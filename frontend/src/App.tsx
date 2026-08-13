@@ -102,6 +102,7 @@ import { BlobCleanPanel, type BlobCleanState } from './components/BlobCleanPanel
 import { IsolatePanel, type IsolateState } from './components/IsolatePanel'
 import { AtomModeBar, type AtomType } from './components/AtomModeBar'
 import { layerRasterKey, rasterFactor, renderLayerRaster } from './lib/layerRaster'
+import { rasterizeParts, regionBitmap, regionEdges } from './lib/pixelRegion'
 import { PreprocessPanel } from './components/PreprocessPanel'
 import { MaskPicker } from './components/MaskPicker'
 import { StepParamDialog } from './components/StepParamDialog'
@@ -419,6 +420,10 @@ export default function App() {
   // one composited texture per layer (client-side, no round trip)
   const [layerRasters, setLayerRasters] = useState<Map<string, ImageBitmap>>(new Map())
   const rasterPending = useRef(new Set<string>())
+  // ROI borders as PIXEL EDGES: segments along the boundary between covered
+  // and uncovered data pixels, drawn in screen space so they stay crisp at
+  // any zoom while still describing exactly which pixels are inside
+  const [layerEdges, setLayerEdges] = useState<Map<string, [number, number][][]>>(new Map())
 
   const clipPending = useRef(new Set<string>())
   const [layerMaskPicker, setLayerMaskPicker] = useState(false)
@@ -1382,6 +1387,13 @@ export default function App() {
       renderLayerRaster(layer, meta.shape[1], meta.shape[0], rf)
         .then((bm) => {
           if (bm) setLayerRasters((m) => new Map(m).set(key, bm))
+          const segs: [number, number][][] = []
+          for (const a of layer.atoms) {
+            if (a.kind !== 'roi' || a.visible === false) continue
+            const region = rasterizeParts(a.parts, meta.shape[1], meta.shape[0], rf)
+            if (region) segs.push(...regionEdges(region))
+          }
+          setLayerEdges((m) => new Map(m).set(key, segs))
         })
         .catch(() => {/* display only: a failed texture just draws nothing */})
         .finally(() => rasterPending.current.delete(key))
@@ -2210,6 +2222,25 @@ export default function App() {
           }),
         )
       }
+      // borders: vector segments along pixel edges — crisp at any zoom,
+      // and they trace the exact set of pixels the ROI covers
+      const edgeSegs = layerNeedsBackendRaster(layer) ? undefined : layerEdges.get(rasterKey)
+      if (edgeSegs?.length) {
+        result.push(
+          new PathLayer({
+            id: `layer-edges-${layer.id}`,
+            data: edgeSegs,
+            getPath: (d: [number, number][]) => d,
+            getColor: [...rgbC, 245] as [number, number, number, number],
+            getWidth: 1.5,
+            widthUnits: 'pixels',
+            widthMinPixels: 1,
+            jointRounded: false,
+            capRounded: false,
+            modelMatrix: selMatrix,
+          }),
+        )
+      }
       // landmarks: numbered crosshair markers (order = coregistration pairing)
       const lmAtoms = visAtoms.filter((a) => a.kind === 'landmark')
       if (lmAtoms.length) {
@@ -2385,7 +2416,7 @@ export default function App() {
     // pointer state (brushStroke / roiDraft / mouseWorld) out of this memo
   }, [meta, bitmap, picks, zOrder, layouts, images, layerUrls, selMatrix,
       layers, clipBitmaps, previewFactor, activeLayerId,
-      panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerClipKey,
+      panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerEdges, layerClipKey,
       transformImage, rotOffsetWorld, coreg, isolate])
 
 
@@ -2397,23 +2428,49 @@ export default function App() {
     const out: unknown[] = []
     const selHidden = (layouts[meta.image.id] ?? DEFAULT_LAYOUT).hidden === true
     if (brushStroke?.length && !selHidden) {
+      // preview the PIXELS the nib will cover, not a smooth round line: the
+      // stroke lands on the data grid, so the preview must speak in pixels
       const erasingNow = tool === 'erase'
       const c = erasingNow
         ? '#fca5a5'
         : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0]
-      out.push(
-        new PathLayer({
-          id: 'brush-draft',
-          data: [{ path: brushStroke.length > 1 ? brushStroke : [brushStroke[0], brushStroke[0]] }],
-          getPath: (d: { path: [number, number][] }) => d.path,
-          getColor: [...hexToRgb(c), erasingNow ? 200 : 170] as [number, number, number, number],
-          getWidth: erasingNow ? eraserSize : brushSize,
-          widthUnits: 'common',
-          capRounded: true,
-          jointRounded: true,
-          modelMatrix: selMatrix,
-        }),
+      const rgbD = hexToRgb(c)
+      const rf = rasterFactor(meta.shape[1], meta.shape[0])
+      const region = rasterizeParts(
+        [{ shape: 'brush', points: brushStroke, width: erasingNow ? eraserSize : brushSize }],
+        meta.shape[1], meta.shape[0], rf,
       )
+      if (region) {
+        const bm = regionBitmap(region, rgbD, erasingNow ? 0.55 : 0.45)
+        if (bm) {
+          out.push(
+            new BitmapLayer({
+              id: 'brush-draft-fill',
+              image: bm,
+              bounds: [
+                region.x0 * rf, (region.y0 + region.h) * rf,
+                (region.x0 + region.w) * rf, region.y0 * rf,
+              ] as [number, number, number, number],
+              modelMatrix: selMatrix,
+              textureParameters: PIXEL_TEXTURE,
+            }),
+          )
+        }
+        out.push(
+          new PathLayer({
+            id: 'brush-draft-edges',
+            data: regionEdges(region),
+            getPath: (d: [number, number][]) => d,
+            getColor: [...rgbD, 255] as [number, number, number, number],
+            getWidth: 1.5,
+            widthUnits: 'pixels',
+            widthMinPixels: 1,
+            jointRounded: false,
+            capRounded: false,
+            modelMatrix: selMatrix,
+          }),
+        )
+      }
     }
     if ((tool === 'roi' || tool === 'crop') && roiDraft.length && !selHidden) {
       const draftColor = tool === 'crop'
