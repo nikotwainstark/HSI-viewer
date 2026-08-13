@@ -21,12 +21,6 @@ export function AntsOverlay({ paths, viewState, size, toWorld }: Props) {
     return `${sx.toFixed(1)},${sy.toFixed(1)}`
   }
 
-  // the outline is drawn exactly as traced (native geometry). A speckled
-  // mask can reach tens of thousands of vertices, where animating the dash
-  // offset would repaint every frame — the marching stops, the shape stays.
-  const totalPoints = paths.reduce((n, p) => n + p.length, 0)
-  const animate = totalPoints <= 20000
-
   return (
     <svg
       className="pointer-events-none absolute inset-0 z-20"
@@ -44,7 +38,7 @@ export function AntsOverlay({ paths, viewState, size, toWorld }: Props) {
               stroke="rgba(255,255,255,0.95)"
               strokeWidth={1.2}
               strokeDasharray="6 4"
-              className={animate ? 'ants' : undefined}
+              className="ants"
             />
           </g>
         )

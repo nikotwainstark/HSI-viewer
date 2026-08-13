@@ -1009,39 +1009,47 @@ class HSIDataset:
             clip = pool_by(self._resolve_step_mask(mask_step).astype(np.float32),
                            factor) > 0.5
 
-        regions: list[np.ndarray] = []
+        # a thin painted stroke IS the mark: ringing a 1 px stroke with a
+        # border would triple its apparent width, so thin atoms are drawn
+        # solid and unringed instead
+        def thin_atom(parts: list[dict]) -> bool:
+            adds = [p for p in parts if p.get("op") != "erase"]
+            return bool(adds) and all(
+                p["shape"] == "brush" and float(p.get("width", 1)) <= 4 for p in adds)
+
+        regions: list[tuple[np.ndarray, bool]] = []
         for parts in atoms:
             canvas = Image.new("L", (wp, hp), 0)
             if self._draw_parts(ImageDraw.Draw(canvas), parts, scale=factor) == 0:
                 continue
             r = np.asarray(canvas) > 0
-            regions.append(r if clip is None else (r & clip))
+            regions.append((r if clip is None else (r & clip), thin_atom(parts)))
         for ids in mask_atoms or []:
             r = pool_by(self._resolve_step_mask({"cache_ids": ids}).astype(np.float32),
                         factor) > 0.5
-            regions.append(r if clip is None else (r & clip))
+            regions.append((r if clip is None else (r & clip), False))
         if not regions:
             # a mask-bound layer with no atoms still shows its editable area
             if clip is None:
                 raise ValueError("invalid ROI geometry")
-            regions = [clip]
+            regions = [(clip, False)]
 
         fill = np.zeros((hp, wp), dtype=bool)
-        for r in regions:
-            fill |= r
+        thin = np.zeros((hp, wp), dtype=bool)
         edge = np.zeros((hp, wp), dtype=bool)
-        if outline:
-            width = max(1, int(round(2.0)))
-            for r in regions:
-                if not r.any():
-                    continue
-                grown = ndimage.binary_dilation(r, iterations=width)
-                edge |= grown & ~r
+        for r, is_thin in regions:
+            if is_thin:
+                thin |= r
+                continue
+            fill |= r
+            if outline and r.any():
+                edge |= ndimage.binary_dilation(r) & ~r
         n = int(color.lstrip("#"), 16)
         rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
         rgba = np.zeros((hp, wp, 4), dtype=np.uint8)
         rgba[fill] = [*rgb, int(np.clip(alpha, 0.0, 1.0) * 255)]
         rgba[edge] = [*rgb, 242]
+        rgba[thin] = [*rgb, 204]
         buf = io.BytesIO()
         Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
         return buf.getvalue()

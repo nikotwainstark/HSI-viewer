@@ -14,7 +14,18 @@ import type { LayerObj, RoiAtom, RoiPart } from './api'
 
 const FILL_ALPHA = 0.28
 const EDGE_ALPHA = 0.95
-const EDGE_PX = 2 // outline thickness in TEXTURE pixels
+const EDGE_PX = 1 // outline thickness in TEXTURE pixels
+// a thin painted stroke IS the mark: ringing a 1 px stroke with a border
+// would triple its apparent width, so thin atoms are drawn solid instead
+const THIN_PX = 4
+const THIN_ALPHA = 0.8
+
+/** True when every additive part is a brush stroke no wider than THIN_PX. */
+function isThinAtom(atom: RoiAtom): boolean {
+  const adds = atom.parts.filter((p) => p.op !== 'erase')
+  return adds.length > 0 &&
+    adds.every((p) => p.shape === 'brush' && (p.width ?? 1) <= THIN_PX)
+}
 const MAX_SIDE = 2048 // texture budget: ~16 MB RGBA per layer at the cap
 
 /** DISPLAY-ONLY texture resolution. The atoms' geometry stays native — this
@@ -110,14 +121,16 @@ export async function renderLayerRaster(
   const octx = out.getContext('2d')
   if (!octx) return null
 
-  // 1. FILL — the whole layer at once, so overlapping atoms never blend twice
-  if (withFill) {
+  // 1. FILL — each group drawn in ONE pass, so overlapping atoms never
+  //    blend twice. Thin strokes get their own solid pass.
+  const paintGroup = (group: RoiAtom[], a: number) => {
+    if (!group.length) return
     const cover = new OffscreenCanvas(pw, ph)
     const cctx = cover.getContext('2d')
-    if (!cctx) return null
+    if (!cctx) return
     cctx.fillStyle = '#fff'
     cctx.strokeStyle = '#fff'
-    for (const atom of atoms) {
+    for (const atom of group) {
       for (const part of atom.parts) {
         cctx.globalCompositeOperation =
           part.op === 'erase' ? 'destination-out' : 'source-over'
@@ -125,9 +138,15 @@ export async function renderLayerRaster(
       }
     }
     cctx.globalCompositeOperation = 'source-in'
-    cctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${FILL_ALPHA})`
+    cctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${a})`
     cctx.fillRect(0, 0, pw, ph)
     octx.drawImage(cover, 0, 0)
+  }
+  const thin = atoms.filter(isThinAtom)
+  const solid = atoms.filter((a) => !isThinAtom(a))
+  if (withFill) {
+    paintGroup(solid, FILL_ALPHA)
+    paintGroup(thin, THIN_ALPHA)
   }
 
   // 2. OUTLINES — one per ATOM, so two overlapping ROIs stay two objects.
@@ -145,6 +164,7 @@ export async function renderLayerRaster(
     [-r, -r], [r, -r], [-r, r], [r, r],
   ]
   for (const atom of atoms) {
+    if (isThinAtom(atom)) continue // its own stroke already reads as the mark
     const box = atomBox(atom, factor, r + 2, pw, ph)
     if (!box) continue
     const [bx, by, bw, bh] = box
