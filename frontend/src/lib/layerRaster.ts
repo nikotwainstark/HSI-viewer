@@ -27,12 +27,17 @@ export function rasterFactor(w: number, h: number): number {
 }
 
 /** Everything that changes what a layer's texture looks like. */
-export function layerRasterKey(layer: LayerObj, imageId: number, factor: number): string {
+export function layerRasterKey(
+  layer: LayerObj,
+  imageId: number,
+  factor: number,
+  fill = true,
+): string {
   const geom = layer.atoms
     .filter((a) => a.kind === 'roi' && a.visible !== false)
     .map((a) => JSON.stringify((a as RoiAtom).parts))
     .join('|')
-  return `${imageId}:${layer.id}:${factor}:${layer.color}:${geom}`
+  return `${imageId}:${layer.id}:${factor}:${fill ? 'f' : 'o'}:${layer.color}:${geom}`
 }
 
 function hexToRgb(hex: string): [number, number, number] {
@@ -90,65 +95,118 @@ export async function renderLayerRaster(
   w: number,
   h: number,
   factor: number,
+  opts: { fill?: boolean } = {},
 ): Promise<ImageBitmap | null> {
+  const withFill = opts.fill !== false
   const atoms = layer.atoms.filter(
     (a): a is RoiAtom => a.kind === 'roi' && a.visible !== false && a.parts.length > 0,
   )
   if (!atoms.length) return null
   const pw = Math.max(1, Math.floor(w / factor))
   const ph = Math.max(1, Math.floor(h / factor))
+  const [cr, cg, cb] = hexToRgb(layer.color)
 
-  // 1. build the layer's binary coverage in one pass (adds fill, erases cut)
-  const mask = new OffscreenCanvas(pw, ph)
-  const mctx = mask.getContext('2d')
-  if (!mctx) return null
-  mctx.fillStyle = '#fff'
-  mctx.strokeStyle = '#fff'
-  for (const atom of atoms) {
-    for (const part of atom.parts) {
-      mctx.globalCompositeOperation =
-        part.op === 'erase' ? 'destination-out' : 'source-over'
-      tracePart(mctx, part, factor)
-    }
-  }
-  mctx.globalCompositeOperation = 'source-over'
-
-  // 2. outline = coverage minus its own erosion, approximated by stamping the
-  //    coverage around a small ring and keeping what the original does not
-  //    cover; cheap, exact for holes and islands alike
-  const edge = new OffscreenCanvas(pw, ph)
-  const ectx = edge.getContext('2d')
-  if (!ectx) return null
-  const r = EDGE_PX
-  for (const [dx, dy] of [
-    [-r, 0], [r, 0], [0, -r], [0, r],
-    [-r, -r], [r, -r], [-r, r], [r, r],
-  ]) {
-    ectx.drawImage(mask, dx, dy)
-  }
-  ectx.globalCompositeOperation = 'destination-out'
-  ectx.drawImage(mask, 0, 0) // keep only the halo just outside the coverage
-  ectx.globalCompositeOperation = 'source-over'
-
-  // 3. colourise: one flat fill (no stacking) plus the outline on top
   const out = new OffscreenCanvas(pw, ph)
   const octx = out.getContext('2d')
   if (!octx) return null
-  const [cr, cg, cb] = hexToRgb(layer.color)
-  octx.drawImage(mask, 0, 0)
-  octx.globalCompositeOperation = 'source-in'
-  octx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${FILL_ALPHA})`
-  octx.fillRect(0, 0, pw, ph)
-  octx.globalCompositeOperation = 'source-over'
 
-  const edgeColoured = new OffscreenCanvas(pw, ph)
-  const cctx = edgeColoured.getContext('2d')
-  if (!cctx) return null
-  cctx.drawImage(edge, 0, 0)
-  cctx.globalCompositeOperation = 'source-in'
-  cctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${EDGE_ALPHA})`
-  cctx.fillRect(0, 0, pw, ph)
-  octx.drawImage(edgeColoured, 0, 0)
+  // 1. FILL — the whole layer at once, so overlapping atoms never blend twice
+  if (withFill) {
+    const cover = new OffscreenCanvas(pw, ph)
+    const cctx = cover.getContext('2d')
+    if (!cctx) return null
+    cctx.fillStyle = '#fff'
+    cctx.strokeStyle = '#fff'
+    for (const atom of atoms) {
+      for (const part of atom.parts) {
+        cctx.globalCompositeOperation =
+          part.op === 'erase' ? 'destination-out' : 'source-over'
+        tracePart(cctx, part, factor)
+      }
+    }
+    cctx.globalCompositeOperation = 'source-in'
+    cctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${FILL_ALPHA})`
+    cctx.fillRect(0, 0, pw, ph)
+    octx.drawImage(cover, 0, 0)
+  }
+
+  // 2. OUTLINES — one per ATOM, so two overlapping ROIs stay two objects.
+  //    Only a combined atom (parts merged into one atom) draws as one shape.
+  //    Each atom is rasterized inside its own bounding box, so the cost
+  //    follows the atom's size rather than the image's.
+  const scratch = new OffscreenCanvas(1, 1)
+  const halo = new OffscreenCanvas(1, 1)
+  const edges = new OffscreenCanvas(pw, ph)
+  const edgeCtx = edges.getContext('2d')
+  if (!edgeCtx) return null
+  const r = EDGE_PX
+  const ring: [number, number][] = [
+    [-r, 0], [r, 0], [0, -r], [0, r],
+    [-r, -r], [r, -r], [-r, r], [r, r],
+  ]
+  for (const atom of atoms) {
+    const box = atomBox(atom, factor, r + 2, pw, ph)
+    if (!box) continue
+    const [bx, by, bw, bh] = box
+    scratch.width = bw
+    scratch.height = bh
+    halo.width = bw
+    halo.height = bh
+    const sctx = scratch.getContext('2d')
+    const hctx = halo.getContext('2d')
+    if (!sctx || !hctx) continue
+    sctx.clearRect(0, 0, bw, bh)
+    hctx.clearRect(0, 0, bw, bh)
+    sctx.setTransform(1, 0, 0, 1, -bx, -by)
+    sctx.fillStyle = '#fff'
+    sctx.strokeStyle = '#fff'
+    for (const part of atom.parts) {
+      sctx.globalCompositeOperation =
+        part.op === 'erase' ? 'destination-out' : 'source-over'
+      tracePart(sctx, part, factor)
+    }
+    sctx.setTransform(1, 0, 0, 1, 0, 0)
+    // halo = coverage stamped around a ring, minus the coverage itself
+    for (const [dx, dy] of ring) hctx.drawImage(scratch, dx, dy)
+    hctx.globalCompositeOperation = 'destination-out'
+    hctx.drawImage(scratch, 0, 0)
+    hctx.globalCompositeOperation = 'source-over'
+    edgeCtx.drawImage(halo, bx, by)
+  }
+  edgeCtx.globalCompositeOperation = 'source-in'
+  edgeCtx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${EDGE_ALPHA})`
+  edgeCtx.fillRect(0, 0, pw, ph)
+  octx.drawImage(edges, 0, 0)
 
   return out.transferToImageBitmap()
+}
+
+/** Texture-space bounding box of one atom (x, y, w, h), padded and clipped. */
+function atomBox(
+  atom: RoiAtom,
+  factor: number,
+  pad: number,
+  pw: number,
+  ph: number,
+): [number, number, number, number] | null {
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (const part of atom.parts) {
+    if (part.op === 'erase') continue // erasing never grows the shape
+    const nib = part.shape === 'brush' ? (part.width ?? 1) / 2 : 0
+    for (const [x, y] of part.points) {
+      x0 = Math.min(x0, x - nib)
+      y0 = Math.min(y0, y - nib)
+      x1 = Math.max(x1, x + nib)
+      y1 = Math.max(y1, y + nib)
+    }
+  }
+  if (!Number.isFinite(x0)) return null
+  const bx = Math.max(0, Math.floor(x0 / factor) - pad)
+  const by = Math.max(0, Math.floor(y0 / factor) - pad)
+  const bw = Math.min(pw, Math.ceil(x1 / factor) + pad + 1) - bx
+  const bh = Math.min(ph, Math.ceil(y1 / factor) + pad + 1) - by
+  return bw > 0 && bh > 0 ? [bx, by, bw, bh] : null
 }

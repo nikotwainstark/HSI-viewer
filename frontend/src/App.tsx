@@ -1321,13 +1321,16 @@ export default function App() {
     if (!meta) return
     const live = new Set<string>()
     for (const layer of layers) {
-      if (!layer.visible || layerNeedsBackendRaster(layer)) continue
+      if (!layer.visible) continue
+      // a mask-bound layer's FILL comes from the backend (the mask lives
+      // server-side); its outlines are still drawn per atom here
+      const withFill = !layerNeedsBackendRaster(layer)
       const rf = rasterFactor(meta.shape[1], meta.shape[0])
-      const key = layerRasterKey(layer, meta.image.id, rf)
+      const key = layerRasterKey(layer, meta.image.id, rf, withFill)
       live.add(key)
       if (layerRasters.has(key) || rasterPending.current.has(key)) continue
       rasterPending.current.add(key)
-      renderLayerRaster(layer, meta.shape[1], meta.shape[0], rf)
+      renderLayerRaster(layer, meta.shape[1], meta.shape[0], rf, { fill: withFill })
         .then((bm) => {
           if (bm) setLayerRasters((m) => new Map(m).set(key, bm))
         })
@@ -2108,23 +2111,6 @@ export default function App() {
           }
         }
       }
-      // ROI atoms of this layer are COMPOSITED into a single texture (see
-      // lib/layerRaster): overlapping atoms never double-blend, holes are
-      // exact, and the deck layer count stays independent of the atom count
-      const rasterKey = layerRasterKey(
-        layer, meta.image.id, rasterFactor(meta.shape[1], meta.shape[0]),
-      )
-      const layerBitmap = layerRasters.get(rasterKey)
-      if (layerBitmap && !layerNeedsBackendRaster(layer)) {
-        result.push(
-          new BitmapLayer({
-            id: `layer-raster-${layer.id}`,
-            image: layerBitmap,
-            bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
-            modelMatrix: selMatrix,
-          }),
-        )
-      }
       // mask-bound layers (and layers with raster mask atoms) come from the
       // backend as ONE composited image
       if (layerNeedsBackendRaster(layer)) {
@@ -2139,6 +2125,24 @@ export default function App() {
             }),
           )
         }
+      }
+      // ROI atoms of this layer are COMPOSITED into a single texture (see
+      // lib/layerRaster): overlapping atoms never double-blend, holes are
+      // exact, and the deck layer count stays independent of the atom count
+      const rasterKey = layerRasterKey(
+        layer, meta.image.id, rasterFactor(meta.shape[1], meta.shape[0]),
+        !layerNeedsBackendRaster(layer),
+      )
+      const layerBitmap = layerRasters.get(rasterKey)
+      if (layerBitmap) {
+        result.push(
+          new BitmapLayer({
+            id: `layer-raster-${layer.id}`,
+            image: layerBitmap,
+            bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
+            modelMatrix: selMatrix,
+          }),
+        )
       }
       // landmarks: numbered crosshair markers (order = coregistration pairing)
       const lmAtoms = visAtoms.filter((a) => a.kind === 'landmark')
