@@ -101,6 +101,7 @@ import { ThresholdPanel, type ThresholdState } from './components/ThresholdPanel
 import { BlobCleanPanel, type BlobCleanState } from './components/BlobCleanPanel'
 import { IsolatePanel, type IsolateState } from './components/IsolatePanel'
 import { AtomModeBar, type AtomType } from './components/AtomModeBar'
+import { layerRasterKey, rasterFactor, renderLayerRaster } from './lib/layerRaster'
 import { PreprocessPanel } from './components/PreprocessPanel'
 import { MaskPicker } from './components/MaskPicker'
 import { StepParamDialog } from './components/StepParamDialog'
@@ -350,11 +351,6 @@ function hasErase(atom: RoiAtom): boolean {
   return atom.parts.some((p) => p.op === 'erase')
 }
 
-/** Brush strokes of a ROI atom (path + nib width). */
-function atomStrokes(atom: RoiAtom): RoiPart[] {
-  return atom.parts.filter((p) => p.shape === 'brush' && p.op !== 'erase')
-}
-
 /** Bounding box of a multi-part ROI (native coords). */
 function partsBbox(parts: RoiPart[]): [number, number, number, number] {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
@@ -400,6 +396,10 @@ export default function App() {
   const roiDraftRef = useRef<[number, number][]>([])
   const [mouseWorld, setMouseWorld] = useState<[number, number] | null>(null)
   const [clipBitmaps, setClipBitmaps] = useState<Map<string, ImageBitmap>>(new Map())
+  // one composited texture per layer (client-side, no round trip)
+  const [layerRasters, setLayerRasters] = useState<Map<string, ImageBitmap>>(new Map())
+  const rasterPending = useRef(new Set<string>())
+
   const clipPending = useRef(new Set<string>())
   const [layerMaskPicker, setLayerMaskPicker] = useState(false)
   const [layerMaskFile, setLayerMaskFile] = useState(false)
@@ -1245,10 +1245,9 @@ export default function App() {
     for (const layer of layers) {
       for (const atom of layer.atoms) {
         if (atom.visible === false || atom.kind === 'landmark') continue
-        const needsRaster =
-          atom.kind === 'mask' || !!layer.maskSource ||
-          (atom.kind === 'roi' && hasErase(atom))
-        if (!needsRaster) continue
+        // vector ROIs are composited client-side now; only server-side
+        // regions (mask atoms, mask-bound layers) need a backend raster
+        if (atom.kind !== 'mask' && !layer.maskSource) continue
         // colour is part of the key: recolouring a layer re-renders its clips
         const geomKey = atom.kind === 'roi' ? JSON.stringify(atom.parts) : ''
         const key =
@@ -1291,6 +1290,38 @@ export default function App() {
       }
     }
   }, [panelSel, layers, meta, maskAtomOutlines, activeLayerId])
+
+  // composite each layer's ROI atoms into one texture; keyed by geometry,
+  // colour, preview factor and image, so edits invalidate it naturally
+  useEffect(() => {
+    if (!meta) return
+    const live = new Set<string>()
+    for (const layer of layers) {
+      if (!layer.visible || layer.maskSource) continue
+      const rf = rasterFactor(meta.shape[1], meta.shape[0])
+      const key = layerRasterKey(layer, meta.image.id, rf)
+      live.add(key)
+      if (layerRasters.has(key) || rasterPending.current.has(key)) continue
+      rasterPending.current.add(key)
+      renderLayerRaster(layer, meta.shape[1], meta.shape[0], rf)
+        .then((bm) => {
+          if (bm) setLayerRasters((m) => new Map(m).set(key, bm))
+        })
+        .catch(() => {/* display only: a failed texture just draws nothing */})
+        .finally(() => rasterPending.current.delete(key))
+    }
+    // drop textures nobody references any more (they hold GPU memory)
+    if (layerRasters.size > live.size + 8) {
+      setLayerRasters((m) => {
+        const next = new Map<string, ImageBitmap>()
+        for (const [k, v] of m) {
+          if (live.has(k)) next.set(k, v)
+          else v.close?.()
+        }
+        return next
+      })
+    }
+  }, [layers, meta, layerRasters])
 
   /** Outer silhouettes of MULTI-PART ROI atoms, so a combined ROI draws as
       one shape instead of stacked part borders. Keyed by image + geometry,
@@ -2029,7 +2060,7 @@ export default function App() {
       for (const a of visAtoms) {
         if (!layerSelected && !selAtomIds.includes(a.id)) continue
         if (a.kind === 'roi') {
-          const sil = a.parts.length > 1
+          const sil = a.parts.length > 1 || hasErase(a)
             ? partsOutlines.get(partsKey(meta.image.id, a))
             : undefined
           if (sil) {
@@ -2053,37 +2084,28 @@ export default function App() {
           }
         }
       }
-      const vecAtoms = visAtoms.filter((a): a is RoiAtom => a.kind === 'roi')
-      // a multi-part atom draws from its union SILHOUETTE (one shape: no
-      // doubled alpha where parts overlap, no internal borders); single-part
-      // atoms — and multi-part ones whose silhouette is still loading — use
-      // their own polygons
-      const polys: { polygon: [number, number][] }[] = []
-      const silhouettes: { path: [number, number][] }[] = []
-      const borderPolys: { polygon: [number, number][] }[] = []
-      for (const a of vecAtoms) {
-        const erased = hasErase(a)
-        const sil = a.parts.length > 1 || erased
-          ? partsOutlines.get(partsKey(meta.image.id, a))
-          : undefined
-        if (sil) {
-          for (const c of sil) {
-            // an erased atom is filled by its raster (holes are exact), so
-            // the silhouette only supplies the border
-            if (!erased) polys.push({ polygon: c })
-            silhouettes.push({ path: c })
-          }
-        } else if (!erased) {
-          for (const p of atomPolygons(a)) {
-            polys.push({ polygon: p })
-            borderPolys.push({ polygon: p })
-          }
-        }
+      // ROI atoms of this layer are COMPOSITED into a single texture (see
+      // lib/layerRaster): overlapping atoms never double-blend, holes are
+      // exact, and the deck layer count stays independent of the atom count
+      const rasterKey = layerRasterKey(
+        layer, meta.image.id, rasterFactor(meta.shape[1], meta.shape[0]),
+      )
+      const layerBitmap = layerRasters.get(rasterKey)
+      if (layerBitmap && !layer.maskSource) {
+        result.push(
+          new BitmapLayer({
+            id: `layer-raster-${layer.id}`,
+            image: layerBitmap,
+            bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
+            modelMatrix: selMatrix,
+          }),
+        )
       }
-      // raster fills: mask atoms always; roi atoms when the layer is mask-bound
+      // mask-bound layers (and mask atoms) still come from the backend: the
+      // mask itself lives server-side
       const rasterAtoms = layer.maskSource
         ? visAtoms.filter((a) => a.kind !== 'landmark')
-        : visAtoms.filter((a) => a.kind === 'mask' || (a.kind === 'roi' && hasErase(a)))
+        : visAtoms.filter((a) => a.kind === 'mask')
       for (const a of rasterAtoms) {
         const geomKey = a.kind === 'roi' ? JSON.stringify(a.parts) : ''
         const bm = clipBitmaps.get(
@@ -2099,68 +2121,6 @@ export default function App() {
             }),
           )
         }
-      }
-      if (polys.length && !layer.maskSource) {
-        // plain layer: union fill (borders drawn separately below)
-        result.push(
-          new PolygonLayer({
-            id: `layer-${layer.id}`,
-            data: polys,
-            getPolygon: (d: { polygon: number[][] }) => d.polygon,
-            filled: true,
-            stroked: false,
-            getFillColor: [...rgbC, 70] as [number, number, number, number],
-            modelMatrix: selMatrix,
-          }),
-        )
-      }
-      if (borderPolys.length) {
-        result.push(
-          new PolygonLayer({
-            id: `layer-border-${layer.id}`,
-            data: borderPolys,
-            getPolygon: (d: { polygon: number[][] }) => d.polygon,
-            filled: false,
-            stroked: true,
-            getLineColor: [...rgbC, 230] as [number, number, number, number],
-            getLineWidth: 1.5,
-            lineWidthUnits: 'pixels',
-            modelMatrix: selMatrix,
-          }),
-        )
-      }
-      // painted strokes: thick paths in WORLD units so they scale with the
-      // image exactly like their rasterization does
-      const strokes = vecAtoms
-        .filter((a) => !hasErase(a))
-        .flatMap((a) => atomStrokes(a).map((p) => ({ path: p.points, w: p.width ?? 1 })))
-      if (strokes.length) {
-        result.push(
-          new PathLayer({
-            id: `layer-brush-${layer.id}`,
-            data: strokes,
-            getPath: (d: { path: [number, number][] }) => d.path,
-            getColor: [...rgbC, 110] as [number, number, number, number],
-            getWidth: (d: { w: number }) => d.w,
-            widthUnits: 'common',
-            capRounded: true,
-            jointRounded: true,
-            modelMatrix: selMatrix,
-          }),
-        )
-      }
-      if (silhouettes.length) {
-        result.push(
-          new PathLayer({
-            id: `layer-silhouette-${layer.id}`,
-            data: silhouettes,
-            getPath: (d: { path: [number, number][] }) => d.path,
-            getColor: [...rgbC, 230] as [number, number, number, number],
-            getWidth: 1.5,
-            widthUnits: 'pixels',
-            modelMatrix: selMatrix,
-          }),
-        )
       }
       // landmarks: numbered crosshair markers (order = coregistration pairing)
       const lmAtoms = visAtoms.filter((a) => a.kind === 'landmark')
@@ -2210,26 +2170,6 @@ export default function App() {
           }),
         )
       }
-    }
-    // live brush stroke
-    if (brushStroke?.length) {
-      const erasingNow = tool === 'erase'
-      const c = erasingNow
-        ? '#fca5a5'
-        : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0]
-      result.push(
-        new PathLayer({
-          id: 'brush-draft',
-          data: [{ path: brushStroke.length > 1 ? brushStroke : [brushStroke[0], brushStroke[0]] }],
-          getPath: (d: { path: [number, number][] }) => d.path,
-          getColor: [...hexToRgb(c), erasingNow ? 200 : 170] as [number, number, number, number],
-          getWidth: erasingNow ? eraserSize : brushSize,
-          widthUnits: 'common',
-          capRounded: true,
-          jointRounded: true,
-          modelMatrix: selMatrix,
-        }),
-      )
     }
     // isolate-components preview: numbered candidate boxes on the canvas
     if (isolate?.preview?.length) {
@@ -2295,32 +2235,6 @@ export default function App() {
         }),
       )
     }
-    // in-progress ROI / crop-window draft
-    if ((tool === 'roi' || tool === 'crop') && roiDraft.length && !selHidden) {
-      const draftColor = tool === 'crop'
-        ? '#fbbf24'
-        : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0]
-      const rgbD = hexToRgb(draftColor)
-      let path: [number, number][]
-      if (tool === 'crop' || roiShape === 'rect') {
-        const p0 = roiDraft[0]
-        const p1 = mouseWorld ?? p0
-        path = [[p0[0], p0[1]], [p1[0], p0[1]], [p1[0], p1[1]], [p0[0], p1[1]], [p0[0], p0[1]]]
-      } else {
-        path = [...roiDraft, ...(mouseWorld ? [mouseWorld] : [])]
-      }
-      result.push(
-        new PathLayer({
-          id: 'roi-draft',
-          data: [{ path }],
-          getPath: (d: { path: [number, number][] }) => d.path,
-          getColor: [...rgbD, 220] as [number, number, number, number],
-          getWidth: 1.5,
-          widthUnits: 'pixels',
-          modelMatrix: selMatrix,
-        }),
-      )
-    }
     if (picks.length && !selHidden) {
       result.push(
         new ScatterplotLayer({
@@ -2379,10 +2293,68 @@ export default function App() {
       }
     }
     return result
+    // NOTE: the in-progress draft lives in `draftLayers` — keep fast-changing
+    // pointer state (brushStroke / roiDraft / mouseWorld) out of this memo
   }, [meta, bitmap, picks, zOrder, layouts, images, layerUrls, selMatrix,
-      layers, clipBitmaps, previewFactor, tool, roiDraft, roiShape, mouseWorld, activeLayerId,
-      panelSel, maskAtomOutlines, partsOutlines, transformImage, rotOffsetWorld, coreg,
-      isolate, brushStroke, brushSize, eraserSize, tool])
+      layers, clipBitmaps, previewFactor, activeLayerId,
+      panelSel, maskAtomOutlines, partsOutlines, layerRasters,
+      transformImage, rotOffsetWorld, coreg, isolate])
+
+
+  /** In-progress drawing (painted stroke, rubber-band shape). Kept OUT of the
+      main layer memo: it changes on every pointer move, and rebuilding the
+      whole scene at that rate is what made painting feel heavy. */
+  const draftLayers = useMemo(() => {
+    if (!meta) return []
+    const out: unknown[] = []
+    const selHidden = (layouts[meta.image.id] ?? DEFAULT_LAYOUT).hidden === true
+    if (brushStroke?.length && !selHidden) {
+      const erasingNow = tool === 'erase'
+      const c = erasingNow
+        ? '#fca5a5'
+        : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0]
+      out.push(
+        new PathLayer({
+          id: 'brush-draft',
+          data: [{ path: brushStroke.length > 1 ? brushStroke : [brushStroke[0], brushStroke[0]] }],
+          getPath: (d: { path: [number, number][] }) => d.path,
+          getColor: [...hexToRgb(c), erasingNow ? 200 : 170] as [number, number, number, number],
+          getWidth: erasingNow ? eraserSize : brushSize,
+          widthUnits: 'common',
+          capRounded: true,
+          jointRounded: true,
+          modelMatrix: selMatrix,
+        }),
+      )
+    }
+    if ((tool === 'roi' || tool === 'crop') && roiDraft.length && !selHidden) {
+      const draftColor = tool === 'crop'
+        ? '#fbbf24'
+        : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0]
+      const rgbD = hexToRgb(draftColor)
+      let path: [number, number][]
+      if (tool === 'crop' || roiShape === 'rect') {
+        const p0 = roiDraft[0]
+        const p1 = mouseWorld ?? p0
+        path = [[p0[0], p0[1]], [p1[0], p0[1]], [p1[0], p1[1]], [p0[0], p1[1]], [p0[0], p0[1]]]
+      } else {
+        path = [...roiDraft, ...(mouseWorld ? [mouseWorld] : [])]
+      }
+      out.push(
+        new PathLayer({
+          id: 'roi-draft',
+          data: [{ path }],
+          getPath: (d: { path: [number, number][] }) => d.path,
+          getColor: [...rgbD, 220] as [number, number, number, number],
+          getWidth: 1.5,
+          widthUnits: 'pixels',
+          modelMatrix: selMatrix,
+        }),
+      )
+    }
+    return out
+  }, [meta, layouts, brushStroke, tool, layers, activeLayerId, eraserSize, brushSize,
+      selMatrix, roiDraft, roiShape, mouseWorld])
 
   const pickPixel = useCallback(
     (coordinate: number[] | undefined) => {
@@ -3683,7 +3655,7 @@ export default function App() {
             setViewState((prev) => (prev ? { ...prev, ...(vs as Partial<ViewState>) } : prev))
           }}
           controller={{ inertia: 300, doubleClickZoom: false }}
-          layers={deckLayers as never[]}
+          layers={[...deckLayers, ...draftLayers] as never[]}
           onClick={(info, event) => {
             if (dragImage) {
               setDragImage(null) // drop the dragged image here
