@@ -123,6 +123,9 @@ interface Props {
   onBrushSize: (v: number) => void
   eraserSize: number
   onEraserSize: (v: number) => void
+  /** strokes already painted into the ROI the brush is building (0 = none) */
+  brushStrokes: number
+  onFinishBrushAtom: () => void
   onExit: () => void
 }
 
@@ -139,7 +142,8 @@ const toolBtn = (active: boolean) =>
 export function AtomModeBar({
   layers, activeLayerId, onActivateLayer, onCreateLayer,
   type, onPickType, roiShape, onCycleShape, erasing, onToggleErase,
-  brushSize, onBrushSize, eraserSize, onEraserSize, onExit,
+  brushSize, onBrushSize, eraserSize, onEraserSize,
+  brushStrokes, onFinishBrushAtom, onExit,
 }: Props) {
   const [sizeFor, setSizeFor] = useState<'brush' | 'eraser' | null>(null)
   const [layerOpen, setLayerOpen] = useState(false)
@@ -272,6 +276,17 @@ export function AtomModeBar({
                       />
                     )}
                   </div>
+                  {roiShape === 'brush' && !erasing && brushStrokes > 0 && (
+                    <button
+                      className="flex items-center gap-1.5 rounded-lg bg-sky-400/15 px-2.5
+                                 py-1.5 text-[11px] text-sky-200 hover:bg-sky-400/25"
+                      title="strokes accumulate into one ROI — finish it and start a new one (Enter)"
+                      onClick={onFinishBrushAtom}
+                    >
+                      <span className="font-mono">{brushStrokes} stroke{brushStrokes === 1 ? '' : 's'}</span>
+                      <span className="text-slate-400">· new ROI</span>
+                    </button>
+                  )}
                   <div className="relative">
                     <button
                       className={toolBtn(erasing)}

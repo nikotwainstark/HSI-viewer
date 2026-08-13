@@ -9,7 +9,12 @@ function atomLabel(atom: Atom): string {
     return `landmark · (${atom.point[0].toFixed(1)}, ${atom.point[1].toFixed(1)})`
   }
   const erased = atom.parts.filter((p) => p.op === 'erase').length
-  const adds = atom.parts.length - erased
+  const addParts = atom.parts.filter((p) => p.op !== 'erase')
+  const adds = addParts.length
+  if (adds > 1 && addParts.every((p) => p.shape === 'brush')) {
+    const nib = addParts[0].width ?? 1
+    return `brush · ${adds} strokes · ${nib} px nib${erased ? ` − ${erased} erase` : ''}`
+  }
   if (adds > 1 || erased) {
     return `roi ∪ ${adds} part${adds === 1 ? '' : 's'}${erased ? ` − ${erased} erase` : ''}`
   }
@@ -29,8 +34,11 @@ function atomGlyph(atom: Atom): string {
   if (atom.kind === 'mask') return '▩'
   if (atom.kind === 'landmark') return '✛'
   if (atom.parts.some((p) => p.op === 'erase')) return '◌'
-  if (atom.parts.length > 1) return '⧉'
-  const shape = atom.parts[0]?.shape
+  const addParts = atom.parts.filter((p) => p.op !== 'erase')
+  if (addParts.length > 1) {
+    return addParts.every((p) => p.shape === 'brush') ? '✎' : '⧉'
+  }
+  const shape = addParts[0]?.shape
   if (shape === 'brush') return '✎'
   return shape === 'rect' ? '▭' : '⬠'
 }

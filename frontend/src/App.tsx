@@ -392,6 +392,16 @@ export default function App() {
   // live painted stroke (native coords) while the pointer is down
   const [brushStroke, setBrushStroke] = useState<[number, number][] | null>(null)
   const painting = useRef(false)
+  // the ROI atom the brush is currently building (null = start a new one)
+  const brushAtomId = useRef<number | null>(null)
+  const [brushAtomStrokes, setBrushAtomStrokes] = useState(0)
+
+  /** Close the ROI the brush is building; the next stroke starts a new one. */
+  const finishBrushAtom = useCallback(() => {
+    brushAtomId.current = null
+    setBrushAtomStrokes(0)
+  }, [])
+
   const [roiDraft, setRoiDraft] = useState<[number, number][]>([])
   const roiDraftRef = useRef<[number, number][]>([])
   const [mouseWorld, setMouseWorld] = useState<[number, number] | null>(null)
@@ -1031,20 +1041,22 @@ export default function App() {
   const enterAtomMode = useCallback(() => {
     setAtomMode({ type: null })
     setErasing(false)
+    finishBrushAtom()
     setTool('drag')
     setRoiDraft([])
     setPanelSel({ layers: [], atoms: { layerId: -1, ids: [] } })
     if (activeLayerId == null || !layers.some((l) => l.id === activeLayerId)) createLayer()
-  }, [activeLayerId, layers, createLayer])
+  }, [activeLayerId, layers, createLayer, finishBrushAtom])
 
   const exitAtomMode = useCallback(() => {
     setAtomMode(null)
     setErasing(false)
+    finishBrushAtom()
     setTool('drag')
     setRoiDraft([])
     setBrushStroke(null)
     painting.current = false
-  }, [])
+  }, [finishBrushAtom])
 
   const startRoi = useCallback(
     (shape: RoiShape) => {
@@ -1054,6 +1066,7 @@ export default function App() {
       setErasing(false)
       setTool(shape === 'brush' ? 'brush' : 'roi')
       setRoiDraft([])
+      finishBrushAtom()
       // arming atom drawing with no active layer auto-creates a plain one
       // (the create-layer path, never mask-bound)
       if (activeLayerId == null || !layers.some((l) => l.id === activeLayerId)) {
@@ -1093,21 +1106,47 @@ export default function App() {
   )
 
   /** Commit a painted stroke as a ROI atom (vector path + nib width). */
+  /** Commit a painted stroke. Strokes ACCUMULATE into the atom currently
+      being painted — several strokes make one ROI, which is what "paint a
+      region" means; a new atom starts only when you say so (the bar's
+      "new ROI" button / Enter) or when the context changes. */
   const completeBrush = useCallback(
     (points: [number, number][], width: number) => {
       if (!points.length) return
-      atomSeq.current += 1
-      const atom: Atom = {
-        id: atomSeq.current,
-        kind: 'roi',
-        parts: [{ shape: 'brush', points, width }],
+      const part: RoiPart = { shape: 'brush', points, width }
+      const current = brushAtomId.current
+      const layer = layers.find((l) => l.id === activeLayerId)
+      const target = current != null && layer?.atoms.some((a) => a.id === current)
+        ? current
+        : null
+      setBrushAtomStrokes((n) => n + 1)
+      if (target != null) {
+        setLayers((ls) =>
+          ls.map((l) =>
+            l.id === activeLayerId
+              ? {
+                  ...l,
+                  atoms: l.atoms.map((a) =>
+                    a.id === target && a.kind === 'roi'
+                      ? { ...a, parts: [...a.parts, part] }
+                      : a,
+                  ),
+                }
+              : l,
+          ),
+        )
+        return
       }
+      atomSeq.current += 1
+      const atom: Atom = { id: atomSeq.current, kind: 'roi', parts: [part] }
+      brushAtomId.current = atom.id
+      setBrushAtomStrokes(1)
       setLayers((ls) => {
-        let target = activeLayerId
-        if (target == null || !ls.some((l) => l.id === target)) {
+        let tgt = activeLayerId
+        if (tgt == null || !ls.some((l) => l.id === tgt)) {
           layerSeq.current += 1
-          target = layerSeq.current
-          setActiveLayerId(target)
+          tgt = layerSeq.current
+          setActiveLayerId(tgt)
           const names = new Set(ls.map((l) => l.name))
           let name = 'Layer'
           let n = 2
@@ -1115,15 +1154,15 @@ export default function App() {
           return [
             ...ls,
             {
-              id: target, name, visible: true, atoms: [atom],
-              color: LAYER_PALETTE[(target - 1) % LAYER_PALETTE.length],
+              id: tgt, name, visible: true, atoms: [atom],
+              color: LAYER_PALETTE[(tgt - 1) % LAYER_PALETTE.length],
             },
           ]
         }
-        return ls.map((l) => (l.id === target ? { ...l, atoms: [...l.atoms, atom] } : l))
+        return ls.map((l) => (l.id === tgt ? { ...l, atoms: [...l.atoms, atom] } : l))
       })
     },
-    [activeLayerId],
+    [activeLayerId, layers],
   )
 
   /** Apply an erase stroke: every ROI atom of the ACTIVE layer that the
@@ -1648,6 +1687,11 @@ export default function App() {
   useEffect(() => {
     if (!atomMode) return
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        // close the ROI the brush is building; the next stroke starts a new one
+        finishBrushAtom()
+        return
+      }
       if (e.key !== 'Escape') return
       e.stopPropagation()
       if (roiDraftRef.current.length > 0) setRoiDraft([])
@@ -1655,7 +1699,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [atomMode, exitAtomMode])
+  }, [atomMode, exitAtomMode, finishBrushAtom])
 
   // Esc for the standalone tools (crop draw mode etc.) outside the mode
   useEffect(() => {
@@ -4188,12 +4232,16 @@ export default function App() {
         <AtomModeBar
           layers={layers}
           activeLayerId={activeLayerId}
-          onActivateLayer={setActiveLayerId}
+          onActivateLayer={(id) => {
+            finishBrushAtom()
+            setActiveLayerId(id)
+          }}
           onCreateLayer={() => createLayer()}
           type={atomMode.type}
           onPickType={(t) => {
             setAtomMode({ type: t })
             setErasing(false)
+            finishBrushAtom()
             if (t === 'roi') startRoi(roiShape)
             else if (t === 'landmark') setTool('landmark')
             else setTool('drag')
@@ -4214,6 +4262,8 @@ export default function App() {
           onBrushSize={setBrushSize}
           eraserSize={eraserSize}
           onEraserSize={setEraserSize}
+          brushStrokes={brushAtomStrokes}
+          onFinishBrushAtom={finishBrushAtom}
           onExit={exitAtomMode}
         />
       )}
