@@ -163,12 +163,11 @@ export interface LayerObj {
   atoms: Atom[]
 }
 
-/** Mask boundary polylines (native coords). factor 4 = fast ants guide;
-    factor 1 = exact native boundary (mask-atom highlights). */
+/** Mask boundary polylines at NATIVE resolution. Geometry is data: only the
+    live image bitmap may be downsampled for display, never an outline. */
 export async function fetchMaskOutline(body: {
   cache_ids?: number[]
   path?: string
-  factor?: number
 }): Promise<[number, number][][]> {
   const res = await postJson<{ contours: [number, number][][] }>('/api/layers/outline', body)
   return res.contours
@@ -200,7 +199,6 @@ export async function isolateMaskComponents(body: {
 /** Outer silhouette of a multi-part ROI (union of its parts, native res). */
 export async function fetchPartsOutline(body: {
   parts: RoiPart[]
-  factor?: number
 }): Promise<[number, number][][]> {
   const res = await postJson<{ contours: [number, number][][] }>(
     '/api/layers/parts_outline', body,
@@ -275,6 +273,8 @@ export interface ExportRoi {
 /** RGBA overlay of an ROI clipped by the layer's mask (display only). */
 export async function fetchRoiClip(body: {
   parts: RoiPart[]
+  /** raster mask atoms to union into the same image */
+  mask_atoms?: number[][]
   cache_ids?: number[]
   path?: string
   color: string

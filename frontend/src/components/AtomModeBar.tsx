@@ -67,33 +67,42 @@ function SizePopover({ value, onChange, onClose }: {
   return (
     <div
       ref={ref}
-      className="absolute bottom-full left-1/2 mb-2 flex -translate-x-1/2 items-center gap-2
-                 rounded-lg border border-sky-400/30 bg-sky-500/25 px-2.5 py-1.5
-                 whitespace-nowrap shadow-xl shadow-black/40 backdrop-blur-xl"
+      className="absolute bottom-full left-1/2 z-50 mb-3 -translate-x-1/2 rounded-xl border
+                 border-white/10 bg-slate-900/95 px-3 py-2.5 shadow-2xl shadow-black/60"
+      style={{ width: 248 }}
       onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => {
         e.preventDefault()
         e.stopPropagation()
       }}
     >
-      <span className="w-12 shrink-0 font-mono text-[11px] text-sky-100">{value}px</span>
+      <div className="mb-2 flex items-baseline justify-between">
+        <span className="text-[10px] font-semibold tracking-[0.12em] text-slate-400 uppercase">
+          size
+        </span>
+        <span className="font-mono text-[12px] text-sky-300">{value} px</span>
+      </div>
       <input
         type="range"
         min={1}
         max={100}
         value={Math.min(100, value)}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-40"
+        className="block w-full"
       />
-      <input
-        type="number"
-        min={1}
-        max={5000}
-        value={value}
-        onChange={(e) => onChange(Math.max(1, Math.min(5000, Number(e.target.value) || 1)))}
-        className="w-16 rounded border border-white/20 bg-black/30 px-1.5 py-0.5 font-mono
-                   text-[11px] text-slate-100 outline-none"
-      />
+      <div className="mt-2 flex items-center gap-2">
+        <span className="shrink-0 font-mono text-[10px] text-slate-500">exact</span>
+        <input
+          type="number"
+          min={1}
+          max={5000}
+          value={value}
+          onChange={(e) => onChange(Math.max(1, Math.min(5000, Number(e.target.value) || 1)))}
+          className="w-20 rounded-lg border border-white/10 bg-white/5 px-2 py-1 font-mono
+                     text-[12px] text-slate-200 outline-none focus:border-sky-400/50"
+        />
+        <span className="shrink-0 font-mono text-[10px] text-slate-500">px · max 5000</span>
+      </div>
     </div>
   )
 }

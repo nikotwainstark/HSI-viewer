@@ -41,10 +41,14 @@ body {
 }
 
 /* --- range slider ------------------------------------------------------- */
+/* the element selector out-ranks utility classes, so the default width lives
+   in a zero-specificity :where() rule — `w-24`, `w-40`, … then actually win */
+:where(input[type="range"]) {
+  width: 100%;
+}
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
-  width: 100%;
   height: 4px;
   border-radius: 9999px;
   background: rgba(148, 163, 184, 0.25);

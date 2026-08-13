@@ -460,7 +460,8 @@ def fs_list(
 
 class RoiClipRequest(BaseModel):
     img: int | None = None
-    parts: list[dict]  # [{shape: 'rect'|'polygon', points: [[x, y], ...]}]
+    parts: list[dict]  # [{shape, points, width?, op?}] — the layer's vectors
+    mask_atoms: list[list[int]] = []  # cache-id lists of raster mask atoms
     cache_ids: list[int] | None = None
     path: str | None = None
     color: str = "#f472b6"
@@ -478,7 +479,8 @@ def layers_clip(req: RoiClipRequest) -> Response:
     )
     try:
         png = ds.render_roi_clip(req.parts, mask_step, req.color,
-                                 req.alpha, _display_factor(req.pf))
+                                 req.alpha, _display_factor(req.pf),
+                                 req.mask_atoms)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
@@ -516,7 +518,6 @@ def cache_isolate(req: IsolateComponentsRequest) -> dict:
 
 class PartsOutlineRequest(BaseModel):
     parts: list[dict]
-    factor: int = 1
 
 
 @app.post("/api/layers/parts_outline")
@@ -524,7 +525,7 @@ def layers_parts_outline(req: PartsOutlineRequest) -> dict:
     """Outer silhouette of a multi-part ROI (union of its parts)."""
     ds = manager.require()
     try:
-        return {"contours": ds.parts_outline(req.parts, req.factor)}
+        return {"contours": ds.parts_outline(req.parts)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

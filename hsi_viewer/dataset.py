@@ -989,15 +989,23 @@ class HSIDataset:
         return n
 
     def render_roi_clip(self, parts: list[dict], mask_step: dict | None,
-                        color: str, alpha: float, factor: int) -> bytes:
-        """Rasterize a (multi-part) ROI atom clipped by an optional binary
-        mask, as an RGBA overlay at display resolution. The vector points
-        stay authoritative — this is display only."""
+                        color: str, alpha: float, factor: int,
+                        mask_atoms: list[list[int]] | None = None) -> bytes:
+        """Rasterize a WHOLE LAYER's region — the union of its vector parts
+        and any raster mask atoms, clipped by the layer's bound mask — as one
+        RGBA overlay at display resolution. Compositing the layer in a single
+        image is what keeps overlapping atoms from blending twice; the vector
+        points stay authoritative (this is display only)."""
         hp, wp = self.height // factor, self.width // factor
         canvas = Image.new("L", (wp, hp), 0)
-        if self._draw_parts(ImageDraw.Draw(canvas), parts, scale=factor) == 0:
-            raise ValueError("invalid ROI geometry")
+        drawn = self._draw_parts(ImageDraw.Draw(canvas), parts, scale=factor)
         m = np.asarray(canvas) > 0
+        for ids in mask_atoms or []:
+            extra = self._resolve_step_mask({"cache_ids": ids})
+            m |= pool_by(extra.astype(np.float32), factor) > 0.5
+            drawn += 1
+        if drawn == 0:
+            raise ValueError("invalid ROI geometry")
         if mask_step is not None:
             full = self._resolve_step_mask(mask_step)
             m &= pool_by(full.astype(np.float32), factor) > 0.5
@@ -1042,44 +1050,33 @@ class HSIDataset:
         logger.info("isolated %d component(s) from mask %s", len(out), obj["name"])
         return {"components": out, "mask": obj["name"]}
 
-    def parts_outline(self, parts: list[dict], factor: int = 1) -> list[list[list[float]]]:
-        """Outer boundary polylines of a multi-part ROI's UNION region — one
-        contour per connected component, so overlapping parts render as a
-        single silhouette instead of stacked rectangles."""
+    def parts_outline(self, parts: list[dict]) -> list[list[list[float]]]:
+        """Outer boundary polylines of a multi-part ROI's UNION region, traced
+        at NATIVE resolution — one contour per connected component."""
         from skimage import measure
 
         canvas = Image.new("L", (self.width, self.height), 0)
         if self._draw_parts(ImageDraw.Draw(canvas), parts) == 0:
             return []
         m = np.asarray(canvas) > 0
-        small = m if factor <= 1 else (pool_by(m.astype(np.float32), factor) > 0.5)
-        out: list[list[list[float]]] = []
-        for c in measure.find_contours(small.astype(float), 0.5):
-            if len(c) < max(12 // factor, 4):
-                continue
-            out.append([[float(col) * factor, float(row) * factor] for row, col in c])
+        out = [[[float(col), float(row)] for row, col in c]
+               for c in measure.find_contours(m.astype(float), 0.5) if len(c) >= 4]
         out.sort(key=len, reverse=True)
-        return out[:40]
+        return out
 
-    def mask_outline(self, mask_step: dict, factor: int = 4) -> list[list[list[float]]]:
-        """Boundary polylines of a binary mask (native coords). factor 4 is a
-        fast approximation for the animated ants guide; factor 1 traces the
-        exact native boundary (used for mask-atom edge highlights, where
-        chamfered corners would misrepresent the stored region)."""
+    def mask_outline(self, mask_step: dict) -> list[list[list[float]]]:
+        """Boundary polylines of a binary mask, traced on the NATIVE mask.
+
+        Geometry is never downsampled: an object's position and shape are
+        data, and only the live image bitmap may be pooled for display."""
         from skimage import measure
 
         m = self._resolve_step_mask(mask_step)
-        small = m if factor <= 1 else (pool_by(m.astype(np.float32), factor) > 0.5)
-        contours = measure.find_contours(small.astype(float), 0.5)
-        out: list[list[list[float]]] = []
-        for c in contours:
-            if len(c) < max(12 // factor, 4):
-                continue  # drop speck outlines
-            if factor > 1:
-                c = c[::3]  # decimate for transfer/render speed
-            out.append([[float(col) * factor, float(row) * factor] for row, col in c])
+        contours = measure.find_contours(m.astype(float), 0.5)
+        out = [[[float(col), float(row)] for row, col in c]
+               for c in contours if len(c) >= 4]
         out.sort(key=len, reverse=True)
-        return out[:40]
+        return out
 
     def _spec_region(self, spec: dict) -> np.ndarray | None:
         """One layer spec's region at native resolution: (union of vector-atom

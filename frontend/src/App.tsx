@@ -1168,7 +1168,7 @@ export default function App() {
       for (const id of touched) {
         const atom = nextAtoms.find((a) => a.id === id)
         if (!atom || atom.kind !== 'roi') continue
-        fetchPartsOutline({ parts: atom.parts, factor: 1 })
+        fetchPartsOutline({ parts: atom.parts })
           .then((cs) => {
             if (cs.length === 0) {
               setLayers((ls) =>
@@ -1239,33 +1239,57 @@ export default function App() {
     }
   }
 
-  // raster overlays: ROI clips of mask-bounded layers + mask-atom fills
+  // Server-side layer regions (mask-bound layers, or layers holding raster
+  // mask atoms) are composited by the BACKEND into ONE image per layer —
+  // same reason as the client-side texture: per-atom images blend twice
+  // where atoms overlap.
+  const layerClipKey = useCallback(
+    (layer: LayerObj, imageId: number, factor: number) => {
+      const vis = layer.atoms.filter((a) => a.visible !== false)
+      const geom = vis
+        .map((a) =>
+          a.kind === 'roi' ? JSON.stringify(a.parts)
+            : a.kind === 'mask' ? `m${a.cacheIds.join(',')}` : '',
+        )
+        .join('|')
+      const src = layer.maskSource
+        ? layer.maskSource.kind === 'cache'
+          ? `c${layer.maskSource.ids.join(',')}`
+          : `p${layer.maskSource.path}`
+        : ''
+      return `${imageId}:${layer.id}:${factor}:${layer.color}:${src}:${geom}`
+    },
+    [],
+  )
+
+  const layerNeedsBackendRaster = (layer: LayerObj) =>
+    !!layer.maskSource || layer.atoms.some((a) => a.kind === 'mask' && a.visible !== false)
+
   useEffect(() => {
     if (!meta || !isHsi) return
     for (const layer of layers) {
-      for (const atom of layer.atoms) {
-        if (atom.visible === false || atom.kind === 'landmark') continue
-        // vector ROIs are composited client-side now; only server-side
-        // regions (mask atoms, mask-bound layers) need a backend raster
-        if (atom.kind !== 'mask' && !layer.maskSource) continue
-        // colour is part of the key: recolouring a layer re-renders its clips
-        const geomKey = atom.kind === 'roi' ? JSON.stringify(atom.parts) : ''
-        const key =
-          `${meta.image.id}:${layer.id}:${atom.id}:${previewFactor}:${layer.color}:${geomKey}`
-        if (clipBitmaps.has(key) || clipPending.current.has(key)) continue
-        clipPending.current.add(key)
-        fetchRoiClip({
-          ...roiRequestArgs(layer, atom),
-          color: layer.color,
-          pf: previewFactor,
-        })
-          .then((blob) => createImageBitmap(blob))
-          .then((bm) => setClipBitmaps((m) => new Map(m).set(key, bm)))
-          .catch((e) => setToast((e as Error).message))
-          .finally(() => clipPending.current.delete(key))
-      }
+      if (!layer.visible || !layerNeedsBackendRaster(layer)) continue
+      const vis = layer.atoms.filter((a) => a.visible !== false)
+      const parts = vis.flatMap((a) => (a.kind === 'roi' ? a.parts : []))
+      const maskAtoms = vis.flatMap((a) => (a.kind === 'mask' ? [a.cacheIds] : []))
+      if (!parts.length && !maskAtoms.length && !layer.maskSource) continue
+      const key = layerClipKey(layer, meta.image.id, previewFactor)
+      if (clipBitmaps.has(key) || clipPending.current.has(key)) continue
+      clipPending.current.add(key)
+      fetchRoiClip({
+        parts,
+        ...(maskAtoms.length ? { mask_atoms: maskAtoms } : {}),
+        ...(layer.maskSource?.kind === 'cache' ? { cache_ids: layer.maskSource.ids } : {}),
+        ...(layer.maskSource?.kind === 'local' ? { path: layer.maskSource.path } : {}),
+        color: layer.color,
+        pf: previewFactor,
+      })
+        .then((blob) => createImageBitmap(blob))
+        .then((bm) => setClipBitmaps((m) => new Map(m).set(key, bm)))
+        .catch(() => {/* display only */})
+        .finally(() => clipPending.current.delete(key))
     }
-  }, [layers, meta, isHsi, previewFactor, clipBitmaps])
+  }, [layers, meta, isHsi, previewFactor, clipBitmaps, layerClipKey])
 
   // native outline contours for mask atoms: needed for highlight rendering
   // AND for canvas hit-testing (the active layer's mask atoms are clickable
@@ -1283,7 +1307,7 @@ export default function App() {
         const key = `${meta.image.id}:${atom.cacheIds.join(',')}`
         if (maskAtomOutlines.has(key) || outlinePendingAtoms.current.has(key)) continue
         outlinePendingAtoms.current.add(key)
-        fetchMaskOutline({ cache_ids: atom.cacheIds, factor: 1 })
+        fetchMaskOutline({ cache_ids: atom.cacheIds })
           .then((cs) => setMaskAtomOutlines((m) => new Map(m).set(key, cs)))
           .catch((e) => setToast((e as Error).message))
           .finally(() => outlinePendingAtoms.current.delete(key))
@@ -1297,7 +1321,7 @@ export default function App() {
     if (!meta) return
     const live = new Set<string>()
     for (const layer of layers) {
-      if (!layer.visible || layer.maskSource) continue
+      if (!layer.visible || layerNeedsBackendRaster(layer)) continue
       const rf = rasterFactor(meta.shape[1], meta.shape[0])
       const key = layerRasterKey(layer, meta.image.id, rf)
       live.add(key)
@@ -1342,7 +1366,7 @@ export default function App() {
         const key = partsKey(meta.image.id, atom)
         if (partsOutlines.has(key) || outlinePendingParts.current.has(key)) continue
         outlinePendingParts.current.add(key)
-        fetchPartsOutline({ parts: atom.parts, factor: 1 })
+        fetchPartsOutline({ parts: atom.parts })
           .then((cs) => setPartsOutlines((m) => new Map(m).set(key, cs)))
           .catch(() => {/* fall back to per-part borders */})
           .finally(() => outlinePendingParts.current.delete(key))
@@ -2091,7 +2115,7 @@ export default function App() {
         layer, meta.image.id, rasterFactor(meta.shape[1], meta.shape[0]),
       )
       const layerBitmap = layerRasters.get(rasterKey)
-      if (layerBitmap && !layer.maskSource) {
+      if (layerBitmap && !layerNeedsBackendRaster(layer)) {
         result.push(
           new BitmapLayer({
             id: `layer-raster-${layer.id}`,
@@ -2101,20 +2125,14 @@ export default function App() {
           }),
         )
       }
-      // mask-bound layers (and mask atoms) still come from the backend: the
-      // mask itself lives server-side
-      const rasterAtoms = layer.maskSource
-        ? visAtoms.filter((a) => a.kind !== 'landmark')
-        : visAtoms.filter((a) => a.kind === 'mask')
-      for (const a of rasterAtoms) {
-        const geomKey = a.kind === 'roi' ? JSON.stringify(a.parts) : ''
-        const bm = clipBitmaps.get(
-          `${meta.image.id}:${layer.id}:${a.id}:${previewFactor}:${layer.color}:${geomKey}`,
-        )
+      // mask-bound layers (and layers with raster mask atoms) come from the
+      // backend as ONE composited image
+      if (layerNeedsBackendRaster(layer)) {
+        const bm = clipBitmaps.get(layerClipKey(layer, meta.image.id, previewFactor))
         if (bm) {
           result.push(
             new BitmapLayer({
-              id: `clip-${layer.id}-${a.id}`,
+              id: `clip-${layer.id}`,
               image: bm,
               bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
               modelMatrix: selMatrix,
@@ -2297,7 +2315,7 @@ export default function App() {
     // pointer state (brushStroke / roiDraft / mouseWorld) out of this memo
   }, [meta, bitmap, picks, zOrder, layouts, images, layerUrls, selMatrix,
       layers, clipBitmaps, previewFactor, activeLayerId,
-      panelSel, maskAtomOutlines, partsOutlines, layerRasters,
+      panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerClipKey,
       transformImage, rotOffsetWorld, coreg, isolate])
 
 

@@ -17,9 +17,11 @@ const EDGE_ALPHA = 0.95
 const EDGE_PX = 2 // outline thickness in TEXTURE pixels
 const MAX_SIDE = 2048 // texture budget: ~16 MB RGBA per layer at the cap
 
-/** Texture resolution is chosen independently of the image's preview factor
-    (a coarse preview must not blur the ROI edges) and only coarsens for very
-    large images, where a full-resolution texture would not fit. */
+/** DISPLAY-ONLY texture resolution. The atoms' geometry stays native — this
+    factor only decides how finely that geometry is painted into the texture
+    (full resolution unless the image is larger than the texture budget). It
+    is deliberately independent of the image's preview factor: a coarse image
+    preview must not coarsen the ROI edges. */
 export function rasterFactor(w: number, h: number): number {
   return Math.max(1, Math.ceil(Math.max(w, h) / MAX_SIDE))
 }
