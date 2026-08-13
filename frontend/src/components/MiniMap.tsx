@@ -75,8 +75,10 @@ export function MiniMap({ images, layouts, zOrder, selectedId, onSelect, onToggl
         const q = imageQuad(l, im.shape[1], im.shape[0])
         const cx = (q[0][0] + q[2][0]) / 2
         const cy = (q[0][1] + q[2][1]) / 2
-        const bw = Math.max(10, im.shape[1] * l.sx * scale)
-        const bh = Math.max(10, im.shape[0] * l.sy * scale)
+        // a mirrored image carries a negative scale: the footprint keeps its
+        // size, only the content is flipped
+        const bw = Math.max(10, Math.abs(im.shape[1] * l.sx) * scale)
+        const bh = Math.max(10, Math.abs(im.shape[0] * l.sy) * scale)
         return (
           <button
             key={id}

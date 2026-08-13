@@ -618,6 +618,27 @@ export default function App() {
     [transformImage, viewState, images, size],
   )
 
+  /** Mirror the image about its own centre axis: a negative scale factor,
+      which the composed transform already understands (the data is never
+      touched — this is the same display-only arrangement as rotate). */
+  const flipImage = useCallback((id: number, axis: 'x' | 'y') => {
+    setLayouts((cur) => {
+      const l = cur[id] ?? DEFAULT_LAYOUT
+      return {
+        ...cur,
+        [id]: axis === 'x' ? { ...l, sx: -l.sx } : { ...l, sy: -l.sy },
+      }
+    })
+  }, [])
+
+  /** Quarter turn about the centre. */
+  const rotateQuarter = useCallback((id: number, dir: 1 | -1) => {
+    setLayouts((cur) => {
+      const l = cur[id] ?? DEFAULT_LAYOUT
+      return { ...cur, [id]: { ...l, rot: l.rot + (dir * Math.PI) / 2 } }
+    })
+  }, [])
+
   const resetTransform = useCallback((id: number) => {
     setLayouts((cur) => ({
       ...cur,
@@ -4123,16 +4144,60 @@ export default function App() {
         )
       })()}
 
-      {/* transform-mode banner (coreg shows its own banner instead) */}
+      {/* transform-mode banner + controls (coreg shows its own bar instead) */}
       {transformImage != null && !coreg && (
-        <div className="pointer-events-none absolute bottom-10 left-1/2 z-40 -translate-x-1/2 text-center select-none">
-          <p className="text-2xl font-semibold tracking-[0.3em] whitespace-nowrap text-white/30">
-            Transform Mode On
-          </p>
-          <p className="mt-1 text-[11px] text-white/45">
-            drag: move · corners: scale · edges: stretch · top handle: rotate · press Esc to exit
-          </p>
-        </div>
+        <>
+          <div className="pointer-events-none absolute bottom-24 left-1/2 z-40 -translate-x-1/2 text-center select-none">
+            <p className="text-2xl font-semibold tracking-[0.3em] whitespace-nowrap text-white/30">
+              Transform Mode On
+            </p>
+            <p className="mt-1 text-[11px] text-white/45">
+              drag: move · corners: scale · edges: stretch · top handle: rotate · Esc exits
+            </p>
+          </div>
+          <div
+            className="absolute bottom-4 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2
+                       rounded-xl border border-white/10 bg-slate-950/75 px-3 py-2
+                       shadow-2xl shadow-black/50 backdrop-blur-xl"
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <span className="max-w-48 shrink-0 truncate font-mono text-[12px] text-slate-300">
+              {images.find((i) => i.id === transformImage)?.name ?? 'image'}
+            </span>
+            <div className="h-5 w-px shrink-0 bg-white/15" />
+            {[
+              { label: 'flip ⇄', title: 'mirror horizontally', act: () => flipImage(transformImage, 'x') },
+              { label: 'flip ⇅', title: 'mirror vertically', act: () => flipImage(transformImage, 'y') },
+              { label: '⟲ 90°', title: 'quarter turn anticlockwise', act: () => rotateQuarter(transformImage, -1) },
+              { label: '⟳ 90°', title: 'quarter turn clockwise', act: () => rotateQuarter(transformImage, 1) },
+            ].map((b) => (
+              <button
+                key={b.label}
+                title={b.title}
+                className="rounded-lg bg-white/10 px-2.5 py-1.5 font-mono text-[11px]
+                           text-slate-200 hover:bg-white/20"
+                onClick={b.act}
+              >
+                {b.label}
+              </button>
+            ))}
+            <div className="h-5 w-px shrink-0 bg-white/15" />
+            <button
+              className="rounded-lg bg-white/10 px-2.5 py-1.5 text-[11px] text-slate-300
+                         hover:bg-white/20"
+              onClick={() => resetTransform(transformImage)}
+            >
+              back to native
+            </button>
+            <button
+              className="rounded-lg px-2.5 py-1.5 text-[11px] text-slate-400
+                         hover:bg-white/10 hover:text-slate-200"
+              onClick={() => setTransformImage(null)}
+            >
+              Done
+            </button>
+          </div>
+        </>
       )}
 
       {/* coreg: mode banner + session controls */}
@@ -4181,6 +4246,23 @@ export default function App() {
                 className="w-24"
               />
             </label>
+            <div className="flex shrink-0 items-center gap-1">
+              {[
+                { label: 'flip ⇄', act: () => flipImage(coreg.movingId, 'x') },
+                { label: 'flip ⇅', act: () => flipImage(coreg.movingId, 'y') },
+                { label: '⟲', act: () => rotateQuarter(coreg.movingId, -1) },
+                { label: '⟳', act: () => rotateQuarter(coreg.movingId, 1) },
+              ].map((b) => (
+                <button
+                  key={b.label}
+                  className="rounded-lg bg-white/10 px-2 py-1.5 font-mono text-[11px]
+                             text-slate-200 hover:bg-white/20"
+                  onClick={b.act}
+                >
+                  {b.label}
+                </button>
+              ))}
+            </div>
             <button
               className="rounded-lg border border-emerald-400/40 bg-emerald-400/15 px-3 py-1.5
                          text-[12px] font-medium text-emerald-200 hover:bg-emerald-400/25"
@@ -4268,13 +4350,19 @@ export default function App() {
               <>
                 <span style={{ color: c }}>
                   {'  ·  '}
-                  {selLayout.rot !== 0
-                    ? `rotated ${((selLayout.rot * 180) / Math.PI).toFixed(1)}°  ` : ''}
-                  {selLayout.sx !== 1 || selLayout.sy !== 1
-                    ? selLayout.sx === selLayout.sy
-                      ? `scale ${selLayout.sx.toFixed(2)}×`
-                      : `stretched ${selLayout.sx.toFixed(2)} × ${selLayout.sy.toFixed(2)}`
+                  {selLayout.sx < 0 || selLayout.sy < 0
+                    ? `flipped ${selLayout.sx < 0 ? '⇄' : ''}${selLayout.sy < 0 ? '⇅' : ''}  `
                     : ''}
+                  {selLayout.rot !== 0
+                    ? `rotated ${(((selLayout.rot * 180) / Math.PI) % 360).toFixed(1)}°  ` : ''}
+                  {(() => {
+                    const ax = Math.abs(selLayout.sx)
+                    const ay = Math.abs(selLayout.sy)
+                    if (ax === 1 && ay === 1) return ''
+                    return ax === ay
+                      ? `scale ${ax.toFixed(2)}×`
+                      : `stretched ${ax.toFixed(2)} × ${ay.toFixed(2)}`
+                  })()}
                 </span>
                 <button
                   className="ml-2 rounded border px-1.5 py-0.5 text-[10px] transition-colors
