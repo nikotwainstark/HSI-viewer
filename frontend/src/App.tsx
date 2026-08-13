@@ -1309,14 +1309,14 @@ export default function App() {
     for (const layer of layers) {
       if (!layer.visible || !layerNeedsBackendRaster(layer)) continue
       const vis = layer.atoms.filter((a) => a.visible !== false)
-      const parts = vis.flatMap((a) => (a.kind === 'roi' ? a.parts : []))
+      const atomParts = vis.flatMap((a) => (a.kind === 'roi' ? [a.parts] : []))
       const maskAtoms = vis.flatMap((a) => (a.kind === 'mask' ? [a.cacheIds] : []))
-      if (!parts.length && !maskAtoms.length && !layer.maskSource) continue
+      if (!atomParts.length && !maskAtoms.length && !layer.maskSource) continue
       const key = layerClipKey(layer, meta.image.id, previewFactor)
       if (clipBitmaps.has(key) || clipPending.current.has(key)) continue
       clipPending.current.add(key)
       fetchRoiClip({
-        parts,
+        atoms: atomParts,
         ...(maskAtoms.length ? { mask_atoms: maskAtoms } : {}),
         ...(layer.maskSource?.kind === 'cache' ? { cache_ids: layer.maskSource.ids } : {}),
         ...(layer.maskSource?.kind === 'local' ? { path: layer.maskSource.path } : {}),
@@ -1361,15 +1361,15 @@ export default function App() {
     const live = new Set<string>()
     for (const layer of layers) {
       if (!layer.visible) continue
-      // a mask-bound layer's FILL comes from the backend (the mask lives
-      // server-side); its outlines are still drawn per atom here
-      const withFill = !layerNeedsBackendRaster(layer)
+      // layers whose region depends on a server-side mask are rendered
+      // entirely by the backend (fill AND borders clipped by that mask)
+      if (layerNeedsBackendRaster(layer)) continue
       const rf = rasterFactor(meta.shape[1], meta.shape[0])
-      const key = layerRasterKey(layer, meta.image.id, rf, withFill)
+      const key = layerRasterKey(layer, meta.image.id, rf)
       live.add(key)
       if (layerRasters.has(key) || rasterPending.current.has(key)) continue
       rasterPending.current.add(key)
-      renderLayerRaster(layer, meta.shape[1], meta.shape[0], rf, { fill: withFill })
+      renderLayerRaster(layer, meta.shape[1], meta.shape[0], rf)
         .then((bm) => {
           if (bm) setLayerRasters((m) => new Map(m).set(key, bm))
         })
@@ -1472,8 +1472,9 @@ export default function App() {
         setAntsPaths(contours)
         if (total > contours.length) {
           setToast(
-            `Mask has ${total} separate boundaries — showing the ${contours.length} largest ` +
-            '(clean the mask blobs for a tidier outline)',
+            `Outline draws the ${contours.length} largest of ${total} mask boundaries — ` +
+            'the rest are specks too small to trace. The whole mask is still used ' +
+            'for spectra, crops and exports.',
           )
         }
       })
@@ -2181,9 +2182,10 @@ export default function App() {
       // exact, and the deck layer count stays independent of the atom count
       const rasterKey = layerRasterKey(
         layer, meta.image.id, rasterFactor(meta.shape[1], meta.shape[0]),
-        !layerNeedsBackendRaster(layer),
       )
-      const layerBitmap = layerRasters.get(rasterKey)
+      const layerBitmap = layerNeedsBackendRaster(layer)
+        ? undefined
+        : layerRasters.get(rasterKey)
       if (layerBitmap) {
         result.push(
           new BitmapLayer({

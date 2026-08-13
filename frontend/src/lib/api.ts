@@ -274,7 +274,8 @@ export interface ExportRoi {
 
 /** RGBA overlay of an ROI clipped by the layer's mask (display only). */
 export async function fetchRoiClip(body: {
-  parts: RoiPart[]
+  /** one entry per ATOM (its ordered parts) — borders are drawn per atom */
+  atoms: RoiPart[][]
   /** raster mask atoms to union into the same image */
   mask_atoms?: number[][]
   cache_ids?: number[]

@@ -460,7 +460,8 @@ def fs_list(
 
 class RoiClipRequest(BaseModel):
     img: int | None = None
-    parts: list[dict]  # [{shape, points, width?, op?}] — the layer's vectors
+    # one entry per ATOM (its ordered parts), so borders can be per-atom
+    atoms: list[list[dict]] = []
     mask_atoms: list[list[int]] = []  # cache-id lists of raster mask atoms
     cache_ids: list[int] | None = None
     path: str | None = None
@@ -478,7 +479,7 @@ def layers_clip(req: RoiClipRequest) -> Response:
         if (req.cache_ids or req.path) else None
     )
     try:
-        png = ds.render_roi_clip(req.parts, mask_step, req.color,
+        png = ds.render_roi_clip(req.atoms, mask_step, req.color,
                                  req.alpha, _display_factor(req.pf),
                                  req.mask_atoms)
     except KeyError as exc:
@@ -529,7 +530,10 @@ def layers_parts_outline(req: PartsOutlineRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-ANTS_MAX_CONTOURS = 200
+# the ants guide is capped by VERTEX budget, not by contour count: a mask
+# with many tiny specks still shows all of them, while a few enormous
+# boundaries cannot stall the overlay
+ANTS_VERTEX_BUDGET = 60_000
 
 
 @app.post("/api/layers/outline")
@@ -550,7 +554,14 @@ def layers_outline(req: RoiOutlineRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     total = len(contours)
-    return {"contours": contours[:ANTS_MAX_CONTOURS], "total": total}
+    shown: list[list[list[float]]] = []
+    used = 0
+    for c in contours:  # already sorted longest first
+        if shown and used + len(c) > ANTS_VERTEX_BUDGET:
+            break
+        shown.append(c)
+        used += len(c)
+    return {"contours": shown, "total": total}
 
 
 class CombineLayersRequest(BaseModel):

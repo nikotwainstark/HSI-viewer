@@ -988,31 +988,60 @@ class HSIDataset:
                 n += 1
         return n
 
-    def render_roi_clip(self, parts: list[dict], mask_step: dict | None,
+    def render_roi_clip(self, atoms: list[list[dict]], mask_step: dict | None,
                         color: str, alpha: float, factor: int,
-                        mask_atoms: list[list[int]] | None = None) -> bytes:
-        """Rasterize a WHOLE LAYER's region — the union of its vector parts
-        and any raster mask atoms, clipped by the layer's bound mask — as one
-        RGBA overlay at display resolution. Compositing the layer in a single
-        image is what keeps overlapping atoms from blending twice; the vector
-        points stay authoritative (this is display only)."""
+                        mask_atoms: list[list[int]] | None = None,
+                        outline: bool = True) -> bytes:
+        """Render a WHOLE LAYER as one RGBA overlay at display resolution.
+
+        Fill = the union of every atom's region, clipped by the layer's bound
+        mask (compositing the layer in a single image is what keeps
+        overlapping atoms from blending twice). Outline = one border PER ATOM,
+        each traced on that atom's OWN clipped region — so the border marks
+        the region the layer actually covers (ROI ∩ mask) instead of the
+        unclipped vector shape. Display only; the vectors stay authoritative.
+        """
+        from scipy import ndimage
+
         hp, wp = self.height // factor, self.width // factor
-        canvas = Image.new("L", (wp, hp), 0)
-        drawn = self._draw_parts(ImageDraw.Draw(canvas), parts, scale=factor)
-        m = np.asarray(canvas) > 0
-        for ids in mask_atoms or []:
-            extra = self._resolve_step_mask({"cache_ids": ids})
-            m |= pool_by(extra.astype(np.float32), factor) > 0.5
-            drawn += 1
-        if drawn == 0:
-            raise ValueError("invalid ROI geometry")
+        clip: np.ndarray | None = None
         if mask_step is not None:
-            full = self._resolve_step_mask(mask_step)
-            m &= pool_by(full.astype(np.float32), factor) > 0.5
+            clip = pool_by(self._resolve_step_mask(mask_step).astype(np.float32),
+                           factor) > 0.5
+
+        regions: list[np.ndarray] = []
+        for parts in atoms:
+            canvas = Image.new("L", (wp, hp), 0)
+            if self._draw_parts(ImageDraw.Draw(canvas), parts, scale=factor) == 0:
+                continue
+            r = np.asarray(canvas) > 0
+            regions.append(r if clip is None else (r & clip))
+        for ids in mask_atoms or []:
+            r = pool_by(self._resolve_step_mask({"cache_ids": ids}).astype(np.float32),
+                        factor) > 0.5
+            regions.append(r if clip is None else (r & clip))
+        if not regions:
+            # a mask-bound layer with no atoms still shows its editable area
+            if clip is None:
+                raise ValueError("invalid ROI geometry")
+            regions = [clip]
+
+        fill = np.zeros((hp, wp), dtype=bool)
+        for r in regions:
+            fill |= r
+        edge = np.zeros((hp, wp), dtype=bool)
+        if outline:
+            width = max(1, int(round(2.0)))
+            for r in regions:
+                if not r.any():
+                    continue
+                grown = ndimage.binary_dilation(r, iterations=width)
+                edge |= grown & ~r
         n = int(color.lstrip("#"), 16)
+        rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
         rgba = np.zeros((hp, wp, 4), dtype=np.uint8)
-        rgba[m] = [(n >> 16) & 255, (n >> 8) & 255, n & 255,
-                   int(np.clip(alpha, 0.0, 1.0) * 255)]
+        rgba[fill] = [*rgb, int(np.clip(alpha, 0.0, 1.0) * 255)]
+        rgba[edge] = [*rgb, 242]
         buf = io.BytesIO()
         Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
         return buf.getvalue()
