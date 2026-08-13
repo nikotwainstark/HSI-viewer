@@ -231,6 +231,16 @@ const DEFAULT_LAYOUT: ImgLayout = { dx: 0, dy: 0, rot: 0, sx: 1, sy: 1, alpha: 1
 
 const DASH_EXT = [new PathStyleExtension({ dash: true })]
 
+/** Magnify with NEAREST so a zoomed-in pixel stays a crisp square: at high
+    zoom the eye has to line ROI edges up with data pixels, and interpolation
+    would blur exactly the boundary being judged. Minification keeps linear
+    filtering so zoomed-out views stay smooth. */
+const PIXEL_TEXTURE = {
+  magFilter: 'nearest' as const,
+  minFilter: 'linear' as const,
+  mipmapFilter: 'linear' as const,
+}
+
 /** Active coregistration session: moving = the SELECTED image, adjusted with
     the transform handles; target = frozen at native orientation. */
 interface CoregState {
@@ -1963,6 +1973,7 @@ export default function App() {
         if (bitmap) {
           result.push(new BitmapLayer({
             id: `img-${id}`, image: bitmap, bounds, opacity: l.alpha, modelMatrix: mm,
+            textureParameters: PIXEL_TEXTURE,
           }))
         }
       } else {
@@ -1970,6 +1981,7 @@ export default function App() {
         if (url) {
           result.push(new BitmapLayer({
             id: `img-${id}`, image: url, bounds, opacity: l.alpha, modelMatrix: mm,
+            textureParameters: PIXEL_TEXTURE,
           }))
         }
         // FROZEN overlays: a non-selected image keeps showing its visible
@@ -2173,6 +2185,7 @@ export default function App() {
               image: bm,
               bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
               modelMatrix: selMatrix,
+              textureParameters: PIXEL_TEXTURE,
             }),
           )
         }
@@ -2193,6 +2206,7 @@ export default function App() {
             image: layerBitmap,
             bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
             modelMatrix: selMatrix,
+            textureParameters: PIXEL_TEXTURE,
           }),
         )
       }
