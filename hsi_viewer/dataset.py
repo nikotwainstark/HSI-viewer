@@ -996,10 +996,10 @@ class HSIDataset:
 
         Fill = the union of every atom's region, clipped by the layer's bound
         mask (compositing the layer in a single image is what keeps
-        overlapping atoms from blending twice). Outline = one border PER ATOM,
-        each traced on that atom's OWN clipped region — so the border marks
-        the region the layer actually covers (ROI ∩ mask) instead of the
-        unclipped vector shape. Display only; the vectors stay authoritative.
+        overlapping atoms from blending twice). Border = one INNER rim per
+        atom, traced on that atom's OWN clipped region: it marks the region
+        the layer actually covers (ROI ∩ mask) and never spills a pixel
+        beyond it. Display only; the vectors stay authoritative.
         """
         from scipy import ndimage
 
@@ -1043,7 +1043,9 @@ class HSIDataset:
                 continue
             fill |= r
             if outline and r.any():
-                edge |= ndimage.binary_dilation(r) & ~r
+                # inner rim: the border never extends past the real region,
+                # so the drawn footprint equals the measured one
+                edge |= r & ~ndimage.binary_erosion(r)
         n = int(color.lstrip("#"), 16)
         rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
         rgba = np.zeros((hp, wp, 4), dtype=np.uint8)

@@ -14,7 +14,9 @@ import type { LayerObj, RoiAtom, RoiPart } from './api'
 
 const FILL_ALPHA = 0.28
 const EDGE_ALPHA = 0.95
-const EDGE_PX = 1 // outline thickness in TEXTURE pixels
+// the border is drawn INSIDE the region: what looks covered is exactly what
+// is covered, so a border can never overstate the ROI by a pixel
+const EDGE_PX = 1 // inner border thickness in TEXTURE pixels
 // a thin painted stroke IS the mark: ringing a 1 px stroke with a border
 // would triple its apparent width, so thin atoms are drawn solid instead
 const THIN_PX = 4
@@ -149,12 +151,13 @@ export async function renderLayerRaster(
     paintGroup(thin, THIN_ALPHA)
   }
 
-  // 2. OUTLINES — one per ATOM, so two overlapping ROIs stay two objects.
-  //    Only a combined atom (parts merged into one atom) draws as one shape.
-  //    Each atom is rasterized inside its own bounding box, so the cost
-  //    follows the atom's size rather than the image's.
+  // 2. BORDERS — one per ATOM (two overlapping ROIs stay two objects; only a
+  //    combined atom draws as one shape), traced on the INSIDE of the atom
+  //    and inside its own bounding box, so the cost follows the atom's size
+  //    rather than the image's.
   const scratch = new OffscreenCanvas(1, 1)
   const halo = new OffscreenCanvas(1, 1)
+  const rim = new OffscreenCanvas(1, 1)
   const edges = new OffscreenCanvas(pw, ph)
   const edgeCtx = edges.getContext('2d')
   if (!edgeCtx) return null
@@ -186,12 +189,24 @@ export async function renderLayerRaster(
       tracePart(sctx, part, factor)
     }
     sctx.setTransform(1, 0, 0, 1, 0, 0)
-    // halo = coverage stamped around a ring, minus the coverage itself
+    // erosion = the coverage intersected with itself shifted every way;
+    // border = coverage minus that erosion, i.e. the inner rim
+    hctx.drawImage(scratch, 0, 0)
+    hctx.globalCompositeOperation = 'destination-in'
     for (const [dx, dy] of ring) hctx.drawImage(scratch, dx, dy)
     hctx.globalCompositeOperation = 'destination-out'
-    hctx.drawImage(scratch, 0, 0)
+    // now turn the eroded core into the rim: redraw coverage, cut the core
+    rim.width = bw
+    rim.height = bh
+    const rctx = rim.getContext('2d')
+    if (!rctx) continue
+    rctx.clearRect(0, 0, bw, bh)
+    rctx.drawImage(scratch, 0, 0)
+    rctx.globalCompositeOperation = 'destination-out'
+    rctx.drawImage(halo, 0, 0)
+    rctx.globalCompositeOperation = 'source-over'
     hctx.globalCompositeOperation = 'source-over'
-    edgeCtx.drawImage(halo, bx, by)
+    edgeCtx.drawImage(rim, bx, by)
   }
   edgeCtx.globalCompositeOperation = 'source-in'
   edgeCtx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${EDGE_ALPHA})`
