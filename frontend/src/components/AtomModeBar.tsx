@@ -255,7 +255,9 @@ export function AtomModeBar({
                   <div className="relative">
                     <button
                       className={toolBtn(!erasing)}
-                      title="click: cycle rect → polygon → brush · right-click: nib size"
+                      title={erasing
+                        ? `back to ${roiShape}`
+                        : 'click: cycle rect → polygon → brush · right-click: nib size'}
                       onClick={onCycleShape}
                       onContextMenu={(e) => {
                         e.preventDefault()

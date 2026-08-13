@@ -21,7 +21,9 @@ body {
 }
 @keyframes ants-march {
   to {
-    stroke-dashoffset: -18;
+    /* one dash period in USER units; the overlay sets --ants-shift so the
+       march speed stays constant on screen at any zoom */
+    stroke-dashoffset: var(--ants-shift, -18);
   }
 }
 

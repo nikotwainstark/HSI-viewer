@@ -211,10 +211,18 @@ export function LayersPanel({
           { label: 'Hide all', hint: `${asel.length} atoms`, onClick: () => onSetAtomsVisibleMany(layer.id, asel, false) },
           { label: 'Show all', onClick: () => onSetAtomsVisibleMany(layer.id, asel, true) },
           { divider: true, label: 'compute' } as MenuEntry,
-          ...(isHsi
+          // pure-vector combines are a local parts union and work on any
+          // image; only combines involving raster mask atoms need the HSI
+          // cache machinery
+          ...(isHsi ||
+          asel.every((id) => layer.atoms.find((a) => a.id === id)?.kind === 'roi')
             ? [{
                 label: 'Combine all',
-                hint: '∪ atoms → mask atom (this layer)',
+                hint: asel.every(
+                  (id) => layer.atoms.find((a) => a.id === id)?.kind === 'roi',
+                )
+                  ? '∪ ROIs → one multi-part ROI'
+                  : '∪ atoms → mask atom (this layer)',
                 onClick: () => onCombineAtoms(layer.id, asel),
               }]
             : []),

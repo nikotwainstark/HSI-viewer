@@ -21,6 +21,7 @@ from .dataset import (
     HSIDataset,
     ProgressFn,
     _stretch_limits,
+    png_level,
     pool_by,
     resolve_axis_order,
     zarr_array_shape,
@@ -58,6 +59,22 @@ class ImageEntry:
         self.array = array
         self.dtype_label = dtype_label
         self.version = int(time.time())
+
+    def geom_dataset(self) -> "HSIDataset":
+        """Backing dataset for a NON-HSI entry, built lazily on first use.
+
+        Layers, ROI atoms and landmarks are image-type agnostic — an RGB
+        photograph is simply a 3-band cube (a scalar map a 1-band one), so the
+        geometry endpoints (outlines, layer regions, exports) run on this
+        dataset while the canvas keeps the entry's own display rendering.
+        """
+        if self.dataset is None:
+            a = self.array
+            assert a is not None, "geom_dataset() is for loaded entries"
+            cube = a if a.ndim == 3 else a[..., None]
+            self.dataset = _dataset_from_cube(np.ascontiguousarray(cube),
+                                              self.path)
+        return self.dataset
 
     def info(self) -> dict:
         base = {
@@ -103,7 +120,8 @@ class ImageEntry:
                      for c in range(3)]
             rgb = np.clip(np.stack(chans, axis=-1), 0, 255).astype(np.uint8)
             buf = io.BytesIO()
-            Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+            Image.fromarray(rgb, mode="RGB").save(
+                buf, format="PNG", compress_level=png_level(rgb[..., 0].size))
             return buf.getvalue()
         img = pool_by(self.array.astype(np.float32), factor)
         lo, hi = _stretch_limits(img, plo, phi)
@@ -130,6 +148,17 @@ def _flat_entry(entry_id: int, name: str, path: str, itype: str,
     progress(1.0, "ready")
     logger.info("loaded %s image %s %s", itype, name, arr.shape)
     return ImageEntry(entry_id, name, path, itype, array=arr, dtype_label=dtype_label)
+
+
+def _dataset_from_cube(cube_arr: np.ndarray, path: str) -> HSIDataset:
+    """(H, W, B) array -> ready HSIDataset with a plain band-index axis."""
+    cube = zarr.array(cube_arr,
+                      chunks=(min(300, cube_arr.shape[0]),
+                              min(300, cube_arr.shape[1]), cube_arr.shape[2]))
+    ds = HSIDataset(cube=cube, wavenumbers=None, mask=None, key_path=path,
+                    axis_kind="index")
+    ds.ensure_ready(lambda f, m: None)
+    return ds
 
 
 def entry_from_array(entry_id: int, name: str, path: str, arr: np.ndarray,

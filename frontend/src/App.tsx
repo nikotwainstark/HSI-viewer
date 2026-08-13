@@ -80,6 +80,7 @@ import {
 } from './lib/api'
 import { usePreviewImage } from './hooks/usePreviewImage'
 import { useElementSize } from './hooks/useElementSize'
+import { useHistory } from './hooks/useHistory'
 import { fitBounds, gridBackgroundStyle, project, unproject, type ViewState } from './lib/view'
 import {
   applyT,
@@ -101,8 +102,8 @@ import { ThresholdPanel, type ThresholdState } from './components/ThresholdPanel
 import { BlobCleanPanel, type BlobCleanState } from './components/BlobCleanPanel'
 import { IsolatePanel, type IsolateState } from './components/IsolatePanel'
 import { AtomModeBar, type AtomType } from './components/AtomModeBar'
-import { layerRasterKey, rasterFactor, renderLayerRaster } from './lib/layerRaster'
-import { rasterizeParts, regionBitmap, regionEdges } from './lib/pixelRegion'
+import { clipFactor, layerRasterKey, renderLayerRaster, type LayerRaster } from './lib/layerRaster'
+import { mergeRegions, rasterizeParts, regionBitmap, regionEdges, subtractRegion } from './lib/pixelRegion'
 import { PreprocessPanel } from './components/PreprocessPanel'
 import { MaskPicker } from './components/MaskPicker'
 import { StepParamDialog } from './components/StepParamDialog'
@@ -232,6 +233,29 @@ const DEFAULT_LAYOUT: ImgLayout = { dx: 0, dy: 0, rot: 0, sx: 1, sy: 1, alpha: 1
 
 const DASH_EXT = [new PathStyleExtension({ dash: true })]
 
+/** Outline of the nib's footprint, in the image's native coords.
+    Up to NIB_EXACT_PX it is the PIXEL STAIRCASE the dab would actually ink —
+    same rasterization the stroke commits, so what the cursor promises is what
+    lands. Beyond that a circle stands in: at those sizes a pixel is far below
+    one screen pixel and tracing thousands of steps buys nothing. */
+const NIB_EXACT_PX = 128
+
+function nibOutline(
+  x: number, y: number, size: number, w: number, h: number,
+): [number, number][][] {
+  if (size <= NIB_EXACT_PX) {
+    const region = rasterizeParts([{ shape: 'brush', points: [[x, y]], width: size }], w, h, 1)
+    return region ? regionEdges(region) : []
+  }
+  const r = Math.max(size / 2, 0.5)
+  const ring: [number, number][] = []
+  for (let i = 0; i <= 64; i++) {
+    const a = (i / 64) * Math.PI * 2
+    ring.push([x + r * Math.cos(a), y + r * Math.sin(a)])
+  }
+  return [ring]
+}
+
 /** Magnify with NEAREST so a zoomed-in pixel stays a crisp square: at high
     zoom the eye has to line ROI edges up with data pixels, and interpolation
     would blur exactly the boundary being judged. Minification keeps linear
@@ -241,6 +265,13 @@ const PIXEL_TEXTURE = {
   minFilter: 'linear' as const,
   mipmapFilter: 'linear' as const,
 }
+
+/** Band-scrub preview: pooled render used ONLY while the spectral axis is
+    being dragged. Two band changes closer together than SCRUB_GAP_MS read as
+    a drag; SCRUB_IDLE_MS of quiet ends it and the canvas returns to native. */
+const SCRUB_FACTOR = 4
+const SCRUB_GAP_MS = 150
+const SCRUB_IDLE_MS = 200
 
 /** Active coregistration session: moving = the SELECTED image, adjusted with
     the transform handles; target = frozen at native orientation. */
@@ -275,7 +306,6 @@ interface ImageUIState {
   band: number
   stretch: Stretch
   cmap: string
-  previewFactor: DisplayFactor
   picks: PickedPixel[]
   regions: SpecRegion[]
   spectrumMode: SpectrumMode
@@ -403,9 +433,29 @@ export default function App() {
   // live painted stroke (native coords) while the pointer is down
   const [brushStroke, setBrushStroke] = useState<[number, number][] | null>(null)
   const painting = useRef(false)
+  /** Incremental raster of the stroke BEING painted. Re-rasterizing the whole
+      path per frame is O(stroke area) and makes long strokes progressively
+      laggier, so points are baked into `stable` in batches and only the live
+      tail is rasterized per frame (the tail is drawn minus the baked coverage
+      so the two never double-blend). */
+  const strokeCache = useRef<{
+    baked: number
+    stable: import('./lib/pixelRegion').PixelRegion | null
+    bitmap: ImageBitmap | null
+    width: number
+    color: string
+  } | null>(null)
   // the ROI atom the brush is currently building (null = start a new one)
   const brushAtomId = useRef<number | null>(null)
   const [brushAtomStrokes, setBrushAtomStrokes] = useState(0)
+
+  // the stroke preview cache dies with its stroke
+  useEffect(() => {
+    if (brushStroke == null && strokeCache.current) {
+      strokeCache.current.bitmap?.close?.()
+      strokeCache.current = null
+    }
+  }, [brushStroke])
 
   /** Close the ROI the brush is building; the next stroke starts a new one. */
   const finishBrushAtom = useCallback(() => {
@@ -418,12 +468,11 @@ export default function App() {
   const [mouseWorld, setMouseWorld] = useState<[number, number] | null>(null)
   const [clipBitmaps, setClipBitmaps] = useState<Map<string, ImageBitmap>>(new Map())
   // one composited texture per layer (client-side, no round trip)
-  const [layerRasters, setLayerRasters] = useState<Map<string, ImageBitmap>>(new Map())
+  const [layerRasters, setLayerRasters] = useState<Map<string, LayerRaster>>(new Map())
   const rasterPending = useRef(new Set<string>())
   // ROI borders as PIXEL EDGES: segments along the boundary between covered
   // and uncovered data pixels, drawn in screen space so they stay crisp at
   // any zoom while still describing exactly which pixels are inside
-  const [layerEdges, setLayerEdges] = useState<Map<string, [number, number][][]>>(new Map())
 
   const clipPending = useRef(new Set<string>())
   const [layerMaskPicker, setLayerMaskPicker] = useState(false)
@@ -444,7 +493,38 @@ export default function App() {
   const [tool, setTool] = useState<Tool>('drag')
   const [stretch, setStretch] = useState<Stretch>({ lo: 2, hi: 98 })
   const [cmap, setCmap] = useState('grey')
-  const [previewFactor, setPreviewFactor] = useState<DisplayFactor>(4)
+  /** Display resolution is NOT a setting. The canvas always shows the data at
+      native resolution, so a ROI always sits on the pixels it was drawn over.
+      The single exception is SCRUBBING the spectral axis: while bands fly past
+      nothing on screen is readable anyway, so the image drops to a pooled
+      render and every overlay is hidden to keep the drag fluid. The moment the
+      drag stops, the native band render returns and the objects redraw on it.
+
+      Scrubbing is detected from the CHANGE RATE, not from pointer events, so
+      the slider, the spectrum's band line and key repeat all behave alike: a
+      single jump never leaves native, a real drag drops to preview at once. */
+  const [scrubbing, setScrubbing] = useState(false)
+  const lastBandChange = useRef(0)
+  const scrubIdle = useRef<number | null>(null)
+  const viewFactor: DisplayFactor = scrubbing ? SCRUB_FACTOR : 1
+  const changeBand = useCallback((b: number) => {
+    setBand(b)
+    setDisplay({ kind: 'band', band: b })
+    const now = performance.now()
+    if (now - lastBandChange.current < SCRUB_GAP_MS) setScrubbing(true)
+    lastBandChange.current = now
+    if (scrubIdle.current != null) window.clearTimeout(scrubIdle.current)
+    scrubIdle.current = window.setTimeout(() => setScrubbing(false), SCRUB_IDLE_MS)
+  }, [])
+
+  /** Render factor for a MASK-BOUND layer, which the backend composites over
+      the whole frame (its region can be the whole frame). Native like
+      everything else; only an image past the budget is pooled, and pooling by
+      an integer factor keeps the overlay's edges on the native grid. */
+  const layerRasterFactorFor = useCallback(
+    (): number => (meta ? clipFactor(meta.shape[1], meta.shape[0]) : 1),
+    [meta],
+  )
   const [viewState, setViewState] = useState<ViewState | null>(null)
   const [panelWidth, setPanelWidth] = useState(() =>
     Math.max(300, Math.min(430, window.innerWidth / 3)),
@@ -541,6 +621,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selLayout.dx, selLayout.dy, selLayout.rot, selLayout.sx, selLayout.sy, selW, selH],
   )
+  /** image-local -> world affine for SVG overlays ([a,b,c,d,e,f]). */
+  const selAffine = useMemo((): [number, number, number, number, number, number] => {
+    const o = applyT(selLayout, selW, selH, [0, 0])
+    const ex = applyT(selLayout, selW, selH, [1, 0])
+    const ey = applyT(selLayout, selW, selH, [0, 1])
+    return [ex[0] - o[0], ex[1] - o[1], ey[0] - o[0], ey[1] - o[1], o[0], o[1]]
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selLayout.dx, selLayout.dy, selLayout.rot, selLayout.sx, selLayout.sy, selW, selH])
   const selMatrix = useMemo(
     () => modelMatrixOf(selLayout, selW, selH),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -549,6 +637,67 @@ export default function App() {
   // coregistration session + confirmed records
   const [coreg, setCoreg] = useState<CoregState | null>(null)
   const [registrations, setRegistrations] = useState<RegistrationRecord[]>([])
+
+  /** UNDO / REDO scope: the objects you edit on the canvas — layers and their
+      atoms, picked pixels, spectral regions, and the selected image's own
+      placement. Server-side work (preprocessing steps, cache objects, in-place
+      crop, loading or removing images) is deliberately OUT: those own data on
+      the backend and have their own reversal paths, and silently rolling them
+      back from a keystroke would be a lie about what the data is. */
+  // History tracks STRUCTURE, never sampled numbers: a picked pixel's spectrum
+  // is re-read whenever the data changes, and replaying an old copy of those
+  // values would show numbers the current data does not have. So picks keep a
+  // stable identity across value refreshes here, and a restored pick is
+  // re-sampled from the live data below.
+  const picksShape = picks.map((p) => `${p.id}:${p.row},${p.col},${p.color}`).join('|')
+  const picksForHistory = useMemo(() => picks, [picksShape]) // eslint-disable-line react-hooks/exhaustive-deps
+  const historyDoc = useMemo(
+    () => ({ layers, activeLayerId, picks: picksForHistory, regions, layout: selLayout }),
+    [layers, activeLayerId, picksForHistory, regions, selLayout],
+  )
+  const applyHistoryDoc = useCallback((d: typeof historyDoc) => {
+    setLayers(d.layers)
+    setActiveLayerId(d.activeLayerId)
+    setRegions(d.regions)
+    setPicks(d.picks)
+    // a pick restored from history carries the spectrum of the data state it
+    // was taken in — re-read it so the plot always shows the live data
+    void Promise.all(
+      d.picks.map((p) =>
+        fetchPixelSpectrum(p.row, p.col)
+          .then((sp) => ({ ...p, values: sp.values }))
+          .catch(() => p),
+      ),
+    ).then((fresh) => setPicks((cur) => (cur.length === fresh.length ? fresh : cur)))
+    // selections and half-drawn shapes describe a document that just changed
+    // under them, so they start clean
+    setPanelSel({ layers: [], atoms: { layerId: -1, ids: [] } })
+    setRoiDraft([])
+    const id = metaRef.current?.image.id
+    if (id != null) setLayouts((l) => ({ ...l, [id]: d.layout }))
+  }, [])
+  const history = useHistory(historyDoc, applyHistoryDoc, meta?.image.id ?? null, !!coreg)
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return
+      const k = e.key.toLowerCase()
+      if (k !== 'z' && k !== 'y') return
+      const el = e.target as HTMLElement | null
+      // a text field owns its own undo
+      if (el && (el.isContentEditable || /^(input|textarea|select)$/i.test(el.tagName))) return
+      e.preventDefault()
+      if (coreg) {
+        setToast('Finish or cancel the coregistration first')
+        return
+      }
+      const redo = k === 'y' || e.shiftKey
+      const done = redo ? history.redo() : history.undo()
+      setToast(done ? (redo ? 'Redo' : 'Undo') : `Nothing to ${redo ? 'redo' : 'undo'}`)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [history, coreg])
   const [coregPick, setCoregPick] = useState<{ layerId: number; x: number; y: number } | null>(null)
   // transform-handle mode: which image is being manually transformed
   const [transformImage, setTransformImage] = useState<number | null>(null)
@@ -680,8 +829,11 @@ export default function App() {
       if (p.length >= 3 && p.length === q.length) {
         const fit = solveSimilarity(p, q)
         if (fit) {
+          // a mirrored fit (flipped section) is a negative vertical scale —
+          // same decomposition the manual flip buttons use
           const base: ImgLayout = {
-            dx: 0, dy: 0, rot: fit.rot, sx: fit.scale, sy: fit.scale, alpha: 0.5,
+            dx: 0, dy: 0, rot: fit.rot, sx: fit.scale,
+            sy: fit.mirrored ? -fit.scale : fit.scale, alpha: 0.5,
           }
           const org = applyT(base, wm, hm, [0, 0])
           init = {
@@ -697,6 +849,10 @@ export default function App() {
         init = {
           ...DEFAULT_LAYOUT,
           alpha: 0.5,
+          // the moving image's own flip is kept: mirroring it beforehand was
+          // a statement about the specimen, not just a viewing convenience
+          sx: savedMoving.sx < 0 ? -1 : 1,
+          sy: savedMoving.sy < 0 ? -1 : 1,
           dx: frozenTarget.dx + target.shape[1] / 2 - wm / 2,
           dy: frozenTarget.dy + target.shape[0] / 2 - hm / 2,
         }
@@ -952,7 +1108,6 @@ export default function App() {
         setBand(bundle.band)
         setStretch(bundle.stretch)
         setCmap(bundle.cmap)
-        setPreviewFactor(bundle.previewFactor)
         setPicks(bundle.picks)
         setRegions(bundle.regions)
         setSpectrumMode(bundle.spectrumMode)
@@ -965,7 +1120,6 @@ export default function App() {
         setBand(m.default_band)
         setStretch({ lo: 2, hi: 98 })
         setCmap('grey')
-        setPreviewFactor(4)
         setPicks([])
         setRegions([])
         setSpectrumMode('avg')
@@ -995,17 +1149,19 @@ export default function App() {
         const [cx, cy] = applyT(l, m.shape[1], m.shape[0], [m.shape[1] / 2, m.shape[0] / 2])
         animateTargetTo(cx, cy)
       }
-      if (m.image.type !== 'hsi') setPanelTab('image')
+      if (m.image.type !== 'hsi') {
+        setPanelTab((t) => (t === 'layers' ? t : 'image'))
+      }
     },
     [refreshCache, animateTargetTo],
   )
 
   const snapshotBundle = useCallback(
     (): ImageUIState => ({
-      display, band, stretch, cmap, previewFactor, picks, regions, spectrumMode, pipeItems,
+      display, band, stretch, cmap, picks, regions, spectrumMode, pipeItems,
       layers, activeLayerId, roiSpectra,
     }),
-    [display, band, stretch, cmap, previewFactor, picks, regions, spectrumMode, pipeItems,
+    [display, band, stretch, cmap, picks, regions, spectrumMode, pipeItems,
      layers, activeLayerId, roiSpectra],
   )
 
@@ -1028,6 +1184,7 @@ export default function App() {
   const doDeleteImage = useCallback(
     async (id: number) => {
       imageBundles.current.delete(id)
+      history.clear(id)
       try {
         const l = await deleteImage(id)
         setImages(l.images)
@@ -1047,7 +1204,7 @@ export default function App() {
         setToast((e as Error).message)
       }
     },
-    [meta, applySelectedMeta],
+    [meta, applySelectedMeta, history],
   )
 
   // ------------------------------------------------------- layers & atoms
@@ -1102,7 +1259,10 @@ export default function App() {
       setErasing(false)
       setTool(shape === 'brush' ? 'brush' : 'roi')
       setRoiDraft([])
-      finishBrushAtom()
+      // Deliberately NOT finishBrushAtom(): switching tool or shape inside
+      // the mode keeps painting into the SAME ROI. Only an explicit "new ROI"
+      // / Enter ends it, or a context where appending would be wrong (leaving
+      // the mode, switching to another layer).
       // arming atom drawing with no active layer auto-creates a plain one
       // (the create-layer path, never mask-bound)
       if (activeLayerId == null || !layers.some((l) => l.id === activeLayerId)) {
@@ -1341,14 +1501,14 @@ export default function App() {
     !!layer.maskSource || layer.atoms.some((a) => a.kind === 'mask' && a.visible !== false)
 
   useEffect(() => {
-    if (!meta || !isHsi) return
+    if (!meta) return
     for (const layer of layers) {
       if (!layer.visible || !layerNeedsBackendRaster(layer)) continue
       const vis = layer.atoms.filter((a) => a.visible !== false)
       const atomParts = vis.flatMap((a) => (a.kind === 'roi' ? [a.parts] : []))
       const maskAtoms = vis.flatMap((a) => (a.kind === 'mask' ? [a.cacheIds] : []))
       if (!atomParts.length && !maskAtoms.length && !layer.maskSource) continue
-      const key = layerClipKey(layer, meta.image.id, previewFactor)
+      const key = layerClipKey(layer, meta.image.id, layerRasterFactorFor())
       if (clipBitmaps.has(key) || clipPending.current.has(key)) continue
       clipPending.current.add(key)
       fetchRoiClip({
@@ -1357,14 +1517,14 @@ export default function App() {
         ...(layer.maskSource?.kind === 'cache' ? { cache_ids: layer.maskSource.ids } : {}),
         ...(layer.maskSource?.kind === 'local' ? { path: layer.maskSource.path } : {}),
         color: layer.color,
-        pf: previewFactor,
+        pf: layerRasterFactorFor(),
       })
         .then((blob) => createImageBitmap(blob))
         .then((bm) => setClipBitmaps((m) => new Map(m).set(key, bm)))
         .catch(() => {/* display only */})
         .finally(() => clipPending.current.delete(key))
     }
-  }, [layers, meta, isHsi, previewFactor, clipBitmaps, layerClipKey])
+  }, [layers, meta, layerRasterFactorFor, clipBitmaps, layerClipKey])
 
   // native outline contours for mask atoms: needed for highlight rendering
   // AND for canvas hit-testing (the active layer's mask atoms are clickable
@@ -1391,7 +1551,7 @@ export default function App() {
   }, [panelSel, layers, meta, maskAtomOutlines, activeLayerId])
 
   // composite each layer's ROI atoms into one texture; keyed by geometry,
-  // colour, preview factor and image, so edits invalidate it naturally
+  // colour, raster factor and image, so edits invalidate it naturally
   useEffect(() => {
     if (!meta) return
     const live = new Set<string>()
@@ -1400,21 +1560,13 @@ export default function App() {
       // layers whose region depends on a server-side mask are rendered
       // entirely by the backend (fill AND borders clipped by that mask)
       if (layerNeedsBackendRaster(layer)) continue
-      const rf = rasterFactor(meta.shape[1], meta.shape[0])
-      const key = layerRasterKey(layer, meta.image.id, rf)
+      const key = layerRasterKey(layer, meta.image.id)
       live.add(key)
       if (layerRasters.has(key) || rasterPending.current.has(key)) continue
       rasterPending.current.add(key)
-      renderLayerRaster(layer, meta.shape[1], meta.shape[0], rf)
-        .then((bm) => {
-          if (bm) setLayerRasters((m) => new Map(m).set(key, bm))
-          const segs: [number, number][][] = []
-          for (const a of layer.atoms) {
-            if (a.kind !== 'roi' || a.visible === false) continue
-            const region = rasterizeParts(a.parts, meta.shape[1], meta.shape[0], rf)
-            if (region) segs.push(...regionEdges(region))
-          }
-          setLayerEdges((m) => new Map(m).set(key, segs))
+      renderLayerRaster(layer, meta.shape[1], meta.shape[0])
+        .then((r) => {
+          if (r) setLayerRasters((m) => new Map(m).set(key, r))
         })
         .catch(() => {/* display only: a failed texture just draws nothing */})
         .finally(() => rasterPending.current.delete(key))
@@ -1422,15 +1574,15 @@ export default function App() {
     // drop textures nobody references any more (they hold GPU memory)
     if (layerRasters.size > live.size + 8) {
       setLayerRasters((m) => {
-        const next = new Map<string, ImageBitmap>()
+        const next = new Map<string, LayerRaster>()
         for (const [k, v] of m) {
           if (live.has(k)) next.set(k, v)
-          else v.close?.()
+          else v.bitmap?.close?.()
         }
         return next
       })
     }
-  }, [layers, meta, layerRasters])
+  }, [layers, meta, layerRasters, layerRasterFactorFor])
 
   /** Outer silhouettes of MULTI-PART ROI atoms, so a combined ROI draws as
       one shape instead of stacked part borders. Keyed by image + geometry,
@@ -1766,6 +1918,7 @@ export default function App() {
       const l = await clearImages()
       setImages(l.images)
       imageBundles.current.clear()
+      history.clear()
       setMeta(null)
       setPanelTab('image')
       setViewState(null)
@@ -1779,14 +1932,14 @@ export default function App() {
     } catch (e) {
       setToast((e as Error).message)
     }
-  }, [])
+  }, [history])
 
   const imageUrl = meta
     ? threshold
-      ? thresholdUrl(meta, display, threshold.value, threshold.reverse, pipelineVersion, previewFactor)
+      ? thresholdUrl(meta, display, threshold.value, threshold.reverse, pipelineVersion, viewFactor)
       : blobClean
         ? maskCleanUrl(meta, blobClean.maskId, blobClean)
-        : previewUrl(meta, display, stretch, cmap, pipelineVersion, previewFactor)
+        : previewUrl(meta, display, stretch, cmap, pipelineVersion, viewFactor)
     : null
   const bitmap = usePreviewImage(imageUrl, setToast)
 
@@ -1982,8 +2135,9 @@ export default function App() {
     for (const im of images) {
       if (meta && im.id === meta.image.id) continue
       const bundle = imageBundles.current.get(im.id)
-      // each layer renders at ITS OWN preview resolution
-      m.set(im.id, imageLayerUrl(im, bundle, bundle?.previewFactor ?? 4))
+      // a backdrop image is native too: its own overlays are drawn on its
+      // pixel grid and must line up with it
+      m.set(im.id, imageLayerUrl(im, bundle, 1))
     }
     return m
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2017,6 +2171,7 @@ export default function App() {
             textureParameters: PIXEL_TEXTURE,
           }))
         }
+        if (scrubbing) continue
         // FROZEN overlays: a non-selected image keeps showing its visible
         // layers (state snapshotted at switch-away), read-only and faded —
         // e.g. its landmarks stay in sight while placing the other image's
@@ -2104,6 +2259,10 @@ export default function App() {
         }
       }
     }
+    // scrubbing the band axis: images only. Every object below is positioned
+    // on the native grid the pooled render does not have, and none of it can
+    // be read while bands fly past — it comes back the moment the drag stops.
+    if (scrubbing) return result
     // coreg: everything outside the target window is blanked by a dark cover
     // with a hole over the target — the moving overlay only shows inside the
     // "Coregistration border" while both image outlines stay visible on top
@@ -2210,7 +2369,7 @@ export default function App() {
       // mask-bound layers (and layers with raster mask atoms) come from the
       // backend as ONE composited image
       if (layerNeedsBackendRaster(layer)) {
-        const bm = clipBitmaps.get(layerClipKey(layer, meta.image.id, previewFactor))
+        const bm = clipBitmaps.get(layerClipKey(layer, meta.image.id, layerRasterFactorFor()))
         if (bm) {
           result.push(
             new BitmapLayer({
@@ -2226,18 +2385,15 @@ export default function App() {
       // ROI atoms of this layer are COMPOSITED into a single texture (see
       // lib/layerRaster): overlapping atoms never double-blend, holes are
       // exact, and the deck layer count stays independent of the atom count
-      const rasterKey = layerRasterKey(
-        layer, meta.image.id, rasterFactor(meta.shape[1], meta.shape[0]),
-      )
-      const layerBitmap = layerNeedsBackendRaster(layer)
+      const raster = layerNeedsBackendRaster(layer)
         ? undefined
-        : layerRasters.get(rasterKey)
-      if (layerBitmap) {
+        : layerRasters.get(layerRasterKey(layer, meta.image.id))
+      if (raster?.bitmap) {
         result.push(
           new BitmapLayer({
             id: `layer-raster-${layer.id}`,
-            image: layerBitmap,
-            bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
+            image: raster.bitmap,
+            bounds: raster.bounds,
             modelMatrix: selMatrix,
             textureParameters: PIXEL_TEXTURE,
           }),
@@ -2245,7 +2401,7 @@ export default function App() {
       }
       // borders: vector segments along pixel edges — crisp at any zoom,
       // and they trace the exact set of pixels the ROI covers
-      const edgeSegs = layerNeedsBackendRaster(layer) ? undefined : layerEdges.get(rasterKey)
+      const edgeSegs = raster?.edges
       if (edgeSegs?.length) {
         result.push(
           new PathLayer({
@@ -2436,9 +2592,9 @@ export default function App() {
     // NOTE: the in-progress draft lives in `draftLayers` — keep fast-changing
     // pointer state (brushStroke / roiDraft / mouseWorld) out of this memo
   }, [meta, bitmap, picks, zOrder, layouts, images, layerUrls, selMatrix,
-      layers, clipBitmaps, previewFactor, activeLayerId,
-      panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerEdges, layerClipKey,
-      transformImage, rotOffsetWorld, coreg, isolate])
+      layers, clipBitmaps, scrubbing, activeLayerId,
+      panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerClipKey,
+      layerRasterFactorFor, transformImage, rotOffsetWorld, coreg, isolate])
 
 
   /** In-progress drawing (painted stroke, rubber-band shape). Kept OUT of the
@@ -2451,46 +2607,102 @@ export default function App() {
     if (brushStroke?.length && !selHidden) {
       // preview the PIXELS the nib will cover, not a smooth round line: the
       // stroke lands on the data grid, so the preview must speak in pixels
+      // (always at native resolution — the raster only spans the stroke bbox)
       const erasingNow = tool === 'erase'
       const c = erasingNow
         ? '#fca5a5'
         : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0]
       const rgbD = hexToRgb(c)
-      const rf = rasterFactor(meta.shape[1], meta.shape[0])
-      const region = rasterizeParts(
-        [{ shape: 'brush', points: brushStroke, width: erasingNow ? eraserSize : brushSize }],
-        meta.shape[1], meta.shape[0], rf,
+      const width = erasingNow ? eraserSize : brushSize
+      // a hairline is its own mark: draw it solid like committed thin atoms
+      const alpha = erasingNow ? 0.55 : width <= 4 ? 0.8 : 0.45
+      const BAKE_EVERY = 64
+      let cache = strokeCache.current
+      if (!cache || cache.width !== width || cache.color !== c) {
+        cache?.bitmap?.close?.()
+        cache = { baked: 1, stable: null, bitmap: null, width, color: c }
+        strokeCache.current = cache
+      }
+      if (brushStroke.length - cache.baked >= BAKE_EVERY) {
+        // fold the tail into the baked raster (include the joining point so
+        // the capsules connect) — amortized O(area / BAKE_EVERY) per frame
+        const grown = rasterizeParts(
+          [{ shape: 'brush', width,
+             points: brushStroke.slice(Math.max(0, cache.baked - 1)) }],
+          meta.shape[1], meta.shape[0], 1,
+        )
+        if (grown) {
+          cache.stable = cache.stable ? mergeRegions(cache.stable, grown) : grown
+          cache.bitmap?.close?.()
+          cache.bitmap = regionBitmap(cache.stable, rgbD, alpha)
+          cache.baked = brushStroke.length
+        }
+      }
+      if (cache.bitmap && cache.stable) {
+        const r = cache.stable
+        out.push(
+          new BitmapLayer({
+            id: 'brush-draft-stable',
+            image: cache.bitmap,
+            bounds: [r.x0, r.y0 + r.h, r.x0 + r.w, r.y0] as [number, number, number, number],
+            modelMatrix: selMatrix,
+            textureParameters: PIXEL_TEXTURE,
+          }),
+        )
+      }
+      const tail = rasterizeParts(
+        [{ shape: 'brush', width,
+           points: brushStroke.slice(Math.max(0, cache.baked - 1)) }],
+        meta.shape[1], meta.shape[0], 1,
       )
-      if (region) {
-        const bm = regionBitmap(region, rgbD, erasingNow ? 0.55 : 0.45)
+      if (tail) {
+        subtractRegion(tail, cache.stable)
+        const bm = regionBitmap(tail, rgbD, alpha)
         if (bm) {
           out.push(
             new BitmapLayer({
-              id: 'brush-draft-fill',
+              id: 'brush-draft-tail',
               image: bm,
               bounds: [
-                region.x0 * rf, (region.y0 + region.h) * rf,
-                (region.x0 + region.w) * rf, region.y0 * rf,
+                tail.x0, tail.y0 + tail.h, tail.x0 + tail.w, tail.y0,
               ] as [number, number, number, number],
               modelMatrix: selMatrix,
               textureParameters: PIXEL_TEXTURE,
             }),
           )
         }
-        out.push(
-          new PathLayer({
-            id: 'brush-draft-edges',
-            data: regionEdges(region),
-            getPath: (d: [number, number][]) => d,
-            getColor: [...rgbD, 255] as [number, number, number, number],
-            getWidth: 1.5,
-            widthUnits: 'pixels',
-            widthMinPixels: 1,
-            jointRounded: false,
-            capRounded: false,
-            modelMatrix: selMatrix,
-          }),
-        )
+      }
+    }
+    // nib preview: a dashed outline of the footprint under the cursor, so the
+    // size is legible BEFORE putting it down
+    if ((tool === 'brush' || tool === 'erase') && mouseWorld && !selHidden) {
+      const [nx, ny] = mouseWorld
+      const [ih, iw] = meta.shape
+      if (nx >= 0 && ny >= 0 && nx < iw && ny < ih) {
+        const erasingNow = tool === 'erase'
+        const rgbN = hexToRgb(erasingNow
+          ? '#fca5a5'
+          : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0])
+        const paths = nibOutline(nx, ny, erasingNow ? eraserSize : brushSize, iw, ih)
+        if (paths.length) {
+          out.push(
+            new PathLayer({
+              id: 'nib-cursor',
+              data: paths,
+              getPath: (d: [number, number][]) => d,
+              getColor: [...rgbN, 235] as [number, number, number, number],
+              getWidth: 1.2,
+              widthUnits: 'pixels',
+              widthMinPixels: 1,
+              jointRounded: false,
+              capRounded: false,
+              modelMatrix: selMatrix,
+              extensions: DASH_EXT,
+              getDashArray: [4, 3] as [number, number],
+              dashJustified: true,
+            }),
+          )
+        }
       }
     }
     if ((tool === 'roi' || tool === 'crop') && roiDraft.length && !selHidden) {
@@ -2919,13 +3131,14 @@ export default function App() {
           const m = await fetchMeta()
           if (m) {
             imageBundles.current.delete(m.image.id) // frame-bound state is void
+            history.clear(m.image.id) // the id is reused, the frame is not
             applySelectedMeta(m)
           }
           setToast(st.message || 'Cropped in place')
         },
       )
     },
-    [meta, runPipelineJob, applySelectedMeta],
+    [meta, runPipelineJob, applySelectedMeta, history],
   )
 
   /** Crop the selected image to a pixel window (from a drawn box or a ROI
@@ -3400,32 +3613,93 @@ export default function App() {
     [viewState, meta, coreg, transformImage, tool, size, zOrder, images, layouts, doSelectImage],
   )
 
-  const handlePointerMove = useCallback(
-    (e: ReactPointerEvent) => {
-      if (!viewState || !meta) return
+  /** Pointer moves arrive at the mouse's report rate (125–1000 Hz), far above
+      the frame rate, and every state write re-renders the app. So move events
+      only record the latest position; ONE rAF per frame turns it into state.
+      The flush body lives in a ref so it always reads the current closure. */
+  const pointerLast = useRef<{ x: number; y: number; buttons: number } | null>(null)
+  const paintBuf = useRef<{ x: number; y: number }[]>([])
+  /** deck's controller also reports at pointer-event rate; only the LATEST
+      view state is committed, once per frame (pan/zoom stay exact: the
+      controller derives them from its own gesture-start state, not from the
+      prop we lag by a frame). */
+  const vsPending = useRef<ViewState | null>(null)
+  const vsRaf = useRef<number | null>(null)
+  const pointerRaf = useRef<number | null>(null)
+  const pointerFlush = useRef<() => void>(() => {})
+  const lastCursorPx = useRef<[number, number] | null>(null)
+  pointerFlush.current = () => {
+    if (!viewState || !meta) return
+    if (painting.current && paintBuf.current.length) {
       const rect = containerRef.current!.getBoundingClientRect()
-      const [wx, wy] = unproject(e.clientX - rect.left, e.clientY - rect.top, viewState, size)
-      if (dragImage) {
-        setLayouts((cur) => ({
-          ...cur,
-          [dragImage.id]: {
-            ...(cur[dragImage.id] ?? DEFAULT_LAYOUT),
-            dx: wx - dragImage.ax,
-            dy: wy - dragImage.ay,
-          },
-        }))
+      const buf = paintBuf.current
+      paintBuf.current = []
+      const local = buf.map(({ x, y }) =>
+        selToLocal(...unproject(x - rect.left, y - rect.top, viewState, size)),
+      )
+      setMouseWorld(local[local.length - 1])
+      setBrushStroke((cur) => {
+        const out = cur ? [...cur] : []
+        let grew = false
+        for (const [lx, ly] of local) {
+          const prev = out[out.length - 1]
+          // sample the path at ~half a pixel so strokes stay smooth but the
+          // point list does not explode
+          if (!prev || Math.hypot(lx - prev[0], ly - prev[1]) >= 0.5) {
+            out.push([lx, ly])
+            grew = true
+          }
+        }
+        return grew ? out : cur
+      })
+      return
+    }
+    const pt = pointerLast.current
+    if (!pt) return
+    const rect = containerRef.current!.getBoundingClientRect()
+    const [wx, wy] = unproject(pt.x - rect.left, pt.y - rect.top, viewState, size)
+    if (dragImage) {
+      setLayouts((cur) => ({
+        ...cur,
+        [dragImage.id]: {
+          ...(cur[dragImage.id] ?? DEFAULT_LAYOUT),
+          dx: wx - dragImage.ax,
+          dy: wy - dragImage.ay,
+        },
+      }))
+    }
+    // while PANNING the cursor sits still on screen and the world slides
+    // underneath — updating the readout would re-render every frame for a
+    // number nobody can read mid-drag
+    if ((pt.buttons & 1) !== 0 && tool === 'drag' && !dragImage) return
+    const [lx, ly] = selToLocal(wx, wy)
+    // local coords; drives the draft shape and the brush/eraser nib preview
+    if (tool === 'roi' || tool === 'crop' || tool === 'brush' || tool === 'erase') {
+      setMouseWorld([lx, ly])
+    }
+    const [h, w] = meta.shape
+    if (lx >= 0 && lx < w && ly >= 0 && ly < h) {
+      const px = Math.floor(lx)
+      const py = Math.floor(ly)
+      const prev = lastCursorPx.current
+      if (!prev || prev[0] !== px || prev[1] !== py) {
+        lastCursorPx.current = [px, py]
+        setCursorPos([px, py])
       }
-      const [lx, ly] = selToLocal(wx, wy)
-      if (tool === 'roi' || tool === 'crop') setMouseWorld([lx, ly]) // live draft preview (local)
-      const [h, w] = meta.shape
-      if (lx >= 0 && lx < w && ly >= 0 && ly < h) {
-        setCursorPos([Math.floor(lx), Math.floor(ly)])
-      } else {
-        setCursorPos(null)
-      }
-    },
-    [viewState, meta, size, dragImage, selToLocal, tool],
-  )
+    } else if (lastCursorPx.current) {
+      lastCursorPx.current = null
+      setCursorPos(null)
+    }
+  }
+  const handlePointerMove = useCallback((e: ReactPointerEvent) => {
+    pointerLast.current = { x: e.clientX, y: e.clientY, buttons: e.buttons }
+    if (pointerRaf.current == null) {
+      pointerRaf.current = requestAnimationFrame(() => {
+        pointerRaf.current = null
+        pointerFlush.current()
+      })
+    }
+  }, [])
 
   const menuItems: MenuEntry[] = useMemo(() => {
     if (!menu) return []
@@ -3715,6 +3989,7 @@ export default function App() {
           const [lx, ly] = selToLocal(wx, wy)
           painting.current = true
           setBrushStroke([[lx, ly]])
+          setMouseWorld([lx, ly])
           e.stopPropagation()
           ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
           return
@@ -3726,17 +4001,16 @@ export default function App() {
       }}
       onPointerMoveCapture={(e) => {
         if (painting.current && viewState && meta) {
-          const rect = containerRef.current!.getBoundingClientRect()
-          const [wx, wy] = unproject(e.clientX - rect.left, e.clientY - rect.top,
-                                     viewState, size)
-          const [lx, ly] = selToLocal(wx, wy)
-          setBrushStroke((cur) => {
-            if (!cur) return [[lx, ly]]
-            const [px, py] = cur[cur.length - 1]
-            // sample the path at ~half a pixel so strokes stay smooth but
-            // the point list does not explode
-            return Math.hypot(lx - px, ly - py) < 0.5 ? cur : [...cur, [lx, ly]]
-          })
+          // buffer only — the shared rAF flush converts and appends once per
+          // frame (this branch stops propagation, so it also keeps the nib
+          // preview current)
+          paintBuf.current.push({ x: e.clientX, y: e.clientY })
+          if (pointerRaf.current == null) {
+            pointerRaf.current = requestAnimationFrame(() => {
+              pointerRaf.current = null
+              pointerFlush.current()
+            })
+          }
           e.stopPropagation()
           return
         }
@@ -3747,6 +4021,7 @@ export default function App() {
       }}
       onPointerUpCapture={(e) => {
         if (painting.current) {
+          pointerFlush.current() // points still in the buffer belong to the stroke
           painting.current = false
           setBrushStroke((cur) => {
             if (cur?.length) {
@@ -3766,7 +4041,12 @@ export default function App() {
           e.stopPropagation()
         }
       }}
-      onPointerLeave={() => setCursorPos(null)}
+      onPointerLeave={() => {
+        lastCursorPx.current = null
+        pointerLast.current = null
+        setCursorPos(null)
+        setMouseWorld(null) // the nib preview follows the pointer off-canvas
+      }}
       onDragEnter={handleDragEnter}
       onDragOver={(e) => e.preventDefault()}
       onDragLeave={handleDragLeave}
@@ -3780,6 +4060,17 @@ export default function App() {
           {
             label: 'Edit',
             entries: [
+              {
+                label: 'Undo',
+                hint: history.canUndo ? 'Ctrl+Z' : 'nothing to undo',
+                onClick: () => setToast(history.undo() ? 'Undo' : 'Nothing to undo'),
+              },
+              {
+                label: 'Redo',
+                hint: history.canRedo ? 'Ctrl+Shift+Z' : 'nothing to redo',
+                onClick: () => setToast(history.redo() ? 'Redo' : 'Nothing to redo'),
+              },
+              { divider: true, label: 'image' },
               {
                 label: 'Crop selected image…',
                 hint: isHsi ? 'draw a window · replaces image' : 'needs an HSI image',
@@ -3818,9 +4109,19 @@ export default function App() {
               cancelAnimationFrame(animRef.current)
               animRef.current = null
             }
-            setViewState((prev) => (prev ? { ...prev, ...(vs as Partial<ViewState>) } : prev))
+            vsPending.current = vs as ViewState
+            if (vsRaf.current == null) {
+              vsRaf.current = requestAnimationFrame(() => {
+                vsRaf.current = null
+                const pending = vsPending.current
+                vsPending.current = null
+                if (pending) {
+                  setViewState((prev) => (prev ? { ...prev, ...pending } : prev))
+                }
+              })
+            }
           }}
-          controller={{ inertia: 300, doubleClickZoom: false }}
+          controller={{ doubleClickZoom: false }}
           layers={[...deckLayers, ...draftLayers] as never[]}
           onClick={(info, event) => {
             if (dragImage) {
@@ -3941,14 +4242,9 @@ export default function App() {
           meta={meta}
           display={display}
           band={band}
-          onBandChange={(b) => {
-            setBand(b)
-            setDisplay({ kind: 'band', band: b })
-          }}
+          onBandChange={changeBand}
           width={panelWidth}
           onWidthChange={setPanelWidth}
-          previewFactor={previewFactor}
-          onPreviewFactorChange={setPreviewFactor}
           tab={panelTab}
           onTabChange={setPanelTab}
           layersLocked={transformImage != null}
@@ -4082,10 +4378,7 @@ export default function App() {
               onCachePeak={handleCachePeak}
               onCacheArea={handleCacheArea}
               onExportSpectra={(lo, hi) => setExportState({ kind: 'spectra', lo, hi })}
-              onBandChange={(b) => {
-                setBand(b)
-                setDisplay({ kind: 'band', band: b })
-              }}
+              onBandChange={changeBand}
             /> : null
           }
           cacheSlot={
@@ -4123,8 +4416,8 @@ export default function App() {
       )}
 
       {/* marching ants: the active layer's effective editing region */}
-      {antsPaths && viewState && meta && !coreg && atomMode && (
-        <AntsOverlay paths={antsPaths} viewState={viewState} size={size} toWorld={selToWorld} />
+      {antsPaths && viewState && meta && !coreg && atomMode && !scrubbing && (
+        <AntsOverlay paths={antsPaths} viewState={viewState} size={size} toWorld={selAffine} />
       )}
 
       {/* coreg: marching-ants border of the target's native window */}
@@ -4139,7 +4432,7 @@ export default function App() {
             paths={[[[0, 0], [w, 0], [w, h], [0, h], [0, 0]]]}
             viewState={viewState}
             size={size}
-            toWorld={(x, y) => [x + tl.dx, y + tl.dy]}
+            toWorld={[1, 0, 0, 1, tl.dx, tl.dy]}
           />
         )
       })()}
@@ -4221,6 +4514,9 @@ export default function App() {
               <span className="font-mono text-[11px] text-slate-300">
                 RMSE <span className="text-sky-300">{coregResiduals.rmse.toFixed(2)}</span> px
                 {' · '}worst {coregResiduals.worst!.toFixed(2)} px · {coregResiduals.n} pairs
+                {(layouts[coreg.movingId]?.sx ?? 1) * (layouts[coreg.movingId]?.sy ?? 1) < 0 && (
+                  <span className="text-amber-300"> · mirrored</span>
+                )}
               </span>
             ) : (
               <span className="font-mono text-[11px] text-slate-500">
@@ -4389,7 +4685,7 @@ export default function App() {
       )}
 
       {/* Define-Atoms mode bar (atom types + per-type tools) */}
-      {meta && isHsi && atomMode && !coreg && (
+      {meta && atomMode && !coreg && (
         <AtomModeBar
           layers={layers}
           activeLayerId={activeLayerId}
@@ -4402,22 +4698,29 @@ export default function App() {
           onPickType={(t) => {
             setAtomMode({ type: t })
             setErasing(false)
-            finishBrushAtom()
             if (t === 'roi') startRoi(roiShape)
             else if (t === 'landmark') setTool('landmark')
             else setTool('drag')
           }}
           roiShape={roiShape}
           onCycleShape={() => {
+            // shape and eraser behave as one radio pair: clicking the shape
+            // tool while erasing simply comes BACK to it. Only a click on the
+            // ALREADY-ARMED tool cycles the shape — returning from the eraser
+            // must never silently change what you were drawing with.
+            if (erasing) {
+              startRoi(roiShape)
+              return
+            }
             const order: RoiShape[] = ['rect', 'polygon', 'brush']
             startRoi(order[(order.indexOf(roiShape) + 1) % order.length])
           }}
           erasing={erasing}
           onToggleErase={() => {
-            const next = !erasing
-            setErasing(next)
+            if (erasing) return // already armed: clicking it again is a no-op
+            setErasing(true)
             setRoiDraft([])
-            setTool(next ? 'erase' : roiShape === 'brush' ? 'brush' : 'roi')
+            setTool('erase')
           }}
           brushSize={brushSize}
           onBrushSize={setBrushSize}

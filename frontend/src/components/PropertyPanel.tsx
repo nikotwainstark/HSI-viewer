@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
-import { axisDescending, fmtAxisValue, type DatasetMeta, type Display, type DisplayFactor } from '../lib/api'
+import { axisDescending, fmtAxisValue, type DatasetMeta, type Display } from '../lib/api'
 import { CubeMark } from './Logo'
 
 export type PanelTab = 'image' | 'layers' | 'spectrum' | 'preprocess' | 'cache'
@@ -11,8 +11,6 @@ interface Props {
   onBandChange: (band: number) => void
   width: number
   onWidthChange: (width: number) => void
-  previewFactor: DisplayFactor
-  onPreviewFactorChange: (f: DisplayFactor) => void
   tab: PanelTab
   onTabChange: (tab: PanelTab) => void
   /** true while an image transform is armed: the Layers tab is locked */
@@ -39,7 +37,6 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 export function PropertyPanel({
   meta, display, band, onBandChange,
   width, onWidthChange,
-  previewFactor, onPreviewFactorChange,
   tab, onTabChange, layersLocked, cacheCount,
   imageSlot, layersSlot, spectrumSlot, preprocessSlot, cacheSlot,
 }: Props) {
@@ -47,7 +44,7 @@ export function PropertyPanel({
   // inline axis-value editor in the "Showing" readout: type a value, the
   // display jumps to the nearest channel
   const [bandInput, setBandInput] = useState<string | null>(null)
-  const [h, w, bands] = meta.shape
+  const bands = meta.shape[2]
   const isHsi = meta.image.type === 'hsi'
   const wn = meta.wavenumbers
   const wnMin = isHsi ? Math.min(wn[0], wn[bands - 1]) : 0
@@ -255,21 +252,6 @@ export function PropertyPanel({
                 {displayLabel}
               </span>
             )}
-          </div>
-          {/* canvas display resolution — rendering only, data untouched */}
-          <div className="mb-2 flex items-center justify-between gap-3">
-            <span className="shrink-0 text-[12px] text-slate-400">Preview res</span>
-            <select
-              className="rounded-lg border border-white/10 bg-slate-900 px-2 py-1 font-mono
-                         text-[12px] text-slate-200 outline-none focus:border-sky-400/50"
-              value={previewFactor}
-              onChange={(e) => onPreviewFactorChange(Number(e.target.value) as DisplayFactor)}
-            >
-              <option value={1}>native ({h}×{w})</option>
-              <option value={2}>2× ({Math.floor(h / 2)}×{Math.floor(w / 2)})</option>
-              <option value={4}>4× ({Math.floor(h / 4)}×{Math.floor(w / 4)})</option>
-              <option value={8}>8× ({Math.floor(h / 8)}×{Math.floor(w / 8)})</option>
-            </select>
           </div>
           {tab === 'spectrum' && (() => {
             // slider runs in the same direction as the spectrum axis

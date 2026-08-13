@@ -74,9 +74,16 @@ class DatasetManager:
 
     def dataset_by(self, img: int | None) -> HSIDataset:
         entry = self.entry_by(img)
-        if entry.itype != "hsi" or entry.dataset is None:
-            raise HTTPException(status_code=400, detail="image is not an HSI dataset")
-        return entry.dataset
+        if entry.itype == "hsi":
+            if entry.dataset is None:
+                raise HTTPException(status_code=400, detail="image is not ready")
+            return entry.dataset
+        # non-HSI images answer geometry/region requests through their lazily
+        # built backing cube (rgb -> 3 bands, scalar map -> 1); the canvas
+        # display still comes from the entry's own renderer
+        if entry.array is None:
+            raise HTTPException(status_code=400, detail="image is not ready")
+        return entry.geom_dataset()
 
     def list_images(self) -> dict:
         return {
@@ -378,11 +385,7 @@ class DatasetManager:
             }
 
     def require(self) -> HSIDataset:
-        entry = self.current_or_404()
-        if entry.itype != "hsi" or entry.dataset is None:
-            raise HTTPException(status_code=400,
-                                detail="selected image is not an HSI dataset")
-        return entry.dataset
+        return self.dataset_by(None)
 
 
 manager = DatasetManager()

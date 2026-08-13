@@ -142,7 +142,36 @@ def get_lut(name: str | None) -> np.ndarray | None:
     return lut
 
 
+#: Overlays (masks, ROI fills) are mostly one flat colour, so zlib pays for
+#: itself many times over — level 1 keeps a native-resolution overlay at a few
+#: hundred KB instead of ~90 MB, for ~50 ms.
+PNG_FAST = 1
+
+#: DENSE renders (a band image) are the opposite: they barely compress, and
+#: this server talks to a browser over loopback where bytes are nearly free
+#: while zlib is not. Above this size a dense render is stored uncompressed,
+#: which is what actually gets the frame on screen sooner (~130 ms instead of
+#: ~475 ms for a 24 Mpx frame). The canvas always renders at native
+#: resolution, so large frames are the normal case, not the exception.
+PNG_RAW_ABOVE_PX = 4_000_000
+
+
+def png_level(pixels: int) -> int:
+    """zlib level for a DENSE image of this many pixels."""
+    return 0 if pixels > PNG_RAW_ABOVE_PX else PNG_FAST
+
+
+#: percentiles are a DISPLAY normalization, so they are estimated from a
+#: regular subsample once the frame is large — a stride keeps the estimate
+#: deterministic and, at a million samples, indistinguishable from the exact
+#: percentile (< 1e-4 apart on real frames) for a fraction of the cost
+STRETCH_SAMPLE_PX = 1_000_000
+
+
 def _stretch_limits(data: np.ndarray, plo: float, phi: float) -> tuple[float, float]:
+    if data.size > STRETCH_SAMPLE_PX:
+        step = int(np.ceil(np.sqrt(data.size / STRETCH_SAMPLE_PX)))
+        data = data[::step, ::step] if data.ndim == 2 else data[::step]
     finite = data[np.isfinite(data)]
     if finite.size == 0:
         return 0.0, 1.0
@@ -554,7 +583,8 @@ class HSIDataset:
             raise ValueError("threshold requires a single-channel live image")
         m = self._threshold_mask(img, thr, reverse)
         buf = io.BytesIO()
-        Image.fromarray(m.astype(np.uint8) * 255, mode="L").save(buf, format="PNG")
+        Image.fromarray(m.astype(np.uint8) * 255, mode="L").save(
+            buf, format="PNG", compress_level=PNG_FAST)
         return buf.getvalue()
 
     def spectrum(self, row: int, col: int) -> np.ndarray:
@@ -575,7 +605,7 @@ class HSIDataset:
         lut = get_lut(cmap)
         img = Image.fromarray(u8, mode="L") if lut is None else Image.fromarray(lut[u8], mode="RGB")
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="PNG", compress_level=png_level(u8.size))
         return buf.getvalue()
 
     def render_band_preview(self, band: int, plo: float = 2.0, phi: float = 98.0,
@@ -725,7 +755,7 @@ class HSIDataset:
         _, cleaned = self._cleaned_mask(obj_id, min_size, expansion, proportion)
         buf = io.BytesIO()
         small = (pool_by(cleaned, PREVIEW_FACTOR) > 0.5).astype(np.uint8) * 255
-        Image.fromarray(small, mode="L").save(buf, format="PNG")
+        Image.fromarray(small, mode="L").save(buf, format="PNG", compress_level=PNG_FAST)
         return buf.getvalue()
 
     def cache_clean_mask(self, obj_id: int, min_size: int, expansion: int,
@@ -752,7 +782,9 @@ class HSIDataset:
                 c = np.where(np.isfinite(c), c, lo)
                 chans.append(np.clip((c - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8))
             buf = io.BytesIO()
-            Image.fromarray(np.stack(chans, axis=-1), mode="RGB").save(buf, format="PNG")
+            rgb = np.stack(chans, axis=-1)
+            Image.fromarray(rgb, mode="RGB").save(
+                buf, format="PNG", compress_level=png_level(rgb[..., 0].size))
             return buf.getvalue()
         lo, hi = _stretch_limits(img, plo, phi)
         return self._to_png(img, lo, hi, cmap)
@@ -956,37 +988,92 @@ class HSIDataset:
     # ---------------------------------------------------------------- layers
 
     @staticmethod
-    def _draw_parts(draw: "ImageDraw.ImageDraw", parts: list[dict],
-                    scale: float = 1.0, ox: float = 0.0, oy: float = 0.0) -> int:
-        """Union-fill multi-part ROI geometry onto a PIL canvas. Returns the
-        number of parts actually drawn."""
+    def _rasterize_parts(parts: list[dict], hp: int, wp: int, scale: float = 1.0,
+                         ox: float = 0.0, oy: float = 0.0) -> tuple[np.ndarray, int]:
+        """Rasterize multi-part ROI geometry to a boolean mask.
+
+        Membership is a yes/no test evaluated at each pixel's CENTRE: pixel i
+        spans [i, i+1) in the stored (native) coordinates and is tested at
+        i + 0.5 — the same pixel the cursor reads out. At a display factor
+        scale > 1 one output pixel stands for a scale x scale block and is
+        tested at the block's centre, so a ROI stays the same shape at every
+        resolution instead of growing a soft rim.
+
+        This mirrors frontend/src/lib/pixelRegion.ts rule for rule (rect span,
+        even-odd polygon crossings, distance-to-polyline for a brush) so that
+        what the canvas shows is exactly what the spectra, crops and exports
+        are computed from. Returns (mask, number of parts drawn).
+        """
+        mask = np.zeros((hp, wp), dtype=bool)
         n = 0
+
+        def cols(a: float, b: float, off: float, limit: int) -> tuple[int, int]:
+            """Index range whose sample points fall in the native span [a, b]."""
+            lo = int(np.ceil((a - off) / scale - 0.5))
+            hi = int(np.floor((b - off) / scale - 0.5))
+            return max(lo, 0), min(hi, limit - 1)
+
         for part in parts:
-            pts = [((float(x) - ox) / scale, (float(y) - oy) / scale)
-                   for x, y in part["points"]]
-            # parts apply IN ORDER; an erase part paints 0 instead of 255, so
+            pts = [(float(x), float(y)) for x, y in part["points"]]
+            if not pts:
+                continue
+            shape = part["shape"]
+            # parts apply IN ORDER; an erase part clears instead of setting, so
             # a region is (adds ∪ …) minus every later erase — holes included
-            ink = 0 if part.get("op") == "erase" else 255
-            if part["shape"] == "rect" and len(pts) == 2:
+            ink = part.get("op") != "erase"
+
+            if shape == "rect" and len(pts) == 2:
                 (x0, y0), (x1, y1) = pts
-                draw.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)],
-                               fill=ink)
+                c0, c1 = cols(min(x0, x1), max(x0, x1), ox, wp)
+                r0, r1 = cols(min(y0, y1), max(y0, y1), oy, hp)
+                if c0 <= c1 and r0 <= r1:
+                    mask[r0:r1 + 1, c0:c1 + 1] = ink
                 n += 1
-            elif part["shape"] == "polygon" and len(pts) >= 3:
-                draw.polygon(pts, fill=ink)
+
+            elif shape == "polygon" and len(pts) >= 3:
+                ys = [p[1] for p in pts]
+                r0, r1 = cols(min(ys), max(ys), oy, hp)
+                for row in range(r0, r1 + 1):
+                    y = (row + 0.5) * scale + oy
+                    xs = []
+                    for i in range(len(pts)):
+                        (xi, yi), (xj, yj) = pts[i], pts[i - 1]
+                        if (yi <= y) == (yj <= y):
+                            continue
+                        xs.append(xi + (y - yi) * (xj - xi) / (yj - yi))
+                    xs.sort()
+                    for i in range(0, len(xs) - 1, 2):
+                        c0, c1 = cols(xs[i], xs[i + 1], ox, wp)
+                        if c0 <= c1:
+                            mask[row, c0:c1 + 1] = ink
                 n += 1
-            elif part["shape"] == "brush" and pts:
+
+            elif shape == "brush":
                 # painted stroke: a polyline swept by a round nib. Stored as
-                # vector (path + width), so it stays resolution-independent
-                # and rasterizes identically at any display factor.
-                w = max(1.0, float(part.get("width", 1)) / scale)
-                r = w / 2.0
-                if len(pts) >= 2:
-                    draw.line(pts, fill=ink, width=max(1, int(round(w))), joint="curve")
-                for x, y in pts:  # round caps / single-click dabs
-                    draw.ellipse([x - r, y - r, x + r, y + r], fill=ink)
+                # vector (path + width), so it stays resolution-independent;
+                # a hairline still covers the pixels its path runs through.
+                r = max(float(part.get("width", 1)) / 2.0, 0.5)
+                segs = list(zip(pts, pts[1:])) or [(pts[0], pts[0])]
+                for (ax, ay), (bx, by) in segs:
+                    c0, c1 = cols(min(ax, bx) - r, max(ax, bx) + r, ox, wp)
+                    r0, r1 = cols(min(ay, by) - r, max(ay, by) + r, oy, hp)
+                    if c0 > c1 or r0 > r1:
+                        continue
+                    gx = (np.arange(c0, c1 + 1) + 0.5) * scale + ox
+                    gy = (np.arange(r0, r1 + 1) + 0.5) * scale + oy
+                    px = gx[None, :] - ax
+                    py = gy[:, None] - ay
+                    dx, dy = bx - ax, by - ay
+                    ll = dx * dx + dy * dy
+                    t = 0.0 if ll == 0 else np.clip((px * dx + py * dy) / ll, 0.0, 1.0)
+                    d2 = (px - t * dx) ** 2 + (py - t * dy) ** 2
+                    hit = d2 <= r * r
+                    if ink:
+                        mask[r0:r1 + 1, c0:c1 + 1] |= hit
+                    else:
+                        mask[r0:r1 + 1, c0:c1 + 1] &= ~hit
                 n += 1
-        return n
+        return mask, n
 
     def render_roi_clip(self, atoms: list[list[dict]], mask_step: dict | None,
                         color: str, alpha: float, factor: int,
@@ -1019,10 +1106,9 @@ class HSIDataset:
 
         regions: list[tuple[np.ndarray, bool]] = []
         for parts in atoms:
-            canvas = Image.new("L", (wp, hp), 0)
-            if self._draw_parts(ImageDraw.Draw(canvas), parts, scale=factor) == 0:
+            r, drawn = self._rasterize_parts(parts, hp, wp, scale=factor)
+            if drawn == 0:
                 continue
-            r = np.asarray(canvas) > 0
             regions.append((r if clip is None else (r & clip), thin_atom(parts)))
         for ids in mask_atoms or []:
             r = pool_by(self._resolve_step_mask({"cache_ids": ids}).astype(np.float32),
@@ -1042,10 +1128,18 @@ class HSIDataset:
                 thin |= r
                 continue
             fill |= r
-            if outline and r.any():
+            if outline:
                 # inner rim: the border never extends past the real region,
-                # so the drawn footprint equals the measured one
-                edge |= r & ~ndimage.binary_erosion(r)
+                # so the drawn footprint equals the measured one. Traced
+                # inside the atom's own bounding box — at native resolution a
+                # frame-sized erosion costs many times what the atom does.
+                rows = np.flatnonzero(r.any(axis=1))
+                if rows.size == 0:
+                    continue
+                cols = np.flatnonzero(r.any(axis=0))
+                box = (slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1))
+                sub = r[box]
+                edge[box] |= sub & ~ndimage.binary_erosion(sub)
         n = int(color.lstrip("#"), 16)
         rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
         rgba = np.zeros((hp, wp, 4), dtype=np.uint8)
@@ -1053,7 +1147,7 @@ class HSIDataset:
         rgba[edge] = [*rgb, 242]
         rgba[thin] = [*rgb, 204]
         buf = io.BytesIO()
-        Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
+        Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", compress_level=PNG_FAST)
         return buf.getvalue()
 
     def isolate_mask_components(self, obj_id: int, max_count: int = 0,
@@ -1094,10 +1188,9 @@ class HSIDataset:
         at NATIVE resolution — one contour per connected component."""
         from skimage import measure
 
-        canvas = Image.new("L", (self.width, self.height), 0)
-        if self._draw_parts(ImageDraw.Draw(canvas), parts) == 0:
+        m, drawn = self._rasterize_parts(parts, self.height, self.width)
+        if drawn == 0:
             return []
-        m = np.asarray(canvas) > 0
         out = [[[float(col), float(row)] for row, col in c]
                for c in measure.find_contours(m.astype(float), 0.5) if len(c) >= 4]
         out.sort(key=len, reverse=True)
@@ -1123,9 +1216,7 @@ class HSIDataset:
         region: np.ndarray | None = None
         atoms = spec.get("atoms") or []
         if atoms:
-            canvas = Image.new("L", (self.width, self.height), 0)
-            self._draw_parts(ImageDraw.Draw(canvas), atoms)
-            region = np.asarray(canvas) > 0
+            region = self._rasterize_parts(atoms, self.height, self.width)[0]
         for ids in spec.get("mask_atoms") or []:
             m = self._resolve_step_mask({"cache_ids": ids})
             region = m.copy() if region is None else (region | m)
@@ -1194,9 +1285,10 @@ class HSIDataset:
         return {"path": str(p)}
 
     def _parts_bbox(self, parts: list[dict]) -> tuple[int, int, int, int]:
-        """Pixel bbox of a multi-part ROI. The +1 on the max edge matches
-        PIL's INCLUSIVE rasterization, so the region's last row/column is
-        never clipped off; brush strokes widen the box by their nib radius."""
+        """Pixel bbox of a multi-part ROI, as a half-open [x0, x1) window. The
+        +1 on the max edge keeps the box a superset of the rasterized region,
+        so its last row/column is never clipped off; brush strokes widen the
+        box by their nib radius."""
         xs: list[float] = []
         ys: list[float] = []
         for part in parts:
@@ -1218,9 +1310,7 @@ class HSIDataset:
                       box: tuple[int, int, int, int]) -> np.ndarray:
         """Union fill of a multi-part ROI within a bbox, native resolution."""
         x0, y0, x1, y1 = box
-        canvas = Image.new("L", (x1 - x0, y1 - y0), 0)
-        self._draw_parts(ImageDraw.Draw(canvas), parts, ox=x0, oy=y0)
-        return np.asarray(canvas) > 0
+        return self._rasterize_parts(parts, y1 - y0, x1 - x0, ox=x0, oy=y0)[0]
 
     def crop_roi(self, parts: list[dict], mask_step: dict | None) -> np.ndarray:
         """Crop the live data to a (multi-part) ROI's bounding box as an

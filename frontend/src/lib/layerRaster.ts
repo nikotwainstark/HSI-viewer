@@ -1,52 +1,58 @@
 /** Composited layer rendering.
  *
- * A layer's atoms are drawn ONCE into an offscreen canvas at display
- * resolution: additive parts fill, erase parts cut out (destination-out), so
- * overlapping atoms never double-blend and holes are exact. The result is a
- * single texture per layer — instead of one deck.gl layer per atom — which
- * also keeps the canvas responsive with hundreds of ROIs.
+ * A layer's ROI atoms are painted into ONE texture from the SAME hard pixel
+ * coverage that decides membership: a data pixel is either inside the region
+ * or outside it, never half-shaded. Canvas anti-aliasing would invent partial
+ * pixels and make a hard-edged ROI look like a soft airbrush, so every atom
+ * is rasterized through lib/pixelRegion (which thresholds coverage) and the
+ * result is written as raw pixels.
  *
- * The vector geometry stays authoritative: this is display only (the backend
- * rasterizes the same parts for every numeric operation).
+ * One texture per layer also means overlapping atoms never blend twice and
+ * the deck.gl layer count stays independent of the atom count. The texture
+ * covers only the atoms' BOUNDING BOX, so a small annotation on a huge cube
+ * costs a small texture and can stay at native resolution — which it must,
+ * since the canvas shows the data natively and a ROI has to sit on the very
+ * pixels it was drawn over. The vector geometry remains authoritative: this
+ * is display only.
  */
 
-import type { LayerObj, RoiAtom, RoiPart } from './api'
+import type { LayerObj, RoiAtom } from './api'
+import { partsBounds, rasterizeParts, regionEdges, type PixelRegion } from './pixelRegion'
 
 const FILL_ALPHA = 0.28
-// a thin painted stroke IS the mark, so it is drawn solid rather than
-// tinted like a broad region
+// a thin painted stroke IS the mark, so it is drawn solid rather than tinted
 const THIN_PX = 4
 const THIN_ALPHA = 0.8
+/** Texture budget per layer: 32 Mpx ≈ 128 MB of RGBA. Only a region larger
+    than a very large cube's full frame is pooled, and pooling by an integer
+    factor keeps the overlay's pixel edges on the native grid — coarser, never
+    misaligned. */
+const MAX_TEXTURE_PX = 32_000_000
 
-/** True when every additive part is a brush stroke no wider than THIN_PX. */
-function isThinAtom(atom: RoiAtom): boolean {
-  const adds = atom.parts.filter((p) => p.op !== 'erase')
-  return adds.length > 0 &&
-    adds.every((p) => p.shape === 'brush' && (p.width ?? 1) <= THIN_PX)
+/** Same budget for a MASK-BOUND layer, which the backend composites over the
+    whole frame: the mask's region can be the frame itself, so the factor comes
+    from the image size rather than from a bounding box. */
+export function clipFactor(w: number, h: number): number {
+  const area = w * h
+  return area > MAX_TEXTURE_PX ? Math.ceil(Math.sqrt(area / MAX_TEXTURE_PX)) : 1
 }
-const MAX_SIDE = 2048 // texture budget: ~16 MB RGBA per layer at the cap
 
-/** DISPLAY-ONLY texture resolution. The atoms' geometry stays native — this
-    factor only decides how finely that geometry is painted into the texture
-    (full resolution unless the image is larger than the texture budget). It
-    is deliberately independent of the image's preview factor: a coarse image
-    preview must not coarsen the ROI edges. */
-export function rasterFactor(w: number, h: number): number {
-  return Math.max(1, Math.ceil(Math.max(w, h) / MAX_SIDE))
+export interface LayerRaster {
+  /** composited fill, or null when every atom is empty */
+  bitmap: ImageBitmap | null
+  /** deck.gl bounds of `bitmap` in the image's native coords */
+  bounds: [number, number, number, number]
+  /** border segments along pixel edges, native coords (hairlines excluded) */
+  edges: [number, number][][]
 }
 
 /** Everything that changes what a layer's texture looks like. */
-export function layerRasterKey(
-  layer: LayerObj,
-  imageId: number,
-  factor: number,
-  fill = true,
-): string {
+export function layerRasterKey(layer: LayerObj, imageId: number, fill = true): string {
   const geom = layer.atoms
     .filter((a) => a.kind === 'roi' && a.visible !== false)
     .map((a) => JSON.stringify((a as RoiAtom).parts))
     .join('|')
-  return `${imageId}:${layer.id}:${factor}:${fill ? 'f' : 'o'}:${layer.color}:${geom}`
+  return `${imageId}:${layer.id}:${fill ? 'f' : 'o'}:${layer.color}:${geom}`
 }
 
 function hexToRgb(hex: string): [number, number, number] {
@@ -54,100 +60,93 @@ function hexToRgb(hex: string): [number, number, number] {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
 }
 
-/** Trace one part into the current path (display-space coords). */
-type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
-
-function tracePart(ctx: Ctx2D, part: RoiPart, s: number): void {
-  const pts = part.points
-  if (part.shape === 'rect' && pts.length === 2) {
-    const [[x0, y0], [x1, y1]] = pts
-    ctx.beginPath()
-    ctx.rect(
-      Math.min(x0, x1) / s, Math.min(y0, y1) / s,
-      Math.abs(x1 - x0) / s + 1 / s, Math.abs(y1 - y0) / s + 1 / s,
-    )
-    ctx.fill()
-    return
-  }
-  if (part.shape === 'polygon' && pts.length >= 3) {
-    ctx.beginPath()
-    ctx.moveTo(pts[0][0] / s, pts[0][1] / s)
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0] / s, pts[i][1] / s)
-    ctx.closePath()
-    ctx.fill()
-    return
-  }
-  if (part.shape === 'brush' && pts.length) {
-    // a stroke is a polyline swept by a round nib: stroke it with a round
-    // cap/join, which is what the backend rasterizes as well
-    ctx.lineWidth = Math.max((part.width ?? 1) / s, 0.75)
-    ctx.lineCap = 'round'
-    ctx.lineJoin = 'round'
-    ctx.beginPath()
-    ctx.moveTo(pts[0][0] / s, pts[0][1] / s)
-    if (pts.length === 1) ctx.lineTo(pts[0][0] / s, pts[0][1] / s)
-    else for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0] / s, pts[i][1] / s)
-    ctx.stroke()
-  }
+/** True when every additive part is a brush stroke no wider than THIN_PX.
+    Such an atom IS its own mark: it is drawn solid and gets no border, or the
+    rim would double the apparent width of a hairline. */
+export function isThinAtom(atom: RoiAtom): boolean {
+  const adds = atom.parts.filter((p) => p.op !== 'erase')
+  return adds.length > 0 &&
+    adds.every((p) => p.shape === 'brush' && (p.width ?? 1) <= THIN_PX)
 }
 
 /**
- * Render every visible ROI atom of a layer into one RGBA texture.
+ * Paint every visible ROI atom of a layer into one RGBA texture and trace the
+ * borders, from a single rasterization pass so the two can never disagree.
  *
- * @param w,h  native image size
- * @param factor display downsample factor (1, 2, 4, 8)
- * @returns an ImageBitmap covering the whole image, or null when the layer
- *          has no vector geometry to draw
+ * @param w,h native image size
  */
 export async function renderLayerRaster(
-  layer: LayerObj,
-  w: number,
-  h: number,
-  factor: number,
-  opts: { fill?: boolean } = {},
-): Promise<ImageBitmap | null> {
-  const withFill = opts.fill !== false
+  layer: LayerObj, w: number, h: number,
+): Promise<LayerRaster | null> {
   const atoms = layer.atoms.filter(
     (a): a is RoiAtom => a.kind === 'roi' && a.visible !== false && a.parts.length > 0,
   )
   if (!atoms.length) return null
-  const pw = Math.max(1, Math.floor(w / factor))
-  const ph = Math.max(1, Math.floor(h / factor))
-  const [cr, cg, cb] = hexToRgb(layer.color)
 
-  const out = new OffscreenCanvas(pw, ph)
-  const octx = out.getContext('2d')
-  if (!octx) return null
-  // borders are drawn as vector pixel-edges by the caller (lib/pixelRegion),
-  // so this texture only carries the fill
+  // native extent of the whole layer, clipped to the image
+  let nx0 = Infinity, ny0 = Infinity, nx1 = -Infinity, ny1 = -Infinity
+  for (const atom of atoms) {
+    const b = partsBounds(atom.parts)
+    if (!b) continue
+    nx0 = Math.min(nx0, b.x0); ny0 = Math.min(ny0, b.y0)
+    nx1 = Math.max(nx1, b.x1); ny1 = Math.max(ny1, b.y1)
+  }
+  if (!Number.isFinite(nx0)) return null
+  nx0 = Math.max(0, Math.floor(nx0)); ny0 = Math.max(0, Math.floor(ny0))
+  nx1 = Math.min(w, Math.ceil(nx1) + 1); ny1 = Math.min(h, Math.ceil(ny1) + 1)
+  if (nx1 <= nx0 || ny1 <= ny0) return null
 
-  // 1. FILL — each group drawn in ONE pass, so overlapping atoms never
-  //    blend twice. Thin strokes get their own solid pass.
-  const paintGroup = (group: RoiAtom[], a: number) => {
-    if (!group.length) return
-    const cover = new OffscreenCanvas(pw, ph)
-    const cctx = cover.getContext('2d')
-    if (!cctx) return
-    cctx.fillStyle = '#fff'
-    cctx.strokeStyle = '#fff'
-    for (const atom of group) {
-      for (const part of atom.parts) {
-        cctx.globalCompositeOperation =
-          part.op === 'erase' ? 'destination-out' : 'source-over'
-        tracePart(cctx, part, factor)
+  const area = (nx1 - nx0) * (ny1 - ny0)
+  const s = area > MAX_TEXTURE_PX ? Math.ceil(Math.sqrt(area / MAX_TEXTURE_PX)) : 1
+
+  const regions: { region: PixelRegion; thin: boolean }[] = []
+  let tx0 = Infinity, ty0 = Infinity, tx1 = -Infinity, ty1 = -Infinity
+  const edges: [number, number][][] = []
+  for (const atom of atoms) {
+    const region = rasterizeParts(atom.parts, w, h, s)
+    if (!region) continue
+    const thin = isThinAtom(atom)
+    regions.push({ region, thin })
+    if (!thin) edges.push(...regionEdges(region))
+    tx0 = Math.min(tx0, region.x0); ty0 = Math.min(ty0, region.y0)
+    tx1 = Math.max(tx1, region.x0 + region.w); ty1 = Math.max(ty1, region.y0 + region.h)
+  }
+  if (!regions.length) return null
+
+  const bw = tx1 - tx0
+  const bh = ty1 - ty0
+  const broad = new Uint8Array(bw * bh)
+  const thinPlane = new Uint8Array(bw * bh)
+  for (const { region, thin } of regions) {
+    const plane = thin ? thinPlane : broad
+    for (let y = 0; y < region.h; y++) {
+      const row = (region.y0 - ty0 + y) * bw + (region.x0 - tx0)
+      for (let x = 0; x < region.w; x++) {
+        if (region.data[y * region.w + x]) plane[row + x] = 1
       }
     }
-    cctx.globalCompositeOperation = 'source-in'
-    cctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${a})`
-    cctx.fillRect(0, 0, pw, ph)
-    octx.drawImage(cover, 0, 0)
-  }
-  const thin = atoms.filter(isThinAtom)
-  const solid = atoms.filter((a) => !isThinAtom(a))
-  if (withFill) {
-    paintGroup(solid, FILL_ALPHA)
-    paintGroup(thin, THIN_ALPHA)
   }
 
-  return out.transferToImageBitmap()
+  const out = new OffscreenCanvas(bw, bh)
+  const ctx = out.getContext('2d')
+  if (!ctx) return null
+  const img = ctx.createImageData(bw, bh)
+  const [cr, cg, cb] = hexToRgb(layer.color)
+  const aBroad = Math.round(FILL_ALPHA * 255)
+  const aThin = Math.round(THIN_ALPHA * 255)
+  for (let i = 0, p = 0; i < broad.length; i++, p += 4) {
+    const a = thinPlane[i] ? aThin : broad[i] ? aBroad : 0
+    if (!a) continue
+    img.data[p] = cr
+    img.data[p + 1] = cg
+    img.data[p + 2] = cb
+    img.data[p + 3] = a
+  }
+  ctx.putImageData(img, 0, 0)
+  return {
+    bitmap: out.transferToImageBitmap(),
+    // deck.gl bounds are [left, bottom, right, top] in native image coords
+    bounds: [tx0 * s, (ty0 + bh) * s, (tx0 + bw) * s, ty0 * s],
+    edges,
+  }
 }
