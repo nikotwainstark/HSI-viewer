@@ -211,6 +211,52 @@ export async function fetchPartsOutline(body: {
 /** Combine regions into a new cache mask: union within each layer spec
     (vector fills ∪ mask-atom rasters, ∩ the layer's bound mask), then union
     across specs. One spec = within-layer atom combine. */
+export interface MaskFileInfo {
+  path: string
+  shape: [number, number]
+  dtype: string
+  expected: [number, number]
+  matches: boolean
+  marked: number
+  labels: number[]
+  n_labels: number
+}
+
+export async function fetchCacheListOf(img: number): Promise<{ objects: CacheObject[] }> {
+  return jsonOrThrow(await fetch(`/api/cache/list?img=${img}`))
+}
+
+export async function importCacheFromImage(body: {
+  source_img: number
+  obj_id: number
+  name?: string
+  /** 2x3 affine source-native -> dest-native; omit when grids are identical */
+  matrix?: number[]
+}): Promise<CacheObject> {
+  return postJson('/api/cache/import_from_image', body)
+}
+
+export async function inspectMaskFile(path: string): Promise<MaskFileInfo> {
+  return postJson('/api/cache/inspect_mask', { path })
+}
+
+export async function importMaskFile(
+  path: string, split_labels: boolean, name?: string,
+): Promise<{ objects: CacheObject[] }> {
+  return postJson('/api/cache/import_mask', { path, split_labels, name })
+}
+
+export async function editMask(body: {
+  /** the mask being edited, as a layer spec */
+  base: { cache_ids?: number[]; path?: string; atoms?: RoiPart[]; mask_atoms?: number[][] }
+  /** the region applied to it */
+  edit: { atoms?: RoiPart[]; cache_ids?: number[]; path?: string; mask_atoms?: number[][] }
+  op: 'subtract' | 'intersect' | 'union'
+  label?: string
+}): Promise<CacheObject> {
+  return postJson('/api/cache/edit_mask', body)
+}
+
 export async function combineLayers(body: {
   layers: {
     atoms: RoiPart[]

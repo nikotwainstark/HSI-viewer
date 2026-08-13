@@ -587,6 +587,82 @@ def layers_combine(req: CombineLayersRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+class ImportFromImageRequest(BaseModel):
+    source_img: int
+    obj_id: int
+    name: str | None = None
+    #: 2x3 affine source-native -> dest-native (x = column, y = row); omitted
+    #: when both grids are identical
+    matrix: list[float] | None = None
+
+
+@app.post("/api/cache/import_from_image")
+def cache_import_from_image(req: ImportFromImageRequest) -> dict:
+    """Copy (or warp, via a registration matrix) a mask object from another
+    image's cache into the SELECTED image's cache."""
+    dest = manager.require()
+    source = manager.dataset_by(req.source_img)
+    src_entry = manager.entry_by(req.source_img)
+    try:
+        obj = source._cache_get(req.obj_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if obj["kind"] != "mask":
+        raise HTTPException(status_code=400, detail="only mask objects can be imported")
+    label = (f"from {src_entry.name} · {obj['name']}"
+             + (" · via registration" if req.matrix else ""))
+    try:
+        return dest.import_mask_array(
+            obj["image"], req.name or obj["name"], label, req.matrix)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ImportMaskRequest(BaseModel):
+    path: str
+    split_labels: bool = False
+    name: str | None = None
+
+
+@app.post("/api/cache/inspect_mask")
+def cache_inspect_mask(req: ImportMaskRequest) -> dict:
+    """What a mask file holds and whether its shape fits the selected image."""
+    ds = manager.require()
+    try:
+        return ds.inspect_mask_file(req.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/cache/import_mask")
+def cache_import_mask(req: ImportMaskRequest) -> dict:
+    """Import an offline mask file as cache mask object(s)."""
+    ds = manager.require()
+    try:
+        return {"objects": ds.import_mask_file(req.path, req.split_labels, req.name)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class EditMaskRequest(BaseModel):
+    base: dict  # layer spec of the mask being edited
+    edit: dict  # layer spec of the region to apply
+    op: str     # subtract | intersect | union
+    label: str | None = None
+
+
+@app.post("/api/cache/edit_mask")
+def cache_edit_mask(req: EditMaskRequest) -> dict:
+    """Boolean-edit a cached mask with a region, into a NEW cache mask."""
+    ds = manager.require()
+    try:
+        return ds.edit_mask(req.base, req.edit, req.op, req.label)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 class ExportLayersRequest(BaseModel):
     path: str
     format: str  # zarr | npz (label map) | png | tiff (exact colours)
@@ -940,8 +1016,9 @@ class CleanMaskRequest(BaseModel):
 
 
 @app.get("/api/cache/list")
-def cache_list() -> dict:
-    return {"objects": manager.require().cache_list()}
+def cache_list(img: int | None = None) -> dict:
+    """Cache objects of the selected image, or of `img` when given."""
+    return {"objects": manager.dataset_by(img).cache_list()}
 
 
 @app.post("/api/cache/peak")

@@ -2,7 +2,10 @@ import { useEffect, useRef, useState, type DragEvent as ReactDragEvent, type Mou
 import type { Atom, LayerObj } from '../lib/api'
 import { ContextMenu, type MenuEntry } from './ContextMenu'
 
-function atomLabel(atom: Atom): string {
+/** Human-readable name of an atom: its own name, or a description of the
+    geometry it carries. Exported so every menu that names an atom names it
+    the same way. */
+export function atomLabel(atom: Atom): string {
   if (atom.name) return atom.name
   if (atom.kind === 'mask') return atom.label
   if (atom.kind === 'landmark') {
@@ -78,6 +81,10 @@ interface Props {
   onExportRoiCubes: (ids: number[]) => void
   /** crop the selected image in place to a ROI atom's bbox (replaces it) */
   onCropToAtom: (layerId: number, atomId: number) => void
+  /** boolean-edit a cached mask with this atom's region */
+  onEditMaskWithAtom: (layerId: number, atomId: number) => void
+  /** true when the cache holds at least one mask object */
+  hasMasks: boolean
   /** crop the atom's region into a NEW image entry (copy semantics) */
   onCropAtomToImage: (layerId: number, atomId: number) => void
 }
@@ -94,7 +101,7 @@ export function LayersPanel({
   onRenameAtom, onToggleRoiSpectrum, roiSpectrumKeys,
   onSetVisibleMany, onDeleteMany, onCombine, onSelectionChange,
   canCoregister, onCoregister, onExportLayers, onExportRoiCubes,
-  onCropToAtom, onCropAtomToImage,
+  onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks,
 }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; target: MenuTarget } | null>(null)
   const [creerOpen, setCreerOpen] = useState<{ x: number; y: number } | null>(null)
@@ -246,6 +253,13 @@ export function LayersPanel({
           hint: 'append to IMAGE tab',
           onClick: () => onCropAtomToImage(layer.id, atom.id),
         })
+        if (hasMasks) {
+          out.push({
+            label: 'Edit mask with this ROI…',
+            hint: 'subtract / keep / add → new mask',
+            onClick: () => onEditMaskWithAtom(layer.id, atom.id),
+          })
+        }
         if (atom.kind === 'roi') {
           out.push({
             label: 'Crop image to ROI (in place)',

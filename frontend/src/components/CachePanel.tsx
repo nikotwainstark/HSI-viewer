@@ -13,6 +13,13 @@ interface Props {
   onRgb: (r: number, g: number, b: number) => void
   onApplyMask: (maskIds: number[], targetIds: number[]) => void
   onCleanBlobs: (obj: CacheObject) => void
+  onIsolate: (obj: CacheObject) => void
+  /** import an offline mask file as a cache object */
+  onImportMask: () => void
+  /** bring a mask over from another image's cache (null = no other images) */
+  onImportFromImage: (() => void) | null
+  /** boolean-edit this mask with a ROI region (null = no regions to offer) */
+  onEditWithRoi: ((obj: CacheObject) => void) | null
 }
 
 const KIND_BADGE: Record<CacheObject['kind'], string> = {
@@ -25,7 +32,8 @@ const KIND_BADGE: Record<CacheObject['kind'], string> = {
 
 export function CachePanel({
   objects, selected, onSelectedChange, displayedId,
-  onDisplay, onDelete, onRatio, onRgb, onApplyMask, onCleanBlobs,
+  onDisplay, onDelete, onRatio, onRgb, onApplyMask, onCleanBlobs, onIsolate, onEditWithRoi,
+  onImportMask, onImportFromImage,
 }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; obj: CacheObject; sel: number[] } | null>(null)
   const anchorId = useRef<number | null>(null)
@@ -105,10 +113,25 @@ export function CachePanel({
       items.push({ divider: true, label: 'compute' }, ...compute)
     }
     if (obj.kind === 'mask') {
+      // NOTE: keep in sync with the canvas menu of a displayed mask in
+      // App.tsx — the same object must offer the same operations wherever it
+      // is right-clicked
       items.push(
         { divider: true, label: 'advanced' },
         { label: 'Clean blobs…', hint: 'remove speckles', onClick: () => onCleanBlobs(obj) },
+        {
+          label: 'Isolate components…',
+          hint: 'one ROI per region (TMA cores)',
+          onClick: () => onIsolate(obj),
+        },
       )
+      if (onEditWithRoi) {
+        items.push({
+          label: 'Edit with ROI…',
+          hint: 'subtract / keep / add → new mask',
+          onClick: () => onEditWithRoi(obj),
+        })
+      }
     }
     items.push({ divider: true })
     items.push({
@@ -117,6 +140,33 @@ export function CachePanel({
     })
     return items
   })()
+
+  const importButton = (
+    <div className="flex gap-1.5">
+      <button
+        className="flex flex-1 items-center justify-center gap-2 rounded-lg border-2 border-dashed
+                   border-white/20 bg-[#0a0e14]/90 px-3 py-2 opacity-60 backdrop-blur-sm
+                   transition-all hover:border-violet-400/50 hover:opacity-100"
+        title="a full-resolution mask prepared elsewhere — the shape must match this image"
+        onClick={onImportMask}
+      >
+        <span className="text-[15px] leading-none text-slate-400">＋</span>
+        <span className="text-[12px] text-slate-300">mask from file…</span>
+      </button>
+      {onImportFromImage && (
+        <button
+          className="flex flex-1 items-center justify-center gap-2 rounded-lg border-2 border-dashed
+                     border-white/20 bg-[#0a0e14]/90 px-3 py-2 opacity-60 backdrop-blur-sm
+                     transition-all hover:border-violet-400/50 hover:opacity-100"
+          title="copy a mask from another image (same grid, or through a registration link)"
+          onClick={onImportFromImage}
+        >
+          <span className="text-[15px] leading-none text-slate-400">⇢</span>
+          <span className="text-[12px] text-slate-300">from another image…</span>
+        </button>
+      )}
+    </div>
+  )
 
   return (
     <div
@@ -127,13 +177,14 @@ export function CachePanel({
       }}
     >
       {objects.length === 0 ? (
-        <div className="flex h-full items-center justify-center">
+        <div className="flex h-full flex-col items-center justify-center gap-3 px-3">
           <p className="max-w-52 text-center text-[11px] leading-relaxed text-slate-600">
             cache is empty — right-click a peak or area in the Spectrum tab to store it here
           </p>
+          {importButton}
         </div>
       ) : (
-        <div className="panel-scroll h-full overflow-y-auto p-1.5">
+        <div className="panel-scroll h-full overflow-y-auto p-1.5 pb-12">
           {objects.map((obj) => {
             const orderIdx = selected.indexOf(obj.id)
             const isSel = orderIdx >= 0
@@ -179,6 +230,10 @@ export function CachePanel({
             )
           })}
         </div>
+      )}
+
+      {objects.length > 0 && (
+        <div className="absolute inset-x-1.5 bottom-1.5">{importButton}</div>
       )}
 
       {menu && (

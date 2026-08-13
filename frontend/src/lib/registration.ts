@@ -74,3 +74,52 @@ export function solveSimilarity(
   if (!flipped) return direct
   return flipped.rmse < direct.rmse ? flipped : direct
 }
+
+export interface ParsedRegistration {
+  matrix: [number, number, number, number, number, number]
+  movingShape: [number, number] | null
+  targetShape: [number, number] | null
+  movingName: string | null
+  targetName: string | null
+  rmse: number | null
+  nPairs: number
+}
+
+/** Accepts our export format, a bare {matrix: [...]}, or a bare 6-number
+    array. Throws with a readable message on anything else. */
+export function parseRegistrationJson(text: string): ParsedRegistration {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    throw new Error('Not valid JSON')
+  }
+  const asMatrix = (v: unknown): ParsedRegistration['matrix'] => {
+    if (!Array.isArray(v) || v.length !== 6 || v.some((n) => typeof n !== 'number' || !Number.isFinite(n))) {
+      throw new Error('matrix must be 6 finite numbers [a, b, tx, c, d, ty]')
+    }
+    return v as ParsedRegistration['matrix']
+  }
+  if (Array.isArray(raw)) {
+    return { matrix: asMatrix(raw), movingShape: null, targetShape: null,
+             movingName: null, targetName: null, rmse: null, nPairs: 0 }
+  }
+  const o = raw as Record<string, unknown>
+  const shape = (v: unknown): [number, number] | null => {
+    const sh = (v as { shape?: unknown } | undefined)?.shape
+    return Array.isArray(sh) && sh.length === 2 ? [Number(sh[0]), Number(sh[1])] : null
+  }
+  const name = (v: unknown): string | null => {
+    const n = (v as { name?: unknown } | undefined)?.name
+    return typeof n === 'string' ? n : null
+  }
+  return {
+    matrix: asMatrix(o.matrix),
+    movingShape: shape(o.moving) ?? (Array.isArray(o.movingShape) ? o.movingShape as [number, number] : null),
+    targetShape: shape(o.target) ?? (Array.isArray(o.targetShape) ? o.targetShape as [number, number] : null),
+    movingName: name(o.moving),
+    targetName: name(o.target),
+    rmse: typeof o.rmse === 'number' ? o.rmse : null,
+    nPairs: typeof o.n_pairs === 'number' ? o.n_pairs : typeof o.nPairs === 'number' ? o.nPairs : 0,
+  }
+}

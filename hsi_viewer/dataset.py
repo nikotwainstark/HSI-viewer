@@ -247,23 +247,55 @@ def pool_by(img: np.ndarray, factor: int) -> np.ndarray:
     return img.reshape(h2, f, w2, f).mean(axis=(1, 3), dtype=np.float32)
 
 
-def load_local_mask(path: str, shape: tuple[int, int]) -> np.ndarray:
-    """Load a full-resolution binary mask from a local .npy file or zarr
-    array. Shape must match the dataset exactly (data fidelity: no resizing)."""
+MASK_SUFFIXES = (".npy", ".png", ".tif", ".tiff")
+
+
+def read_mask_array(path: str) -> np.ndarray:
+    """Read a mask file as a 2D array, WITHOUT any resampling or shape check.
+
+    Accepts .npy, a zarr array, or an image (png/tif). A 3- or 4-channel
+    image is collapsed to one plane only when every marked pixel carries the
+    SAME colour — a multi-colour overlay is a label map whose classes would be
+    silently merged, so it is rejected with the count instead.
+    """
     p = Path(path).expanduser()
     if not p.exists():
         raise ValueError(f"mask path does not exist: {path}")
-    if p.suffix == ".npy":
-        arr = np.load(p, mmap_mode="r")
+    if p.suffix.lower() == ".npy":
+        arr = np.asarray(np.load(p, mmap_mode="r"))
+    elif p.suffix.lower() in (".png", ".tif", ".tiff"):
+        from PIL import Image as _Image
+
+        arr = np.asarray(_Image.open(p))
     elif zarr_node_kind(p) == "array":
         arr = zarr.open(str(p), mode="r")[:]
     else:
-        raise ValueError("mask must be a .npy file or a zarr array")
-    if arr.ndim != 2 or tuple(arr.shape) != tuple(shape):
+        raise ValueError("mask must be a .npy, .png, .tif file or a zarr array")
+    if arr.ndim == 3 and arr.shape[2] in (3, 4):
+        rgb = arr[..., :3]
+        if arr.shape[2] == 4:  # a transparent pixel is background
+            rgb = np.where(arr[..., 3:4] > 0, rgb, 0)
+        marked = rgb.any(axis=2)
+        colours = np.unique(rgb[marked].reshape(-1, 3), axis=0) if marked.any() else []
+        if len(colours) > 1:
+            raise ValueError(
+                f"image holds {len(colours)} distinct colours — it is a label map, "
+                "not a binary mask; export a single-channel label map instead")
+        arr = marked
+    if arr.ndim != 2:
+        raise ValueError(f"mask must be a 2D array, got shape {tuple(arr.shape)}")
+    return arr
+
+
+def load_local_mask(path: str, shape: tuple[int, int]) -> np.ndarray:
+    """Load a full-resolution binary mask from disk. Shape must match the
+    dataset EXACTLY — a mask is data, so it is never resized to fit."""
+    arr = read_mask_array(path)
+    if tuple(arr.shape) != tuple(shape):
         raise ValueError(
             f"mask shape {tuple(arr.shape)} does not match dataset spatial shape {tuple(shape)}"
         )
-    return np.asarray(arr) > 0.5
+    return arr > 0.5
 
 
 # ------------------------------------------------------------------- dataset
@@ -1238,6 +1270,132 @@ class HSIDataset:
             result |= region
         return self._cache_append("mask", label or "combined layers ∪", "combined",
                                   result.astype(np.float32))
+
+    def import_mask_array(self, src: np.ndarray, name: str, source_label: str,
+                          matrix: list[float] | None = None) -> dict:
+        """Adopt a mask from ANOTHER image's grid as a cache mask here.
+
+        Same grid -> copied as-is. Different grid -> `matrix` (2x3 affine,
+        source-native -> dest-native, x = column / y = row) must be given and
+        the mask is warped by NEAREST NEIGHBOUR: a mask is a yes/no map, so
+        interpolation would invent membership values. Pixels mapping outside
+        the source stay empty.
+        """
+        from scipy import ndimage
+
+        if matrix is None:
+            if src.shape != (self.height, self.width):
+                raise ValueError(
+                    f"Loading failed, the imported mask has "
+                    f"[{src.shape[0]},{src.shape[1]}], but the canvas is "
+                    f"[{self.height},{self.width}]")
+            out = src > 0.5
+        else:
+            a, b, tx, c, d, ty = (float(v) for v in matrix)
+            det = a * d - b * c
+            if abs(det) < 1e-12:
+                raise ValueError("registration matrix is singular")
+            # dest -> source inverse, in (x, y)
+            ia, ib = d / det, -b / det
+            ic, id_ = -c / det, a / det
+            itx = -(ia * tx + ib * ty)
+            ity = -(ic * tx + id_ * ty)
+            # pixel centres sit at index + 0.5 (the app-wide membership rule);
+            # scipy samples at integer indices, hence the half-pixel shifts
+            mat_rc = np.array([[id_, ic], [ib, ia]])
+            off = np.array([
+                0.5 * (ic + id_) + ity - 0.5,
+                0.5 * (ia + ib) + itx - 0.5,
+            ])
+            out = ndimage.affine_transform(
+                (src > 0.5).astype(np.uint8), matrix=mat_rc, offset=off,
+                output_shape=(self.height, self.width), order=0,
+                mode="constant", cval=0) > 0
+        if not out.any():
+            raise ValueError("the imported mask lands entirely outside this image")
+        return self._cache_append("mask", name, "imp", out.astype(np.float32),
+                                  source=source_label)
+
+    def inspect_mask_file(self, path: str) -> dict:
+        """What a mask file holds, and whether it fits this image — reported
+        BEFORE importing so a mismatch is explained rather than just refused."""
+        arr = read_mask_array(path)
+        h, w = arr.shape
+        labels = np.unique(arr[arr > 0]) if arr.size else np.array([])
+        return {
+            "path": path,
+            "shape": [int(h), int(w)],
+            "dtype": str(arr.dtype),
+            "expected": [self.height, self.width],
+            "matches": (h, w) == (self.height, self.width),
+            "marked": int((arr > 0).sum()),
+            # a label map carries several distinct positive values
+            "labels": [float(v) for v in labels[:64]],
+            "n_labels": int(labels.size),
+        }
+
+    def import_mask_file(self, path: str, split_labels: bool = False,
+                         name: str | None = None) -> list[dict]:
+        """Import an offline mask FILE as cache mask object(s).
+
+        The shape must match this image exactly (see load_local_mask) — a
+        mask means "these pixels", so resampling it would invent data. A
+        label map can be split into one mask per label, which is how an
+        offline segmentation usually arrives.
+        """
+        arr = read_mask_array(path)
+        if tuple(arr.shape) != (self.height, self.width):
+            raise ValueError(
+                f"mask shape {tuple(arr.shape)} does not match this image "
+                f"({self.height}, {self.width}) — masks are never resized")
+        base = name or Path(path).name
+        if not split_labels:
+            m = arr > 0.5
+            if not m.any():
+                raise ValueError("mask file has no marked pixels")
+            return [self._cache_append("mask", base, "imp", m.astype(np.float32),
+                                       source=f"imported · {path}")]
+        labels = np.unique(arr[arr > 0])
+        if labels.size == 0:
+            raise ValueError("mask file has no marked pixels")
+        if labels.size > 256:
+            raise ValueError(f"{labels.size} labels is too many to split (max 256)")
+        out = []
+        for v in labels:
+            out.append(self._cache_append(
+                "mask", f"{base} · {int(v) if float(v).is_integer() else v}", "imp",
+                (arr == v).astype(np.float32), source=f"imported · {path}"))
+        return out
+
+    def edit_mask(self, base: dict, edit: dict, op: str,
+                  label: str | None = None) -> dict:
+        """Boolean-edit a mask region with another region -> NEW cache mask.
+
+        The source object is never touched: cache objects are the provenance
+        of everything derived from them, so an edit adds a sibling instead of
+        rewriting history (delete the old one if it is no longer wanted).
+        Both operands are layer specs, so either side can be a cache mask, a
+        vector ROI, or a whole layer's region.
+        """
+        if op not in ("subtract", "intersect", "union"):
+            raise ValueError(f"unknown mask operation {op!r}")
+        m = self._spec_region(base)
+        if m is None:
+            raise ValueError("mask source is empty")
+        r = self._spec_region(edit)
+        if r is None:
+            raise ValueError("edit region is empty")
+        if op == "subtract":
+            out = m & ~r
+        elif op == "intersect":
+            out = m & r
+        else:
+            out = m | r
+        if not out.any():
+            raise ValueError("the result would be empty")
+        sign = {"subtract": "−", "intersect": "∩", "union": "∪"}[op]
+        return self._cache_append(
+            "mask", label or f"mask {sign} ROI", "edit", out.astype(np.float32))
 
     def export_layers(self, path: str, fmt: str, layer_specs: list[dict]) -> dict:
         """Export layer regions at native resolution. zarr/npz: one integer

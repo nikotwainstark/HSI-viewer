@@ -27,6 +27,11 @@ import {
   exportData,
   exportSpectra,
   combineLayers,
+  editMask,
+  importCacheFromImage,
+  importMaskFile,
+  inspectMaskFile,
+  type MaskFileInfo,
   cropImageInPlace,
   cropRoi,
   exportLayers,
@@ -94,7 +99,7 @@ import {
   type TransformHandle,
 } from './lib/transform'
 import { CoregOverview } from './components/CoregOverview'
-import { solveSimilarity } from './lib/registration'
+import { solveSimilarity, type ParsedRegistration } from './lib/registration'
 import { PathStyleExtension } from '@deck.gl/extensions'
 import { PropertyPanel, type PanelTab } from './components/PropertyPanel'
 import { CachePanel } from './components/CachePanel'
@@ -106,6 +111,13 @@ import { clipFactor, layerRasterKey, renderLayerRaster, type LayerRaster } from 
 import { mergeRegions, rasterizeParts, regionBitmap, regionEdges, subtractRegion } from './lib/pixelRegion'
 import { PreprocessPanel } from './components/PreprocessPanel'
 import { MaskPicker } from './components/MaskPicker'
+import { MaskEditDialog } from './components/MaskEditDialog'
+import { RoiPicker } from './components/RoiPicker'
+import { MaskImportDialog } from './components/MaskImportDialog'
+import { CacheImportDialog } from './components/CacheImportDialog'
+import { RegLinks, type RegLinkInfo } from './components/RegLinks'
+import { RegImportDialog } from './components/RegImportDialog'
+import { AffineApplyDialog } from './components/AffineApplyDialog'
 import { StepParamDialog } from './components/StepParamDialog'
 import { ExportDialog } from './components/ExportDialog'
 import { NameDialog } from './components/NameDialog'
@@ -115,7 +127,7 @@ import { ImagePanel, ImageInfoDialog } from './components/ImagePanel'
 import { OpacityPanel } from './components/OpacityPanel'
 import { MiniMap, layerColorHex } from './components/MiniMap'
 import { MenuBar } from './components/MenuBar'
-import { LayersPanel } from './components/LayersPanel'
+import { LayersPanel, atomLabel } from './components/LayersPanel'
 import { AntsOverlay } from './components/AntsOverlay'
 import { LogoLockup } from './components/Logo'
 import {
@@ -233,6 +245,11 @@ const DEFAULT_LAYOUT: ImgLayout = { dx: 0, dy: 0, rot: 0, sx: 1, sy: 1, alpha: 1
 
 const DASH_EXT = [new PathStyleExtension({ dash: true })]
 
+/** filename-safe slug for exported artefacts */
+function _safeName(n: string): string {
+  return n.replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'image'
+}
+
 /** Outline of the nib's footprint, in the image's native coords.
     Up to NIB_EXACT_PX it is the PIXEL STAIRCASE the dab would actually ink —
     same rasterization the stroke commits, so what the cursor promises is what
@@ -286,16 +303,38 @@ interface CoregState {
 }
 
 /** Confirmed registration: 2x3 matrix mapping moving-local -> target-local
-    native pixels (row-major [a, b, tx, c, d, ty]). */
+    native pixels (row-major [a, b, tx, c, d, ty]). A registration is an EDGE
+    between two images — it is drawn as a link on the canvas and everything
+    derived from it (apply, mask transfer, export) reads the exact matrix;
+    decompositions into display transforms are views, never the record. */
 interface RegistrationRecord {
   movingId: number
   movingName: string
+  /** moving image's native (h, w) at recording time — import validation */
+  movingShape: [number, number]
   targetId: number
   targetName: string
+  targetShape: [number, number]
   matrix: [number, number, number, number, number, number]
   rmse: number | null
   nPairs: number
 }
+
+/** Signed decomposition of a record's linear part into a display transform.
+    Mirrors survive (negative sy); shear cannot be represented and is
+    reported so callers can warn instead of silently approximating. */
+function decomposeMatrix(m: RegistrationRecord['matrix']) {
+  const rot = Math.atan2(m[3], m[0])
+  const sx = Math.hypot(m[0], m[3])
+  const cos = Math.cos(rot)
+  const sin = Math.sin(rot)
+  // signed projection of the y column onto the frame set by the x column:
+  // hypot() here would fold a mirrored fit back to positive scale
+  const sy = m[4] * cos - m[1] * sin
+  const shear = Math.abs(m[1] * cos + m[4] * sin) > 1e-6 * Math.max(1, Math.abs(sy))
+  return { rot, sx, sy, shear }
+}
+
 
 type HandleKind = TransformHandle
 
@@ -638,6 +677,69 @@ export default function App() {
   const [coreg, setCoreg] = useState<CoregState | null>(null)
   const [registrations, setRegistrations] = useState<RegistrationRecord[]>([])
 
+  /** Standalone affine (no target): dialog -> ghost preview -> commit. */
+  const [affineDialogOpen, setAffineDialogOpen] = useState(false)
+  const [affinePreview, setAffinePreview] = useState<
+    { layout: ImgLayout; anchor: [number, number]; frame: [number, number] | null;
+      shear: boolean } | null
+  >(null)
+
+  const openAffinePreview = useCallback(
+    (parsed: ParsedRegistration, ignoreTranslation: boolean) => {
+      setAffineDialogOpen(false)
+      if (!meta) return
+      const w = meta.shape[1]
+      const h = meta.shape[0]
+      const { rot, sx, sy, shear } = decomposeMatrix(
+        parsed.matrix as RegistrationRecord['matrix'],
+      )
+      const cur = layouts[meta.image.id] ?? DEFAULT_LAYOUT
+      const base: ImgLayout = { ...cur, dx: 0, dy: 0, rot, sx, sy }
+      // the virtual output frame's origin sits where the image's own origin
+      // currently displays — translation stays visible without a target
+      const anchor = applyT(cur, w, h, [0, 0])
+      let dx: number
+      let dy: number
+      if (ignoreTranslation) {
+        const wc = applyT(cur, w, h, [w / 2, h / 2])
+        const org = applyT(base, w, h, [w / 2, h / 2])
+        dx = wc[0] - org[0]
+        dy = wc[1] - org[1]
+      } else {
+        const org = applyT(base, w, h, [0, 0])
+        dx = anchor[0] + parsed.matrix[2] - org[0]
+        dy = anchor[1] + parsed.matrix[5] - org[1]
+      }
+      setAffinePreview({
+        layout: { ...base, dx, dy },
+        anchor,
+        frame: ignoreTranslation ? null : (parsed.targetShape ?? [h, w]),
+        shear,
+      })
+    },
+    [meta, layouts],
+  )
+
+  const commitAffine = useCallback(() => {
+    if (!affinePreview || !meta) return
+    setLayouts((cur) => ({ ...cur, [meta.image.id]: affinePreview.layout }))
+    setAffinePreview(null)
+    setToast('Affine transform applied (display transform — data untouched)')
+  }, [affinePreview, meta])
+
+  // Esc cancels the affine preview
+  useEffect(() => {
+    if (!affinePreview) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      setAffinePreview(null)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [affinePreview])
+
+
   /** UNDO / REDO scope: the objects you edit on the canvas — layers and their
       atoms, picked pixels, spectral regions, and the selected image's own
       placement. Server-side work (preprocessing steps, cache objects, in-place
@@ -698,7 +800,15 @@ export default function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [history, coreg])
-  const [coregPick, setCoregPick] = useState<{ layerId: number; x: number; y: number } | null>(null)
+  /** coreg entry, step 1: choose the target image (movingLayerId fixed when
+      entered from a layer's own menu, free when entered from the image) */
+  const [coregPick, setCoregPick] = useState<
+    { movingLayerId: number | null; x: number; y: number } | null
+  >(null)
+  /** step 2: landmark pairing or manual */
+  const [coregMode, setCoregMode] = useState<
+    { movingLayerId: number | null; targetId: number; x: number; y: number } | null
+  >(null)
   // transform-handle mode: which image is being manually transformed
   const [transformImage, setTransformImage] = useState<number | null>(null)
   const handleDrag = useRef<{
@@ -802,20 +912,23 @@ export default function App() {
       least-squares similarity fit; otherwise moving centres on the target
       for pure manual alignment. */
   const startCoreg = useCallback(
-    (movingLayerId: number, targetId: number) => {
+    (opts: { targetId: number; movingLayerId: number | null; targetLayerId: number | null }) => {
       if (!meta) return
-      const movingLayer = layers.find((l) => l.id === movingLayerId)
+      const { targetId } = opts
       const target = images.find((i) => i.id === targetId)
-      if (!movingLayer || !target) return
-      const p = movingLayer.atoms
+      if (!target) return
+      // landmark pairing is EXPLICIT on both sides: one chosen layer each,
+      // pairs matched by placement order within that layer (no cross-layer
+      // pooling — that would make the pairing order arbitrary)
+      const movingLayer = layers.find((l) => l.id === opts.movingLayerId)
+      const p = (movingLayer?.atoms ?? [])
         .filter((a): a is Extract<Atom, { kind: 'landmark' }> => a.kind === 'landmark')
         .map((a) => a.point)
       const tb = imageBundles.current.get(targetId)
-      const q = (tb?.layers ?? []).flatMap((l) =>
-        l.atoms
-          .filter((a): a is Extract<Atom, { kind: 'landmark' }> => a.kind === 'landmark')
-          .map((a) => a.point),
-      )
+      const targetLayer = (tb?.layers ?? []).find((l) => l.id === opts.targetLayerId)
+      const q = (targetLayer?.atoms ?? [])
+        .filter((a): a is Extract<Atom, { kind: 'landmark' }> => a.kind === 'landmark')
+        .map((a) => a.point)
       const savedMoving = layouts[meta.image.id] ?? DEFAULT_LAYOUT
       const savedTarget = layouts[targetId] ?? DEFAULT_LAYOUT
       // the coreg workspace is the target's NATIVE grid: its own display
@@ -857,9 +970,6 @@ export default function App() {
           dy: frozenTarget.dy + target.shape[0] / 2 - hm / 2,
         }
         if (p.length && p.length === q.length) pairs = p.map((pp, i) => ({ p: pp, q: q[i] }))
-        if (p.length >= 3 && p.length !== q.length) {
-          setToast(`Landmark counts differ (${p.length} vs ${q.length}) — manual alignment`)
-        }
       }
       // hide every non-participating image for the session (restored on exit),
       // and force z-order: target directly below the moving overlay on top
@@ -937,8 +1047,10 @@ export default function App() {
       {
         movingId: coreg.movingId,
         movingName: mIm?.name ?? '',
+        movingShape: [meta.shape[0], meta.shape[1]],
         targetId: coreg.targetId,
         targetName: tIm?.name ?? '',
+        targetShape: tIm ? [tIm.shape[0], tIm.shape[1]] : [0, 0],
         matrix,
         rmse: coregResiduals?.rmse ?? null,
         nPairs: coreg.pairs.length,
@@ -976,9 +1088,10 @@ export default function App() {
     (rec: RegistrationRecord) => {
       const im = images.find((i) => i.id === rec.movingId)
       if (!im) return
-      const rot = Math.atan2(rec.matrix[3], rec.matrix[0])
-      const sx = Math.hypot(rec.matrix[0], rec.matrix[3])
-      const sy = Math.hypot(rec.matrix[1], rec.matrix[4])
+      const { rot, sx, sy, shear } = decomposeMatrix(rec.matrix)
+      if (shear) {
+        setToast('Matrix carries shear — display alignment is approximate (data ops stay exact)')
+      }
       const tl = layouts[rec.targetId] ?? DEFAULT_LAYOUT
       const base: ImgLayout = { dx: 0, dy: 0, rot, sx, sy, alpha: 0.5 }
       const org = applyT(base, im.shape[1], im.shape[0], [0, 0])
@@ -2263,6 +2376,38 @@ export default function App() {
     // on the native grid the pooled render does not have, and none of it can
     // be read while bands fly past — it comes back the moment the drag stops.
     if (scrubbing) return result
+    // standalone-affine preview: ghost of the image under the proposed
+    // transform (alpha 0.3) + the virtual output frame it lands in
+    if (affinePreview && bitmap) {
+      if (affinePreview.frame) {
+        const [fh, fw] = affinePreview.frame
+        const [ax, ay] = affinePreview.anchor
+        result.push(
+          new PathLayer({
+            id: 'affine-frame',
+            data: [{ path: [
+              [ax, ay], [ax + fw, ay], [ax + fw, ay + fh], [ax, ay + fh], [ax, ay],
+            ] }],
+            getPath: (d: { path: [number, number][] }) => d.path,
+            getColor: [245, 158, 11, 200] as [number, number, number, number],
+            getWidth: 1.5,
+            widthUnits: 'pixels',
+            extensions: DASH_EXT,
+            getDashArray: [6, 4] as [number, number],
+          }),
+        )
+      }
+      result.push(
+        new BitmapLayer({
+          id: 'affine-ghost',
+          image: bitmap,
+          bounds: [0, meta.shape[0], meta.shape[1], 0] as [number, number, number, number],
+          opacity: 0.3,
+          modelMatrix: modelMatrixOf(affinePreview.layout, meta.shape[1], meta.shape[0]),
+          textureParameters: PIXEL_TEXTURE,
+        }),
+      )
+    }
     // coreg: everything outside the target window is blanked by a dark cover
     // with a hole over the target — the moving overlay only shows inside the
     // "Coregistration border" while both image outlines stay visible on top
@@ -2594,7 +2739,7 @@ export default function App() {
   }, [meta, bitmap, picks, zOrder, layouts, images, layerUrls, selMatrix,
       layers, clipBitmaps, scrubbing, activeLayerId,
       panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerClipKey,
-      layerRasterFactorFor, transformImage, rotOffsetWorld, coreg, isolate])
+      layerRasterFactorFor, transformImage, rotOffsetWorld, coreg, isolate, affinePreview])
 
 
   /** In-progress drawing (painted stroke, rubber-band shape). Kept OUT of the
@@ -2893,6 +3038,164 @@ export default function App() {
     const base = clean(meta?.name ?? 'export')
     return { base, what }
   }, [display, meta])
+
+  /** Import an offline mask FILE into the cache. Two steps on purpose: the
+      file is inspected first so the shape check (and what the file actually
+      holds) is shown BEFORE anything is created — a mask is data, so a
+      mismatch has to be explained, never resampled away. */
+  const [maskFileBrowser, setMaskFileBrowser] = useState(false)
+  const [maskImport, setMaskImport] = useState<MaskFileInfo | null>(null)
+
+  const inspectMask = useCallback(async (path: string) => {
+    setMaskFileBrowser(false)
+    try {
+      setMaskImport(await inspectMaskFile(path))
+    } catch (e) {
+      setToast((e as Error).message)
+    }
+  }, [])
+
+  const doImportMask = useCallback(
+    async (splitLabels: boolean, name: string) => {
+      const info = maskImport
+      if (!info) return
+      setMaskImport(null)
+      try {
+        const { objects } = await importMaskFile(info.path, splitLabels, name)
+        await refreshCache()
+        setPanelTab('cache')
+        setToast(
+          objects.length === 1
+            ? `Imported mask "${objects[0].name}"`
+            : `Imported ${objects.length} masks from ${info.path.split('/').pop()}`,
+        )
+      } catch (e) {
+        setToast((e as Error).message)
+      }
+    },
+    [maskImport, refreshCache],
+  )
+
+  /** Cross-image mask import: same grid copies, different grids travel
+      through a registration edge (nearest-neighbour warp on the backend). */
+  const [cacheImportOpen, setCacheImportOpen] = useState(false)
+
+  /** 2x3 inverse of a registration matrix (for target->moving traffic). */
+  const invertMatrix = (
+    m: RegistrationRecord['matrix'],
+  ): RegistrationRecord['matrix'] | null => {
+    const [a, b, tx, c, d, ty] = m
+    const det = a * d - b * c
+    if (Math.abs(det) < 1e-12) return null
+    const ia = d / det
+    const ib = -b / det
+    const ic = -c / det
+    const idd = a / det
+    return [ia, ib, -(ia * tx + ib * ty), ic, idd, -(ic * tx + idd * ty)]
+  }
+
+  /** How a mask travels from `src` into the SELECTED image, if it can. */
+  const crossImportRoute = useCallback(
+    (src: ImageEntryInfo): { matrix: number[] | null; label: string } | { refusal: string } => {
+      if (!meta) return { refusal: 'no image selected' }
+      if (src.shape[0] === meta.shape[0] && src.shape[1] === meta.shape[1]) {
+        return { matrix: null, label: 'same grid' }
+      }
+      const forward = registrations.find(
+        (r) => r.movingId === src.id && r.targetId === meta.image.id,
+      )
+      if (forward) return { matrix: forward.matrix, label: 'via registration' }
+      const backward = registrations.find(
+        (r) => r.movingId === meta.image.id && r.targetId === src.id,
+      )
+      if (backward) {
+        const inv = invertMatrix(backward.matrix)
+        if (inv) return { matrix: inv, label: 'via registration (inverse)' }
+      }
+      return {
+        refusal:
+          `Loading failed, the imported mask has [${src.shape[0]},${src.shape[1]}], ` +
+          `but the canvas is [${meta.shape[0]},${meta.shape[1]}] — coregister the two ` +
+          'images to enable transfer',
+      }
+    },
+    [meta, registrations],
+  )
+
+  const doCrossImport = useCallback(
+    async (sourceImg: number, obj: CacheObject, route: { matrix: number[] | null }) => {
+      setCacheImportOpen(false)
+      try {
+        const created = await importCacheFromImage({
+          source_img: sourceImg,
+          obj_id: obj.id,
+          ...(route.matrix ? { matrix: route.matrix } : {}),
+        })
+        await refreshCache()
+        setPanelTab('cache')
+        setToast(`Imported mask "${created.name}"`)
+      } catch (e) {
+        setToast((e as Error).message)
+      }
+    },
+    [refreshCache],
+  )
+
+  /** Boolean mask editing: a ROI region applied to a cached mask. The source
+      mask is never touched — the result is a NEW cache object, so anything
+      already derived from the original keeps meaning what it meant. */
+  /** mask id waiting for the user to choose which ROI to edit it with */
+  const [maskEditPickRoi, setMaskEditPickRoi] = useState<number | null>(null)
+  const [maskEdit, setMaskEdit] = useState<
+    { maskId: number | null; label: string; region: { atoms?: RoiPart[]; cache_ids?: number[]; path?: string } } | null
+  >(null)
+
+  /** Every ROI/mask atom that can serve as an edit region, newest first. */
+  const regionAtoms = useMemo(
+    () =>
+      layers.flatMap((l) =>
+        l.atoms
+          .filter((a) => a.kind !== 'landmark' && a.visible !== false)
+          .map((a) => ({ layer: l, atom: a })),
+      ),
+    [layers],
+  )
+
+  const openMaskEditWithAtom = useCallback((
+    layer: LayerObj, atom: Atom, maskId: number | null = null,
+  ) => {
+    const args = roiRequestArgs(layer, atom)
+    if (atom.kind === 'landmark') return
+    setMaskEdit({
+      maskId,
+      label: atomLabel(atom),
+      region: atom.kind === 'mask'
+        ? { cache_ids: args.cache_ids }
+        : { atoms: args.parts, ...(args.cache_ids ? { cache_ids: args.cache_ids } : {}),
+            ...((args as { path?: string }).path ? { path: (args as { path?: string }).path } : {}) },
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meta])
+
+  const applyMaskEdit = useCallback(
+    async (maskId: number, op: 'subtract' | 'intersect' | 'union', label: string) => {
+      if (!maskEdit) return
+      setMaskEdit(null)
+      try {
+        const obj = await editMask({
+          base: { cache_ids: [maskId] },
+          edit: maskEdit.region,
+          op,
+          label,
+        })
+        await refreshCache()
+        setToast(`Created mask "${obj.name}"`)
+      } catch (e) {
+        setToast((e as Error).message)
+      }
+    },
+    [maskEdit, refreshCache],
+  )
 
   /** Isolate components: mask → largest connected regions → one ROI atom
       each, in reading order, inside a fresh layer (TMA cores in one go). */
@@ -3564,32 +3867,95 @@ export default function App() {
     }))
   }, [])
 
+  const registrationJson = (rec: RegistrationRecord): string =>
+    JSON.stringify(
+      {
+        app: 'Hyperspectral Cube Viewer',
+        kind: 'registration',
+        moving: { name: rec.movingName, shape: rec.movingShape },
+        target: { name: rec.targetName, shape: rec.targetShape },
+        matrix: rec.matrix,
+        convention:
+          'target_xy = [[a,b,tx],[c,d,ty]] · [moving_x, moving_y, 1]; x = column, y = row, native pixels',
+        rmse: rec.rmse,
+        n_pairs: rec.nPairs,
+      },
+      null,
+      2,
+    )
+
   const copyRegistration = useCallback((rec: RegistrationRecord) => {
-    navigator.clipboard?.writeText(JSON.stringify(rec, null, 2))
+    navigator.clipboard?.writeText(registrationJson(rec))
     setToast('Registration JSON copied to clipboard')
   }, [])
 
-  /** Registration section for an image's arrange menu (post-Confirm). */
+  const exportRegistration = useCallback((rec: RegistrationRecord) => {
+    const blob = new Blob([registrationJson(rec)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const el = document.createElement('a')
+    el.href = url
+    el.download = `registration_${_safeName(rec.movingName)}_to_${_safeName(rec.targetName)}.json`
+    el.click()
+    URL.revokeObjectURL(url)
+  }, [])
+
+  /** clicked registration edge: its menu opens here */
+  const [regLinkMenu, setRegLinkMenu] = useState<
+    { rec: RegistrationRecord; x: number; y: number } | null
+  >(null)
+  /** import dialog target: the image that will be MOVING */
+  const [regImportFor, setRegImportFor] = useState<number | null>(null)
+
+  const importRegistration = useCallback(
+    (parsed: ParsedRegistration, movingIm: ImageEntryInfo, targetIm: ImageEntryInfo,
+     applyNow: boolean) => {
+      const rec: RegistrationRecord = {
+        movingId: movingIm.id,
+        movingName: movingIm.name,
+        movingShape: [movingIm.shape[0], movingIm.shape[1]],
+        targetId: targetIm.id,
+        targetName: targetIm.name,
+        targetShape: [targetIm.shape[0], targetIm.shape[1]],
+        matrix: parsed.matrix,
+        rmse: parsed.rmse,
+        nPairs: parsed.nPairs,
+      }
+      setRegistrations((rs) => [
+        ...rs.filter((r) => !(r.movingId === rec.movingId && r.targetId === rec.targetId)),
+        rec,
+      ])
+      setRegImportFor(null)
+      if (applyNow) applyRegistration(rec)
+      setToast(`Registration imported: "${rec.movingName}" → "${rec.targetName}"`)
+    },
+    [applyRegistration],
+  )
+
+  /** Registration section for an image's arrange menu. Every record is an
+      edge on the canvas too — this section is the same actions reachable
+      without hunting for the line. */
   const registrationEntries = useCallback(
     (imageId: number): MenuEntry[] => {
-      const rec = registrations.find((r) => r.movingId === imageId)
-      if (!rec) return []
-      return [
-        { divider: true, label: 'registration' } as MenuEntry,
-        {
-          label: 'Re-apply registration',
-          hint: `→ ${rec.targetName}`,
-          onClick: () => applyRegistration(rec),
-        },
-        { label: 'Remove alignment', onClick: () => removeAlignment(imageId) },
-        {
-          label: 'Copy registration JSON',
+      const recs = registrations.filter((r) => r.movingId === imageId)
+      const out: MenuEntry[] = [{ divider: true, label: 'registration' } as MenuEntry]
+      for (const rec of recs) {
+        out.push({
+          label: `Re-apply registration → ${rec.targetName}`,
           hint: rec.rmse != null ? `RMSE ${rec.rmse.toFixed(2)} px` : undefined,
-          onClick: () => copyRegistration(rec),
-        },
-      ]
+          onClick: () => applyRegistration(rec),
+        })
+      }
+      if (recs.length) {
+        out.push({ label: 'Remove alignment', onClick: () => removeAlignment(imageId) })
+      }
+      out.push({
+        label: 'Import registration…',
+        hint: 'affine JSON → link to a target',
+        onClick: () => setRegImportFor(imageId),
+      })
+      return out
     },
-    [registrations, applyRegistration, removeAlignment, copyRegistration],
+    [registrations, applyRegistration, removeAlignment],
   )
 
   /** Double-click an image on canvas to select it (drag tool only; drawing
@@ -3747,6 +4113,13 @@ export default function App() {
             hint: 'append to IMAGE tab',
             onClick: () => cropAtom(layer, atom),
           })
+          if (cacheObjects.some((o) => o.kind === 'mask')) {
+            out.push({
+              label: 'Edit mask with this ROI…',
+              hint: 'subtract / keep / add → new mask',
+              onClick: () => openMaskEditWithAtom(layer, atom),
+            })
+          }
           if (atom.kind === 'roi') {
             out.push({
               label: 'Crop image to ROI (in place)',
@@ -3834,6 +4207,18 @@ export default function App() {
         hint: 'rotate / stretch / scale',
         onClick: () => setTransformImage(meta.image.id),
       })
+      if (images.length > 1) {
+        items.push({
+          label: 'Coregister to…',
+          hint: 'landmark fit or manual · this image moves',
+          onClick: () => setCoregPick({ movingLayerId: null, x: menu.x, y: menu.y }),
+        })
+      }
+      items.push({
+        label: 'Apply affine transform…',
+        hint: '2×3 matrix · preview first',
+        onClick: () => setAffineDialogOpen(true),
+      })
       items.push({
         label: 'Opacity…',
         hint: `${Math.round(l.alpha * 100)}%`,
@@ -3863,6 +4248,13 @@ export default function App() {
             hint: 'one ROI per region (TMA cores)',
             onClick: () => openIsolate(obj),
           })
+          if (regionAtoms.length) {
+            items.push({
+              label: 'Edit with ROI…',
+              hint: 'subtract / keep / add → new mask',
+              onClick: () => setMaskEditPickRoi(obj.id),
+            })
+          }
         }
         items.push({
           label: 'Delete from cache',
@@ -3877,6 +4269,11 @@ export default function App() {
       if (!(display.kind === 'cached' && display.rgb)) {
         items.push({ label: 'Create mask from live threshold…', onClick: openThreshold })
       }
+      items.push({
+        label: 'Import mask from file…',
+        hint: 'npy / png / tif / zarr · shape must match',
+        onClick: () => setMaskFileBrowser(true),
+      })
       items.push({
         label: 'Export as…',
         hint: 'zarr / npz / png / tiff',
@@ -4071,6 +4468,11 @@ export default function App() {
                 onClick: () => setToast(history.redo() ? 'Redo' : 'Nothing to redo'),
               },
               { divider: true, label: 'image' },
+              {
+                label: 'Apply affine transform…',
+                hint: meta ? '2×3 matrix · preview first' : 'needs an image',
+                onClick: () => meta && setAffineDialogOpen(true),
+              },
               {
                 label: 'Crop selected image…',
                 hint: isHsi ? 'draw a window · replaces image' : 'needs an HSI image',
@@ -4315,9 +4717,15 @@ export default function App() {
               }}
               roiSpectrumKeys={roiSpectra.map((r) => `${r.layerId}:${r.atomId}`)}
               canCoregister={images.length > 1}
-              onCoregister={(layerId, x, y) => setCoregPick({ layerId, x, y })}
+              onCoregister={(layerId, x, y) => setCoregPick({ movingLayerId: layerId, x, y })}
               onExportLayers={(ids) => setExportState({ kind: 'layers', ids })}
               onExportRoiCubes={(ids) => setExportState({ kind: 'roicubes', layerIds: ids })}
+              hasMasks={cacheObjects.some((o) => o.kind === 'mask')}
+              onEditMaskWithAtom={(layerId, atomId) => {
+                const layer = layers.find((l) => l.id === layerId)
+                const atom = layer?.atoms.find((a) => a.id === atomId)
+                if (layer && atom) openMaskEditWithAtom(layer, atom)
+              }}
               onCropToAtom={(layerId, atomId) => {
                 const layer = layers.find((l) => l.id === layerId)
                 const atom = layer?.atoms.find((a) => a.id === atomId)
@@ -4393,6 +4801,14 @@ export default function App() {
               onRgb={handleCacheRgb}
               onApplyMask={handleApplyMask}
               onCleanBlobs={openBlobClean}
+              onIsolate={openIsolate}
+              onImportMask={() => setMaskFileBrowser(true)}
+              onImportFromImage={
+                images.length > 1 ? () => setCacheImportOpen(true) : null
+              }
+              onEditWithRoi={
+                regionAtoms.length ? (obj) => setMaskEditPickRoi(obj.id) : null
+              }
             /> : null
           }
         />
@@ -4577,7 +4993,7 @@ export default function App() {
         </>
       )}
 
-      {/* coreg target chooser */}
+      {/* coreg step 1: choose the target image */}
       {coregPick && meta && (
         <ContextMenu
           x={coregPick.x}
@@ -4593,13 +5009,208 @@ export default function App() {
               return {
                 label: im.name,
                 hint: `${nLm} landmarks`,
-                onClick: () => startCoreg(coregPick.layerId, im.id),
+                onClick: () =>
+                  setCoregMode({
+                    movingLayerId: coregPick.movingLayerId,
+                    targetId: im.id,
+                    x: coregPick.x,
+                    y: coregPick.y,
+                  }),
               }
             })}
           header={{ type: 'coregister', name: 'choose target image' }}
           onClose={() => setCoregPick(null)}
         />
       )}
+      {/* coreg step 2: landmark pairing (explicit layers, equal counts) or manual */}
+      {coregMode && meta && (() => {
+        const landmarksOf = (ls: LayerObj[]) =>
+          ls
+            .map((l) => ({
+              layer: l,
+              n: l.atoms.filter((a) => a.kind === 'landmark').length,
+            }))
+            .filter((e) => e.n > 0)
+        const movingSide = landmarksOf(
+          coregMode.movingLayerId != null
+            ? layers.filter((l) => l.id === coregMode.movingLayerId)
+            : layers,
+        )
+        const targetSide = landmarksOf(
+          imageBundles.current.get(coregMode.targetId)?.layers ?? [],
+        )
+        const pairings = movingSide.flatMap((m) =>
+          targetSide
+            .filter((t) => t.n === m.n && m.n >= 3)
+            .map((t) => ({ m, t })),
+        )
+        const items: MenuEntry[] = pairings.length
+          ? pairings.map(({ m, t }) => ({
+              label: `Landmark fit · ${m.layer.name} ↔ ${t.layer.name}`,
+              hint: `${m.n} pairs`,
+              onClick: () =>
+                startCoreg({
+                  targetId: coregMode.targetId,
+                  movingLayerId: m.layer.id,
+                  targetLayerId: t.layer.id,
+                }),
+            }))
+          : [
+              {
+                label: 'Landmark fit (unavailable)',
+                hint: 'needs equal counts ≥3 on both sides',
+                onClick: () => {
+                  const mDesc = movingSide.map((e) => `"${e.layer.name}" ${e.n}`).join(', ')
+                  const tDesc = targetSide.map((e) => `"${e.layer.name}" ${e.n}`).join(', ')
+                  setToast(
+                    'Coregistration needs matching landmark layers (≥3 pairs, same order). ' +
+                      `Moving: ${mDesc || 'none'} · Target: ${tDesc || 'none'}`,
+                  )
+                },
+              },
+            ]
+        items.push({ divider: true } as MenuEntry)
+        items.push({
+          label: 'Manual alignment',
+          hint: 'drag / handles, no landmarks',
+          onClick: () =>
+            startCoreg({
+              targetId: coregMode.targetId,
+              movingLayerId: null,
+              targetLayerId: null,
+            }),
+        })
+        return (
+          <ContextMenu
+            x={coregMode.x}
+            y={coregMode.y}
+            items={items}
+            header={{
+              type: 'coregister',
+              name: `→ ${images.find((i) => i.id === coregMode.targetId)?.name ?? ''}`,
+            }}
+            onClose={() => setCoregMode(null)}
+          />
+        )
+      })()}
+
+      {/* registration edges: amber moving->target links, clickable */}
+      {viewState && registrations.length > 0 && !coreg && (
+        <RegLinks
+          links={registrations.map((r): RegLinkInfo => ({
+            movingId: r.movingId,
+            targetId: r.targetId,
+            label: 'coreg',
+            sub: [
+              r.rmse != null ? `RMSE ${r.rmse.toFixed(2)} px` : null,
+              decomposeMatrix(r.matrix).sy < 0 ? 'mirrored' : null,
+            ].filter(Boolean).join(' · ') || null,
+          }))}
+          images={images}
+          layouts={layouts}
+          viewState={viewState}
+          size={size}
+          onOpen={(link, x, y) => {
+            const rec = registrations.find(
+              (r) => r.movingId === link.movingId && r.targetId === link.targetId,
+            )
+            if (rec) setRegLinkMenu({ rec, x, y })
+          }}
+        />
+      )}
+      {regLinkMenu && (
+        <ContextMenu
+          x={regLinkMenu.x}
+          y={regLinkMenu.y}
+          items={[
+            {
+              label: 'Apply registration',
+              hint: 'align moving onto target',
+              onClick: () => applyRegistration(regLinkMenu.rec),
+            },
+            { divider: true, label: 'share' } as MenuEntry,
+            {
+              label: 'Export JSON…',
+              hint: 'save the affine to a file',
+              onClick: () => exportRegistration(regLinkMenu.rec),
+            },
+            { label: 'Copy JSON', onClick: () => copyRegistration(regLinkMenu.rec) },
+            { divider: true } as MenuEntry,
+            {
+              label: 'Delete record',
+              onClick: () =>
+                setRegistrations((rs) =>
+                  rs.filter(
+                    (r) =>
+                      !(r.movingId === regLinkMenu.rec.movingId &&
+                        r.targetId === regLinkMenu.rec.targetId),
+                  ),
+                ),
+            },
+          ]}
+          header={{
+            type: 'registration',
+            name: `${regLinkMenu.rec.movingName} → ${regLinkMenu.rec.targetName}`,
+          }}
+          onClose={() => setRegLinkMenu(null)}
+        />
+      )}
+      {affineDialogOpen && meta && (() => {
+        const im = images.find((i) => i.id === meta.image.id)
+        return im ? (
+          <AffineApplyDialog
+            image={im}
+            onConfirm={openAffinePreview}
+            onClose={() => setAffineDialogOpen(false)}
+          />
+        ) : null
+      })()}
+      {affinePreview && (
+        <div
+          className="absolute bottom-4 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3
+                     rounded-xl border border-white/10 bg-slate-950/70 px-4 py-2.5
+                     shadow-2xl shadow-black/50 backdrop-blur-xl"
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <span className="font-mono text-[11px] text-slate-300">
+            affine preview
+            {affinePreview.frame &&
+              ` · frame ${affinePreview.frame[0]}×${affinePreview.frame[1]}`}
+            {affinePreview.shear && (
+              <span className="text-amber-300"> · shear approximated on display</span>
+            )}
+          </span>
+          <button
+            className="rounded-lg border border-emerald-400/40 bg-emerald-400/15 px-3 py-1.5
+                       text-[12px] font-medium text-emerald-200 hover:bg-emerald-400/25"
+            onClick={commitAffine}
+          >
+            Confirm
+          </button>
+          <button
+            className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-[12px]
+                       text-slate-300 hover:bg-white/10"
+            onClick={() => setAffinePreview(null)}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      {regImportFor != null && (() => {
+        const movingIm = images.find((i) => i.id === regImportFor)
+        if (!movingIm) return null
+        return (
+          <RegImportDialog
+            moving={movingIm}
+            candidates={images.filter((i) => i.id !== regImportFor)}
+            onConfirm={(parsed, targetId, applyNow) => {
+              const targetIm = images.find((i) => i.id === targetId)
+              if (targetIm) importRegistration(parsed, movingIm, targetIm, applyNow)
+            }}
+            onClose={() => setRegImportFor(null)}
+          />
+        )
+      })()}
 
       {/* relative-placement minimap (colors match the canvas outlines);
           during coreg it is replaced by the interactive overview widget */}
@@ -4824,6 +5435,34 @@ export default function App() {
       {infoImage && <ImageInfoDialog img={infoImage} onClose={() => setInfoImage(null)} />}
 
       {/* layer creation mask sources */}
+      {maskEditPickRoi != null && (
+        <RoiPicker
+          regions={regionAtoms.map(({ layer, atom }) => ({
+            layerId: layer.id,
+            atomId: atom.id,
+            layerName: layer.name,
+            color: layer.color,
+            label: atomLabel(atom),
+          }))}
+          onConfirm={(layerId, atomId) => {
+            const layer = layers.find((l) => l.id === layerId)
+            const atom = layer?.atoms.find((a) => a.id === atomId)
+            const maskId = maskEditPickRoi
+            setMaskEditPickRoi(null)
+            if (layer && atom) openMaskEditWithAtom(layer, atom, maskId)
+          }}
+          onClose={() => setMaskEditPickRoi(null)}
+        />
+      )}
+      {maskEdit && (
+        <MaskEditDialog
+          masks={cacheObjects.filter((o) => o.kind === 'mask')}
+          initialMaskId={maskEdit.maskId}
+          regionLabel={maskEdit.label}
+          onConfirm={(id, op, name) => void applyMaskEdit(id, op, name)}
+          onClose={() => setMaskEdit(null)}
+        />
+      )}
       {layerMaskPicker && (
         <MaskPicker
           masks={cacheObjects.filter((o) => o.kind === 'mask')}
@@ -4840,6 +5479,32 @@ export default function App() {
             setPanelTab('layers')
           }}
           onClose={() => setLayerMaskPicker(false)}
+        />
+      )}
+      {maskFileBrowser && (
+        <FileBrowser
+          title="Import mask into cache"
+          subtitle="Full-resolution mask: .npy, .png, .tif or a zarr array"
+          filesFilter="npy,png,tif,tiff"
+          pickKinds={['file', 'zarr-array']}
+          onOpen={(path) => void inspectMask(path)}
+          onClose={() => setMaskFileBrowser(false)}
+        />
+      )}
+      {cacheImportOpen && meta && (
+        <CacheImportDialog
+          sources={images
+            .filter((i) => i.id !== meta.image.id)
+            .map((image) => ({ image, route: crossImportRoute(image) }))}
+          onConfirm={(sourceImg, obj, route) => void doCrossImport(sourceImg, obj, route)}
+          onClose={() => setCacheImportOpen(false)}
+        />
+      )}
+      {maskImport && (
+        <MaskImportDialog
+          info={maskImport}
+          onConfirm={(split, name) => void doImportMask(split, name)}
+          onClose={() => setMaskImport(null)}
         />
       )}
       {layerMaskFile && (
