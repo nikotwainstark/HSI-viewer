@@ -168,9 +168,11 @@ export interface LayerObj {
 export async function fetchMaskOutline(body: {
   cache_ids?: number[]
   path?: string
-}): Promise<[number, number][][]> {
-  const res = await postJson<{ contours: [number, number][][] }>('/api/layers/outline', body)
-  return res.contours
+}): Promise<{ contours: [number, number][][]; total: number }> {
+  const res = await postJson<{ contours: [number, number][][]; total?: number }>(
+    '/api/layers/outline', body,
+  )
+  return { contours: res.contours, total: res.total ?? res.contours.length }
 }
 
 /** One bounding box per connected component of a cached mask, in reading

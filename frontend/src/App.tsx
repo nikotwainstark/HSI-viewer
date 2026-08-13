@@ -1308,7 +1308,7 @@ export default function App() {
         if (maskAtomOutlines.has(key) || outlinePendingAtoms.current.has(key)) continue
         outlinePendingAtoms.current.add(key)
         fetchMaskOutline({ cache_ids: atom.cacheIds })
-          .then((cs) => setMaskAtomOutlines((m) => new Map(m).set(key, cs)))
+          .then(({ contours }) => setMaskAtomOutlines((m) => new Map(m).set(key, contours)))
           .catch((e) => setToast((e as Error).message))
           .finally(() => outlinePendingAtoms.current.delete(key))
       }
@@ -1428,9 +1428,15 @@ export default function App() {
         ? { cache_ids: layer.maskSource.ids }
         : { path: layer.maskSource.path },
     )
-      .then((cs) => {
-        outlineCache.current.set(key, cs)
-        setAntsPaths(cs)
+      .then(({ contours, total }) => {
+        outlineCache.current.set(key, contours)
+        setAntsPaths(contours)
+        if (total > contours.length) {
+          setToast(
+            `Mask has ${total} separate boundaries — showing the ${contours.length} largest ` +
+            '(clean the mask blobs for a tidier outline)',
+          )
+        }
       })
       .catch((e) => setToast((e as Error).message))
   }, [activeLayerId, layers, meta])

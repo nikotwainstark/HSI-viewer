@@ -491,7 +491,6 @@ def layers_clip(req: RoiClipRequest) -> Response:
 class RoiOutlineRequest(BaseModel):
     cache_ids: list[int] | None = None
     path: str | None = None
-    factor: int = 4
 
 
 class IsolateComponentsRequest(BaseModel):
@@ -530,22 +529,28 @@ def layers_parts_outline(req: PartsOutlineRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+ANTS_MAX_CONTOURS = 200
+
+
 @app.post("/api/layers/outline")
 def layers_outline(req: RoiOutlineRequest) -> dict:
-    """Mask boundary polylines (ants guide at factor 4, exact at factor 1)."""
+    """Mask boundary polylines at native resolution (geometry is data).
+
+    A speckled mask can have tens of thousands of one-pixel islands, which
+    no overlay can draw: the biggest boundaries are returned and the total
+    is reported so the caller can say what was left out — never a silent
+    truncation."""
     if not (req.cache_ids or req.path):
         raise HTTPException(status_code=400, detail="mask source required")
-    if req.factor not in (1, 2, 4, 8):
-        raise HTTPException(status_code=400, detail="factor must be 1, 2, 4 or 8")
     ds = manager.require()
     try:
-        contours = ds.mask_outline({"cache_ids": req.cache_ids, "path": req.path},
-                                   req.factor)
+        contours = ds.mask_outline({"cache_ids": req.cache_ids, "path": req.path})
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"contours": contours}
+    total = len(contours)
+    return {"contours": contours[:ANTS_MAX_CONTOURS], "total": total}
 
 
 class CombineLayersRequest(BaseModel):
