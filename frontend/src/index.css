@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: #0a0e14;
+  color: #e2e8f0;
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- marching ants (active layer effective region) ----------------------- */
+.ants {
+  animation: ants-march 0.6s linear infinite;
+}
+@keyframes ants-march {
+  to {
+    stroke-dashoffset: -18;
+  }
+}
+
+/* --- panel scrollbar ---------------------------------------------------- */
+.panel-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.panel-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.2);
+  border-radius: 4px;
+}
+.panel-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.35);
+}
+.panel-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* --- range slider ------------------------------------------------------- */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 9999px;
+  background: rgba(148, 163, 184, 0.25);
+  outline: none;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #7dd3fc;
+  border: 2px solid #0a0e14;
+  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.5), 0 2px 6px rgba(0, 0, 0, 0.5);
+  transition: transform 0.1s ease;
+}
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #7dd3fc;
+  border: 2px solid #0a0e14;
+}

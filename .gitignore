@@ -1,0 +1,13 @@
+# dependencies / build output
+frontend/node_modules/
+frontend/dist/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# editors / OS
+.DS_Store
+*.swp

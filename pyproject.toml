@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hsi-viewer"
+version = "0.1.0"
+description = "Hyperspectral Cube Viewer - local web viewer for hyperspectral zarr data"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "zarr>=3",
+    "numpy",
+    "pillow",
+    "scipy",
+    "matplotlib",
+]
+
+[project.scripts]
+hsi-viewer = "hsi_viewer.main:run"
+
+[tool.setuptools]
+packages = ["hsi_viewer"]
+
+[tool.setuptools.package-data]
+hsi_viewer = ["static/**/*"]
