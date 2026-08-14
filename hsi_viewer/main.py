@@ -640,6 +640,26 @@ def layers_outline(req: RoiOutlineRequest) -> dict:
     return {"contours": shown, "total": total}
 
 
+class RegionPixelsRequest(BaseModel):
+    atoms: list[dict]
+    cache_ids: list[int] | None = None
+    path: str | None = None
+
+
+@app.post("/api/layers/region_pixels")
+def layers_region_pixels(req: RegionPixelsRequest) -> dict:
+    """Pixel count of (atoms' union ∩ the given mask) — 0 means the geometry
+    lies entirely outside the layer's effective region."""
+    ds = manager.require()
+    try:
+        return {"pixels": ds.region_pixels(
+            {"atoms": req.atoms, "cache_ids": req.cache_ids, "path": req.path})}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 class CombineLayersRequest(BaseModel):
     layers: list[dict]
     label: str | None = None

@@ -55,6 +55,7 @@ import {
   fetchLiveStats,
   fetchLiveValue,
   fetchMeta,
+  fetchRegionPixels,
   fetchOpenStatus,
   fetchPipelineStatus,
   fetchPixelSpectrum,
@@ -1386,8 +1387,55 @@ export default function App() {
     [activeLayerId, layers, createLayer],
   )
 
+  /** A part drawn ENTIRELY outside the layer's effective region defines
+      nothing: reject it instead of leaving an invisible atom behind. Plain
+      layers are checked instantly on the client (image bounds); mask-bound
+      layers ask the backend for (part ∩ mask) and remove the part if empty
+      — the same after-the-fact style the eraser's auto-delete uses. */
+  const partInsideImage = useCallback(
+    (part: RoiPart): boolean => {
+      if (!meta) return true
+      return rasterizeParts([part], meta.shape[1], meta.shape[0], 1) != null
+    },
+    [meta],
+  )
+
+  const verifyPartInMask = useCallback(
+    (layerId: number, atomId: number, part: RoiPart) => {
+      const layer = layers.find((l) => l.id === layerId)
+      const ms = layer?.maskSource
+      if (!ms) return // plain layer: the client-side bounds check was enough
+      void fetchRegionPixels({
+        atoms: [part],
+        ...(ms.kind === 'cache' ? { cache_ids: ms.ids } : {}),
+        ...(ms.kind === 'local' ? { path: ms.path } : {}),
+      })
+        .then(({ pixels }) => {
+          if (pixels > 0) return
+          setLayers((ls) =>
+            ls.map((l) => {
+              if (l.id !== layerId) return l
+              const atoms = l.atoms.flatMap((a) => {
+                if (a.id !== atomId || a.kind !== 'roi') return [a]
+                const parts = a.parts.filter((pp) => pp !== part)
+                return parts.some((pp) => pp.op !== 'erase') ? [{ ...a, parts }] : []
+              })
+              return { ...l, atoms }
+            }),
+          )
+          setToast("Atom lies outside the layer's mask region — nothing was defined")
+        })
+        .catch(() => {/* validation only — a failed check never deletes work */})
+    },
+    [layers],
+  )
+
   const completeRoi = useCallback(
     (shape: RoiShape, points: [number, number][]) => {
+      if (!partInsideImage({ shape, points })) {
+        setToast("Atom lies outside the image — nothing was defined")
+        return
+      }
       atomSeq.current += 1
       const atom: Atom = { id: atomSeq.current, kind: 'roi', parts: [{ shape, points }] }
       setLayers((ls) => {
@@ -1411,8 +1459,9 @@ export default function App() {
         }
         return ls.map((l) => (l.id === target ? { ...l, atoms: [...l.atoms, atom] } : l))
       })
+      if (activeLayerId != null) verifyPartInMask(activeLayerId, atom.id, atom.parts[0])
     },
-    [activeLayerId],
+    [activeLayerId, partInsideImage, verifyPartInMask],
   )
 
   /** Commit a painted stroke as a ROI atom (vector path + nib width). */
@@ -1424,6 +1473,10 @@ export default function App() {
     (points: [number, number][], width: number) => {
       if (!points.length) return
       const part: RoiPart = { shape: 'brush', points, width }
+      if (!partInsideImage(part)) {
+        setToast('Stroke lies outside the image — nothing was defined')
+        return
+      }
       const current = brushAtomId.current
       const layer = layers.find((l) => l.id === activeLayerId)
       const target = current != null && layer?.atoms.some((a) => a.id === current)
@@ -1445,6 +1498,7 @@ export default function App() {
               : l,
           ),
         )
+        if (activeLayerId != null) verifyPartInMask(activeLayerId, target, part)
         return
       }
       atomSeq.current += 1
@@ -1471,8 +1525,9 @@ export default function App() {
         }
         return ls.map((l) => (l.id === tgt ? { ...l, atoms: [...l.atoms, atom] } : l))
       })
+      if (activeLayerId != null) verifyPartInMask(activeLayerId, atom.id, part)
     },
-    [activeLayerId, layers],
+    [activeLayerId, layers, partInsideImage, verifyPartInMask],
   )
 
   /** Apply an erase stroke: every ROI atom of the ACTIVE layer that the

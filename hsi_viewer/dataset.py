@@ -1279,6 +1279,12 @@ class HSIDataset:
             region = m if region is None else (region & m)
         return region
 
+    def region_pixels(self, spec: dict) -> int:
+        """How many pixels a layer spec's region covers (0 = empty). Used to
+        refuse atoms drawn entirely outside a layer's bound-mask region."""
+        region = self._spec_region(spec)
+        return int(region.sum()) if region is not None else 0
+
     def combine_layers(self, layer_specs: list[dict],
                        label: str | None = None) -> dict:
         """Union-combine layer regions into one native-resolution cache mask.

@@ -257,6 +257,14 @@ export async function editMask(body: {
   return postJson('/api/cache/edit_mask', body)
 }
 
+export async function fetchRegionPixels(body: {
+  atoms: RoiPart[]
+  cache_ids?: number[]
+  path?: string
+}): Promise<{ pixels: number }> {
+  return postJson('/api/layers/region_pixels', body)
+}
+
 export async function combineLayers(body: {
   layers: {
     atoms: RoiPart[]
