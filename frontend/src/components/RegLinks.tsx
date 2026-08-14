@@ -27,7 +27,12 @@ interface Props {
 }
 
 const NATIVE: Layout = { dx: 0, dy: 0, rot: 0, sx: 1, sy: 1, alpha: 1 }
-const COLOR = '#f59e0b' // amber, matching the crop/attention accent
+const COLOR = '#facc15' // industrial yellow — the link is a LIVE transform
+/** chevron spacing along the link, screen px */
+const CHEVRON_STEP = 18
+/** one chase pulse spans this many chevrons before wrapping */
+const CHASE_SPAN = 8
+const CHASE_S = 1.6
 
 /** Clip the world segment a->b against one image's rectangle, in that
     image's LOCAL space (affine keeps lines straight, so Liang-Barsky on the
@@ -94,27 +99,21 @@ export const RegLinks = memo(function RegLinks(
     const [x1, y1] = P(t1)
     const mx = (x0 + x1) / 2
     const my = (y0 + y1) / 2
-    let angle = (Math.atan2(y1 - y0, x1 - x0) * 180) / Math.PI
+    const heading = (Math.atan2(y1 - y0, x1 - x0) * 180) / Math.PI
+    let angle = heading
     if (angle > 90) angle -= 180
     if (angle < -90) angle += 180
-    return { link, dim, overlapping, x0, y0, x1, y1, mx, my, angle }
+    return { link, dim, overlapping, x0, y0, x1, y1, mx, my, angle, heading }
   })
 
   return (
     <svg className="pointer-events-none absolute inset-0 z-20" width={size.width} height={size.height}>
-      <defs>
-        <marker
-          id="reg-arrow" viewBox="0 0 8 8" refX="7" refY="4"
-          markerWidth="7" markerHeight="7" orient="auto-start-reverse"
-        >
-          <path d="M 0 0 L 8 4 L 0 8 z" fill={COLOR} />
-        </marker>
-      </defs>
       {rendered.map((r) => {
         if (!r) return null
         const { link } = r
         const key = `${link.movingId}-${link.targetId}`
         const open = (e: React.MouseEvent) => {
+          e.preventDefault() // right-click must not stack the browser menu on ours
           e.stopPropagation()
           onOpen(link, e.clientX, e.clientY)
         }
@@ -136,20 +135,41 @@ export const RegLinks = memo(function RegLinks(
                   x={r.mx} y={r.my - 20} textAnchor="middle"
                   fontSize={10} fontFamily="monospace" fill={COLOR}
                 >
-                  ⇢ {link.label}
+                  <tspan className="reg-chevron">»</tspan> {link.label}
                 </text>
               </g>
             </g>
           )
         }
+        // industrial runway lights: a row of chevrons pointing at the
+        // target, flashing in sequence toward it — the transform is LIVE
+        const len = Math.hypot(r.x1 - r.x0, r.y1 - r.y0)
+        const nChev = Math.max(2, Math.min(48, Math.floor(len / CHEVRON_STEP)))
+        const chevrons = Array.from({ length: nChev }, (_, i) => {
+          const t = (i + 0.5) / nChev
+          return {
+            x: r.x0 + t * (r.x1 - r.x0),
+            y: r.y0 + t * (r.y1 - r.y0),
+            delay: ((i % CHASE_SPAN) / CHASE_SPAN) * CHASE_S - CHASE_S,
+          }
+        })
         return (
           <g key={key} opacity={r.dim ? 0.45 : 1}>
-            <line
-              x1={r.x0} y1={r.y0} x2={r.x1} y2={r.y1}
-              stroke={COLOR} strokeWidth={2.5}
-              strokeDasharray={r.dim ? '6 5' : undefined}
-              markerEnd="url(#reg-arrow)"
-            />
+            {chevrons.map((c, i) => (
+              <path
+                key={i}
+                d="M -5 -6 L 4 0 L -5 6"
+                transform={`translate(${c.x} ${c.y}) rotate(${r.heading})`}
+                fill="none"
+                stroke={COLOR}
+                strokeWidth={3}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                paintOrder="stroke"
+                className={r.dim ? undefined : 'reg-chevron'}
+                style={r.dim ? { opacity: 0.5 } : { animationDelay: `${c.delay}s` }}
+              />
+            ))}
             {/* invisible fat stroke: the click target */}
             <line
               x1={r.x0} y1={r.y0} x2={r.x1} y2={r.y1}

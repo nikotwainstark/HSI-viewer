@@ -18,9 +18,11 @@ interface Props {
   onLoad: () => void
   /** in-place crop of the SELECTED hsi image (draw the window on canvas) */
   onCrop: () => void
+  /** start coregistration with this image as MOVING (null: single image) */
+  onCoregister: ((id: number, x: number, y: number) => void) | null
 }
 
-export function ImagePanel({ images, selectedId, onSelect, onDelete, onInfo, onLoad, onCrop }: Props) {
+export function ImagePanel({ images, selectedId, onSelect, onDelete, onInfo, onLoad, onCrop, onCoregister }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; img: ImageEntryInfo } | null>(null)
 
   const openMenu = (img: ImageEntryInfo) => (e: ReactMouseEvent) => {
@@ -42,6 +44,13 @@ export function ImagePanel({ images, selectedId, onSelect, onDelete, onInfo, onL
               label: 'Crop…',
               hint: 'in place · draw a window on canvas',
               onClick: onCrop,
+            }]
+          : []),
+        ...(onCoregister
+          ? [{
+              label: 'Coregister to…',
+              hint: 'landmark fit or manual · this image moves',
+              onClick: () => onCoregister(menu.img.id, menu.x, menu.y),
             }]
           : []),
         { divider: true },

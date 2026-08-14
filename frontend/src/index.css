@@ -27,6 +27,27 @@ body {
   }
 }
 
+/* --- registration link: runway-light chase ------------------------------ */
+/* Each chevron flashes briefly; staggered animation-delay makes the flash
+   travel along the row toward the target — the transform is live. */
+.reg-chevron {
+  opacity: 0.28;
+  animation: reg-chase 1.6s linear infinite;
+}
+@keyframes reg-chase {
+  0%,
+  30%,
+  100% {
+    opacity: 0.28;
+  }
+  8% {
+    opacity: 1;
+  }
+  18% {
+    opacity: 0.55;
+  }
+}
+
 /* --- panel scrollbar ---------------------------------------------------- */
 .panel-scroll::-webkit-scrollbar {
   width: 8px;

@@ -3,17 +3,21 @@ import { useEffect, useState } from 'react'
 /**
  * Fetch a preview PNG and decode it to an ImageBitmap.
  * The previous bitmap is kept until the new one is ready, so the canvas
- * never flashes while scrubbing through bands or switching datasets.
+ * never flashes while scrubbing through bands — but the caller gets the URL
+ * the bitmap was decoded FROM, because "previous" may belong to a different
+ * image entirely (image switch) and must not be drawn in the new frame.
  */
 export function usePreviewImage(
   url: string | null,
   onError?: (message: string) => void,
-): ImageBitmap | null {
-  const [bitmap, setBitmap] = useState<ImageBitmap | null>(null)
+): { bitmap: ImageBitmap | null; loadedUrl: string | null } {
+  const [state, setState] = useState<{ bitmap: ImageBitmap | null; loadedUrl: string | null }>(
+    { bitmap: null, loadedUrl: null },
+  )
 
   useEffect(() => {
     if (!url) {
-      setBitmap(null)
+      setState({ bitmap: null, loadedUrl: null })
       return
     }
     let cancelled = false
@@ -32,7 +36,7 @@ export function usePreviewImage(
       })
       .then((blob) => createImageBitmap(blob))
       .then((bm) => {
-        if (!cancelled) setBitmap(bm)
+        if (!cancelled) setState({ bitmap: bm, loadedUrl: url })
       })
       .catch((err) => {
         console.error(err)
@@ -44,5 +48,5 @@ export function usePreviewImage(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url])
 
-  return bitmap
+  return state
 }

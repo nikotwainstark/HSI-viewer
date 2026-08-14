@@ -287,6 +287,14 @@ export async function exportRoiCubes(body: {
 
 /** Fresh-image in-place crop: REPLACES the selected image entry with the
     cropped live data (new dataset, empty recipe/cache; disk untouched). */
+export async function bakeRegistration(body: {
+  img: number
+  matrix: number[]
+  target_shape: [number, number]
+}): Promise<{ state: string }> {
+  return postJson('/api/registration/bake', body)
+}
+
 export async function cropImageInPlace(body: { parts: RoiPart[] }): Promise<PipelineStatus> {
   return postJson('/api/images/crop_inplace', body)
 }

@@ -6,6 +6,8 @@ import threading
 import webbrowser
 from pathlib import Path
 
+import numpy as np
+
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -280,6 +282,77 @@ class DatasetManager:
                     self.pipe_progress = 1.0
             except Exception as exc:
                 logger.exception("data export job failed")
+                with self._lock:
+                    self.pipe_state = "error"
+                    self.pipe_error = str(exc)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def bake_async(self, img_id: int, matrix: list[float],
+                   out_shape: tuple[int, int]) -> None:
+        """Warp image `img_id`'s data onto a registration's target grid and
+        REPLACE the entry — fresh-image semantics like the in-place crop: new
+        dataset, empty recipe/cache, old memory freed, disk untouched."""
+        entry = self.entry_by(img_id)
+        with self._lock:
+            if self.pipe_state == "running":
+                raise HTTPException(status_code=409, detail="a pipeline job is already running")
+            self.pipe_state = "running"
+            self.pipe_progress = 0.0
+            self.pipe_message = "starting"
+            self.pipe_error = None
+
+        def work() -> None:
+            def on_progress(frac: float, msg: str) -> None:
+                self.pipe_progress = frac
+                self.pipe_message = msg
+
+            try:
+                base = entry.name.split("\u00b7 ")[-1].strip()
+                name = f"aligned {out_shape[1]}x{out_shape[0]} \u00b7 {base}"
+                if entry.itype == "hsi":
+                    ds = entry.dataset
+                    assert ds is not None
+                    arr = ds.resample_to_grid(matrix, out_shape, on_progress)
+                    new_entry = images_mod.entry_from_array(
+                        entry.id, name, f"{ds.key_path}::baked{entry.id}", arr,
+                        ds.wavenumbers.copy() if ds.has_wavenumbers else None,
+                        lambda f, m: on_progress(0.85 + 0.15 * f, m),
+                        axis_kind=ds.axis_kind)
+                else:
+                    # flat images (rgb / scalar maps) warp channel by channel;
+                    # the entry keeps its own display type
+                    from scipy import ndimage
+
+                    from .dataset import _inverse_rc
+                    assert entry.array is not None
+                    src = entry.array
+                    mat_rc, off = _inverse_rc(matrix)
+                    oh, ow = int(out_shape[0]), int(out_shape[1])
+                    if src.ndim == 3:
+                        chans = [ndimage.affine_transform(
+                            src[..., c].astype(np.float32), matrix=mat_rc,
+                            offset=off, output_shape=(oh, ow), order=1,
+                            mode="constant", cval=0.0) for c in range(src.shape[2])]
+                        out = np.stack(chans, axis=-1)
+                        if entry.itype == "rgb":
+                            out = np.clip(np.round(out), 0, 255).astype(np.uint8)
+                    else:
+                        out = ndimage.affine_transform(
+                            src.astype(np.float32), matrix=mat_rc, offset=off,
+                            output_shape=(oh, ow), order=1, mode="constant",
+                            cval=0.0)
+                    new_entry = images_mod.ImageEntry(
+                        entry.id, name, f"{entry.path}::baked{entry.id}",
+                        entry.itype, array=out, dtype_label=entry.dtype_label)
+                with self._lock:
+                    self.images[entry.id] = new_entry
+                    self.pipe_state = "idle"
+                    self.pipe_progress = 1.0
+                    self.pipe_message = f'registration baked \u2192 "{name}"'
+                logger.info("bake replaced image %d: %s", entry.id, name)
+            except Exception as exc:
+                logger.exception("bake failed")
                 with self._lock:
                     self.pipe_state = "error"
                     self.pipe_error = str(exc)
@@ -622,6 +695,22 @@ class ImportMaskRequest(BaseModel):
     path: str
     split_labels: bool = False
     name: str | None = None
+
+
+class BakeRequest(BaseModel):
+    img: int
+    matrix: list[float]  # 2x3, this image's native px -> target-grid native px
+    target_shape: list[int]  # [h, w] of the output grid
+
+
+@app.post("/api/registration/bake")
+def registration_bake(req: BakeRequest) -> dict:
+    """Resample an image's data onto a registration target grid, replacing
+    the image in place (job; poll /api/pipeline/status)."""
+    if len(req.matrix) != 6 or len(req.target_shape) != 2:
+        raise HTTPException(status_code=400, detail="matrix must be 2x3, target_shape [h, w]")
+    manager.bake_async(req.img, req.matrix, (req.target_shape[0], req.target_shape[1]))
+    return {"state": "running"}
 
 
 @app.post("/api/cache/inspect_mask")

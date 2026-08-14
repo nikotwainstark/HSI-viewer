@@ -287,6 +287,27 @@ def read_mask_array(path: str) -> np.ndarray:
     return arr
 
 
+def _inverse_rc(matrix: list[float]) -> tuple[np.ndarray, np.ndarray]:
+    """Invert a 2x3 affine (source-native -> dest-native, x = column, y = row)
+    and express it in scipy's (row, col) index space. Pixel centres sit at
+    index + 0.5 (the app-wide membership rule); scipy samples at integer
+    indices, hence the half-pixel shifts."""
+    a, b, tx, c, d, ty = (float(v) for v in matrix)
+    det = a * d - b * c
+    if abs(det) < 1e-12:
+        raise ValueError("registration matrix is singular")
+    ia, ib = d / det, -b / det
+    ic, id_ = -c / det, a / det
+    itx = -(ia * tx + ib * ty)
+    ity = -(ic * tx + id_ * ty)
+    mat_rc = np.array([[id_, ic], [ib, ia]])
+    off = np.array([
+        0.5 * (ic + id_) + ity - 0.5,
+        0.5 * (ia + ib) + itx - 0.5,
+    ])
+    return mat_rc, off
+
+
 def load_local_mask(path: str, shape: tuple[int, int]) -> np.ndarray:
     """Load a full-resolution binary mask from disk. Shape must match the
     dataset EXACTLY — a mask is data, so it is never resized to fit."""
@@ -1271,6 +1292,38 @@ class HSIDataset:
         return self._cache_append("mask", label or "combined layers ∪", "combined",
                                   result.astype(np.float32))
 
+    def resample_to_grid(self, matrix: list[float], out_shape: tuple[int, int],
+                         progress: ProgressFn) -> np.ndarray:
+        """Bake a registration into the data: warp the LIVE cube onto another
+        image's grid, returning (out_h, out_w, B) float32.
+
+        `matrix` maps this image's native px -> output-grid native px. Data
+        is sampled bilinearly at pixel centres; the valid mask travels
+        CONSERVATIVELY (an output pixel touched by any invalid or
+        out-of-bounds source is invalid) and invalid pixels are zeroed across
+        all bands, so the standard valid-pixel rules of the new image inherit
+        every invalidity source. The disk original is untouched — reload it
+        to undo.
+        """
+        from scipy import ndimage
+
+        assert self.full is not None and self.full_valid is not None
+        out_h, out_w = int(out_shape[0]), int(out_shape[1])
+        mat_rc, off = _inverse_rc(matrix)
+        arr = np.empty((out_h, out_w, self.bands), dtype=np.float32)
+        for b in range(self.bands):
+            if b % 16 == 0:
+                progress(0.05 + 0.75 * b / self.bands, f"warping band {b + 1}/{self.bands}")
+            arr[:, :, b] = ndimage.affine_transform(
+                self.full[b], matrix=mat_rc, offset=off,
+                output_shape=(out_h, out_w), order=1, mode="constant", cval=0.0)
+        progress(0.82, "warping valid mask")
+        vw = ndimage.affine_transform(
+            self.full_valid.astype(np.float32), matrix=mat_rc, offset=off,
+            output_shape=(out_h, out_w), order=1, mode="constant", cval=0.0)
+        arr[vw < 0.999] = 0.0
+        return arr
+
     def import_mask_array(self, src: np.ndarray, name: str, source_label: str,
                           matrix: list[float] | None = None) -> dict:
         """Adopt a mask from ANOTHER image's grid as a cache mask here.
@@ -1291,22 +1344,7 @@ class HSIDataset:
                     f"[{self.height},{self.width}]")
             out = src > 0.5
         else:
-            a, b, tx, c, d, ty = (float(v) for v in matrix)
-            det = a * d - b * c
-            if abs(det) < 1e-12:
-                raise ValueError("registration matrix is singular")
-            # dest -> source inverse, in (x, y)
-            ia, ib = d / det, -b / det
-            ic, id_ = -c / det, a / det
-            itx = -(ia * tx + ib * ty)
-            ity = -(ic * tx + id_ * ty)
-            # pixel centres sit at index + 0.5 (the app-wide membership rule);
-            # scipy samples at integer indices, hence the half-pixel shifts
-            mat_rc = np.array([[id_, ic], [ib, ia]])
-            off = np.array([
-                0.5 * (ic + id_) + ity - 0.5,
-                0.5 * (ia + ib) + itx - 0.5,
-            ])
+            mat_rc, off = _inverse_rc(matrix)
             out = ndimage.affine_transform(
                 (src > 0.5).astype(np.uint8), matrix=mat_rc, offset=off,
                 output_shape=(self.height, self.width), order=0,

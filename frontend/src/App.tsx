@@ -26,6 +26,7 @@ import {
   exportCanvas,
   exportData,
   exportSpectra,
+  bakeRegistration,
   combineLayers,
   editMask,
   importCacheFromImage,
@@ -2054,7 +2055,15 @@ export default function App() {
         ? maskCleanUrl(meta, blobClean.maskId, blobClean)
         : previewUrl(meta, display, stretch, cmap, pipelineVersion, viewFactor)
     : null
-  const bitmap = usePreviewImage(imageUrl, setToast)
+  const { bitmap, loadedUrl } = usePreviewImage(imageUrl, setToast)
+  // whose image the decoded bitmap belongs to: band/stretch changes keep the
+  // ds param, an image switch changes it — a stale bitmap of ANOTHER image
+  // must never be drawn into the newly selected frame
+  const bitmapFresh =
+    bitmap != null &&
+    loadedUrl != null &&
+    meta != null &&
+    new URLSearchParams(loadedUrl.split('?')[1] ?? '').get('ds') === meta.id
 
   // live value under the cursor (throttled: one request in flight at a time)
   useEffect(() => {
@@ -2270,9 +2279,18 @@ export default function App() {
       const mm = modelMatrixOf(l, im.shape[1], im.shape[0])
       const bounds: [number, number, number, number] = [0, im.shape[0], im.shape[1], 0]
       if (id === selId) {
-        if (bitmap) {
+        if (bitmap && bitmapFresh) {
           result.push(new BitmapLayer({
             id: `img-${id}`, image: bitmap, bounds, opacity: l.alpha, modelMatrix: mm,
+            textureParameters: PIXEL_TEXTURE,
+          }))
+        } else {
+          // image just switched: until ITS render arrives, show the same
+          // URL-based frame it had as a non-selected image (browser-cached)
+          // rather than another image's leftover bitmap
+          const url = imageLayerUrl(im, imageBundles.current.get(im.id), 1)
+          result.push(new BitmapLayer({
+            id: `img-${id}`, image: url, bounds, opacity: l.alpha, modelMatrix: mm,
             textureParameters: PIXEL_TEXTURE,
           }))
         }
@@ -2736,7 +2754,7 @@ export default function App() {
     return result
     // NOTE: the in-progress draft lives in `draftLayers` — keep fast-changing
     // pointer state (brushStroke / roiDraft / mouseWorld) out of this memo
-  }, [meta, bitmap, picks, zOrder, layouts, images, layerUrls, selMatrix,
+  }, [meta, bitmap, bitmapFresh, picks, zOrder, layouts, images, layerUrls, selMatrix,
       layers, clipBitmaps, scrubbing, activeLayerId,
       panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerClipKey,
       layerRasterFactorFor, transformImage, rotOffsetWorld, coreg, isolate, affinePreview])
@@ -3444,6 +3462,51 @@ export default function App() {
     [meta, runPipelineJob, applySelectedMeta, history],
   )
 
+  /** Bake a registration into the moving image's DATA: warp onto the target
+      grid and replace the entry in place (fresh-image semantics, disk
+      untouched — reload the source to undo). The record is consumed: after
+      baking, the two grids coincide and the old matrix would be a lie. */
+  const bakeRegistrationRec = useCallback(
+    async (rec: RegistrationRecord) => {
+      setRegLinkMenu(null)
+      await runPipelineJob(
+        () => bakeRegistration({
+          img: rec.movingId,
+          matrix: rec.matrix,
+          target_shape: rec.targetShape,
+        }),
+        async (st) => {
+          const l = await fetchImages()
+          setImages(l.images)
+          imageBundles.current.delete(rec.movingId) // frame-bound state is void
+          history.clear(rec.movingId) // the id is reused, the frame is not
+          // grids coincide now: overlay the moving image on the target
+          setLayouts((cur) => {
+            const tl = cur[rec.targetId] ?? DEFAULT_LAYOUT
+            return {
+              ...cur,
+              [rec.movingId]: {
+                ...DEFAULT_LAYOUT,
+                dx: tl.dx,
+                dy: tl.dy,
+                alpha: cur[rec.movingId]?.alpha ?? 0.5,
+              },
+            }
+          })
+          setRegistrations((rs) =>
+            rs.filter(
+              (r) => !(r.movingId === rec.movingId && r.targetId === rec.targetId),
+            ),
+          )
+          const m = await fetchMeta()
+          if (m) applySelectedMeta(m)
+          setToast(st.message || 'Registration baked into data')
+        },
+      )
+    },
+    [runPipelineJob, applySelectedMeta, history],
+  )
+
   /** Crop the selected image to a pixel window (from a drawn box or a ROI
       bounding box). */
   const cropSelectedToBox = useCallback(
@@ -3856,10 +3919,6 @@ export default function App() {
      activeLayerId, coreg, maskAtomOutlines],
   )
 
-  const removeAlignment = useCallback((id: number) => {
-    setLayouts((cur) => ({ ...cur, [id]: { ...DEFAULT_LAYOUT, alpha: cur[id]?.alpha ?? 1 } }))
-  }, [])
-
   const toggleImageHidden = useCallback((id: number) => {
     setLayouts((cur) => ({
       ...cur,
@@ -3899,6 +3958,20 @@ export default function App() {
     URL.revokeObjectURL(url)
   }, [])
 
+  /** Open the coreg target picker with `imgId` as the MOVING image,
+      selecting it first when it is not the selected one (the session always
+      moves the selected image). */
+  const beginCoregFor = useCallback(
+    (imgId: number, x: number, y: number) => {
+      if (meta?.image.id === imgId) {
+        setCoregPick({ movingLayerId: null, x, y })
+        return
+      }
+      void doSelectImage(imgId).then(() => setCoregPick({ movingLayerId: null, x, y }))
+    },
+    [meta, doSelectImage],
+  )
+
   /** clicked registration edge: its menu opens here */
   const [regLinkMenu, setRegLinkMenu] = useState<
     { rec: RegistrationRecord; x: number; y: number } | null
@@ -3931,31 +4004,19 @@ export default function App() {
     [applyRegistration],
   )
 
-  /** Registration section for an image's arrange menu. Every record is an
-      edge on the canvas too — this section is the same actions reachable
-      without hunting for the line. */
+  /** Registration section of an image's arrange menu: ONLY the import entry.
+      Every action on an existing record lives in its chevron link's menu —
+      one home per record, not three. */
   const registrationEntries = useCallback(
-    (imageId: number): MenuEntry[] => {
-      const recs = registrations.filter((r) => r.movingId === imageId)
-      const out: MenuEntry[] = [{ divider: true, label: 'registration' } as MenuEntry]
-      for (const rec of recs) {
-        out.push({
-          label: `Re-apply registration → ${rec.targetName}`,
-          hint: rec.rmse != null ? `RMSE ${rec.rmse.toFixed(2)} px` : undefined,
-          onClick: () => applyRegistration(rec),
-        })
-      }
-      if (recs.length) {
-        out.push({ label: 'Remove alignment', onClick: () => removeAlignment(imageId) })
-      }
-      out.push({
+    (imageId: number): MenuEntry[] => [
+      { divider: true, label: 'registration' } as MenuEntry,
+      {
         label: 'Import registration…',
         hint: 'affine JSON → link to a target',
         onClick: () => setRegImportFor(imageId),
-      })
-      return out
-    },
-    [registrations, applyRegistration, removeAlignment],
+      },
+    ],
+    [],
   )
 
   /** Double-click an image on canvas to select it (drag tool only; drawing
@@ -4168,6 +4229,11 @@ export default function App() {
             onClick: () => setTransformImage(im.id),
           },
           {
+            label: 'Coregister to…',
+            hint: 'landmark fit or manual · this image moves',
+            onClick: () => beginCoregFor(im.id, menu.x, menu.y),
+          },
+          {
             label: 'Opacity…',
             hint: `${Math.round(l.alpha * 100)}%`,
             onClick: () => setOpacityFor(im.id),
@@ -4211,7 +4277,7 @@ export default function App() {
         items.push({
           label: 'Coregister to…',
           hint: 'landmark fit or manual · this image moves',
-          onClick: () => setCoregPick({ movingLayerId: null, x: menu.x, y: menu.y }),
+          onClick: () => beginCoregFor(meta.image.id, menu.x, menu.y),
         })
       }
       items.push({
@@ -4659,6 +4725,7 @@ export default function App() {
               onDelete={doDeleteImage}
               onInfo={setInfoImage}
               onLoad={() => setBrowserOpen(true)}
+              onCoregister={images.length > 1 ? beginCoregFor : null}
               onCrop={() => {
                 setRoiDraft([])
                 setTool('crop')
@@ -5127,6 +5194,11 @@ export default function App() {
               label: 'Apply registration',
               hint: 'align moving onto target',
               onClick: () => applyRegistration(regLinkMenu.rec),
+            },
+            {
+              label: 'Bake into data (in place)…',
+              hint: 'resample onto the target grid · replaces the moving image',
+              onClick: () => void bakeRegistrationRec(regLinkMenu.rec),
             },
             { divider: true, label: 'share' } as MenuEntry,
             {
