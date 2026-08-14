@@ -2810,7 +2810,7 @@ export default function App() {
     // NOTE: the in-progress draft lives in `draftLayers` — keep fast-changing
     // pointer state (brushStroke / roiDraft / mouseWorld) out of this memo
   }, [meta, bitmap, bitmapFresh, picks, zOrder, layouts, images, layerUrls, selMatrix,
-      layers, clipBitmaps, scrubbing, activeLayerId,
+      layers, clipBitmaps, scrubbing,
       panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerClipKey,
       layerRasterFactorFor, transformImage, rotOffsetWorld, coreg, isolate, affinePreview])
 
@@ -3971,7 +3971,7 @@ export default function App() {
       setMenu({ x: e.clientX, y: e.clientY, world, pick: hit, imageHit, atomHit })
     },
     [viewState, size, picks, zOrder, images, layouts, selToWorld, selToLocal, layers,
-     activeLayerId, coreg, maskAtomOutlines],
+     activeLayerId, coreg, maskAtomOutlines, meta],
   )
 
   const toggleImageHidden = useCallback((id: number) => {
@@ -4182,6 +4182,276 @@ export default function App() {
       })
     }
   }, [])
+
+  /** The left panel re-rendered on EVERY app render — including each
+      pan/zoom frame, which never changes anything it shows. Memoizing the
+      ELEMENT keeps its identity stable across unrelated renders, so React
+      skips reconciling the whole subtree; the dependency list (lint-
+      enforced) rebuilds it exactly when something it displays changes. */
+  /** Painting updates the stroke every frame; the mode bar reads none of
+      that, so its element is memoized like the side panel. */
+  const atomModeBarEl = useMemo(() => {
+    if (!atomMode) return null
+    return (
+      <AtomModeBar
+          layers={layers}
+          activeLayerId={activeLayerId}
+          onActivateLayer={(id) => {
+            finishBrushAtom()
+            setActiveLayerId(id)
+          }}
+          onCreateLayer={() => createLayer()}
+          type={atomMode.type}
+          onPickType={(t) => {
+            setAtomMode({ type: t })
+            setErasing(false)
+            if (t === 'roi') startRoi(roiShape)
+            else if (t === 'landmark') setTool('landmark')
+            else setTool('drag')
+          }}
+          roiShape={roiShape}
+          onCycleShape={() => {
+            // shape and eraser behave as one radio pair: clicking the shape
+            // tool while erasing simply comes BACK to it. Only a click on the
+            // ALREADY-ARMED tool cycles the shape — returning from the eraser
+            // must never silently change what you were drawing with.
+            if (erasing) {
+              startRoi(roiShape)
+              return
+            }
+            const order: RoiShape[] = ['rect', 'polygon', 'brush']
+            startRoi(order[(order.indexOf(roiShape) + 1) % order.length])
+          }}
+          erasing={erasing}
+          onToggleErase={() => {
+            if (erasing) return // already armed: clicking it again is a no-op
+            setErasing(true)
+            setRoiDraft([])
+            setTool('erase')
+          }}
+          brushSize={brushSize}
+          onBrushSize={setBrushSize}
+          eraserSize={eraserSize}
+          onEraserSize={setEraserSize}
+          brushStrokes={brushAtomStrokes}
+          onFinishBrushAtom={finishBrushAtom}
+          onExit={exitAtomMode}
+        />
+    )
+  }, [atomMode, layers, activeLayerId, roiShape, erasing, brushSize, eraserSize,
+      brushAtomStrokes, finishBrushAtom, createLayer, startRoi, exitAtomMode])
+
+  const toolbarEl = useMemo(
+    () => (
+      <div className={coreg ? 'pointer-events-none opacity-40' : undefined}>
+        <Toolbar
+          tool={tool}
+          onToolChange={setTool}
+          stretch={stretch}
+          onStretchChange={setStretch}
+          cmap={cmap}
+          onCmapChange={setCmap}
+          cmapDisabled={display.kind === 'cached' && display.rgb}
+          onAddAtom={enterAtomMode}
+          atomsDisabled={transformImage != null || coreg != null}
+        />
+      </div>
+    ),
+    [tool, stretch, cmap, display, enterAtomMode, transformImage, coreg],
+  )
+
+  const propertyPanelEl = useMemo(() => {
+    if (!meta) return null
+    return (
+      <div className={coreg ? 'pointer-events-none opacity-40' : undefined}>
+        <PropertyPanel
+          meta={meta}
+          display={display}
+          band={band}
+          onBandChange={changeBand}
+          width={panelWidth}
+          onWidthChange={setPanelWidth}
+          tab={panelTab}
+          onTabChange={setPanelTab}
+          layersLocked={transformImage != null}
+          cacheCount={cacheObjects.length}
+          imageSlot={
+            <ImagePanel
+              images={images}
+              selectedId={meta.image.id}
+              onSelect={doSelectImage}
+              onDelete={doDeleteImage}
+              onInfo={setInfoImage}
+              onLoad={() => setBrowserOpen(true)}
+              onCoregister={images.length > 1 ? beginCoregFor : null}
+              onCrop={() => {
+                setRoiDraft([])
+                setTool('crop')
+                setToast('Crop mode: click two corners of the window · Esc cancels')
+              }}
+            />
+          }
+          layersSlot={
+            <div
+              className={
+                transformImage != null
+                  ? 'pointer-events-none h-full opacity-40'
+                  : 'h-full'
+              }
+              title={transformImage != null ? 'layers are locked while transforming' : undefined}
+            >
+            <LayersPanel
+              layers={layers}
+              activeId={activeLayerId}
+              isHsi={isHsi}
+              onActivate={setActiveLayerId}
+              onReorder={(ids) =>
+                setLayers((ls) =>
+                  ids.map((id) => ls.find((l) => l.id === id))
+                    .filter(Boolean) as LayerObj[],
+                )
+              }
+              onCreate={() => createLayer()}
+              onCreateFromCacheMask={() => setLayerMaskPicker(true)}
+              onCreateFromLocalMask={() => setLayerMaskFile(true)}
+              onRename={(id) => {
+                const l = layers.find((x) => x.id === id)
+                if (l) setRenameLayerState({ id, name: l.name })
+              }}
+              onChooseColor={chooseLayerColor}
+              onSelectionChange={handlePanelSelChange}
+              onDelete={(id) => {
+                setLayers((ls) => ls.filter((l) => l.id !== id))
+                setActiveLayerId((cur) => (cur === id ? null : cur))
+              }}
+              onToggleVisible={(id) =>
+                setLayers((ls) =>
+                  ls.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)),
+                )
+              }
+              onDeleteAtom={deleteAtom}
+              onToggleAtomVisible={toggleAtomVisible}
+              onSetAtomsVisibleMany={setAtomsVisibleMany}
+              onDeleteAtomsMany={deleteAtomsMany}
+              onCombineAtoms={combineAtomsMany}
+              onRenameAtom={startRenameAtom}
+              onToggleRoiSpectrum={(layerId, atomId) => {
+                const layer = layers.find((l) => l.id === layerId)
+                const atom = layer?.atoms.find((a) => a.id === atomId)
+                if (layer && atom) void toggleRoiSpectrum(layer, atom)
+              }}
+              roiSpectrumKeys={roiSpectra.map((r) => `${r.layerId}:${r.atomId}`)}
+              canCoregister={images.length > 1}
+              onCoregister={(layerId, x, y) => setCoregPick({ movingLayerId: layerId, x, y })}
+              onExportLayers={(ids) => setExportState({ kind: 'layers', ids })}
+              onExportRoiCubes={(ids) => setExportState({ kind: 'roicubes', layerIds: ids })}
+              hasMasks={cacheObjects.some((o) => o.kind === 'mask')}
+              onEditMaskWithAtom={(layerId, atomId) => {
+                const layer = layers.find((l) => l.id === layerId)
+                const atom = layer?.atoms.find((a) => a.id === atomId)
+                if (layer && atom) openMaskEditWithAtom(layer, atom)
+              }}
+              onCropToAtom={(layerId, atomId) => {
+                const layer = layers.find((l) => l.id === layerId)
+                const atom = layer?.atoms.find((a) => a.id === atomId)
+                if (atom?.kind === 'roi') {
+                  const [bx0, by0, bx1, by1] = partsBbox(atom.parts)
+                  cropSelectedToBox(bx0, by0, bx1, by1)
+                }
+              }}
+              onCropAtomToImage={(layerId, atomId) => {
+                const layer = layers.find((l) => l.id === layerId)
+                const atom = layer?.atoms.find((a) => a.id === atomId)
+                if (layer && atom) void cropAtom(layer, atom)
+              }}
+              onSetVisibleMany={setLayersVisibleMany}
+              onDeleteMany={deleteLayersMany}
+              onCombine={combineLayersMany}
+            />
+            </div>
+          }
+          preprocessSlot={
+            isHsi ? <PreprocessPanel
+              datasetName={meta.name}
+              dataLabel={meta.pipeline.label}
+              axisUnit={meta.axis.unit}
+              items={pipeItems}
+              onAddStep={addStep}
+              onRemoveStep={removeStep}
+              onReorderPending={reorderPending}
+              onPickMaskFromCache={setMaskPickerStep as (uid: number) => void}
+              onPickMaskFromLocal={setMaskFileStep as (uid: number) => void}
+              onEditParams={setParamStep as (uid: number) => void}
+              onSubmit={submitJob}
+              onRenameNode={handleRenameNode}
+              onExportNode={handleExportNode}
+              onRevertNode={revertToNode}
+              onNodeInfo={setInfoNodeUid as (uid: number) => void}
+            /> : null
+          }
+          spectrumSlot={
+            isHsi ? <SpectrumPanel
+              meta={meta}
+              mode={spectrumMode}
+              onModeChange={setSpectrumMode}
+              avgValues={avgSpec?.values ?? null}
+              nValid={avgSpec?.n_valid ?? null}
+              picks={picks}
+              roiSeries={roiSeriesResolved}
+              currentBand={display.kind === 'band' ? display.band : null}
+              displayedRegion={
+                display.kind === 'integral' ? { i0: display.i0, i1: display.i1 } : null
+              }
+              regions={regions}
+              onAddRegion={(i0, i1) =>
+                setRegions((rs) => [...rs, { id: ++regionSeq.current, i0, i1 }])
+              }
+              onRemoveRegion={(id) => setRegions((rs) => rs.filter((r) => r.id !== id))}
+              onDisplayRegion={(r) => setDisplay({ kind: 'integral', i0: r.i0, i1: r.i1 })}
+              onCachePeak={handleCachePeak}
+              onCacheArea={handleCacheArea}
+              onExportSpectra={(lo, hi) => setExportState({ kind: 'spectra', lo, hi })}
+              onBandChange={changeBand}
+            /> : null
+          }
+          cacheSlot={
+            isHsi ? <CachePanel
+              objects={cacheObjects}
+              selected={cacheSel}
+              onSelectedChange={setCacheSel}
+              displayedId={display.kind === 'cached' ? display.id : null}
+              onDisplay={handleCacheDisplay}
+              onDelete={handleCacheDelete}
+              onRatio={handleCacheRatio}
+              onRgb={handleCacheRgb}
+              onApplyMask={handleApplyMask}
+              onCleanBlobs={openBlobClean}
+              onIsolate={openIsolate}
+              onImportMask={() => setMaskFileBrowser(true)}
+              onImportFromImage={
+                images.length > 1 ? () => setCacheImportOpen(true) : null
+              }
+              onEditWithRoi={
+                regionAtoms.length ? (obj) => setMaskEditPickRoi(obj.id) : null
+              }
+            /> : null
+          }
+        />
+      </div>
+    )
+  }, [meta, coreg, panelWidth, panelTab, isHsi, display, band, changeBand,
+      transformImage, cacheObjects, images, layers, activeLayerId,
+      picks, regions, spectrumMode, avgSpec, roiSpectra, roiSeriesResolved,
+      pipeItems, cacheSel, reorderPending, regionAtoms.length,
+      doSelectImage, doDeleteImage, beginCoregFor, cropSelectedToBox,
+      handlePanelSelChange, chooseLayerColor, createLayer, deleteAtom,
+      deleteAtomsMany, deleteLayersMany, setAtomsVisibleMany,
+      setLayersVisibleMany, toggleAtomVisible, toggleRoiSpectrum,
+      combineAtomsMany, combineLayersMany, startRenameAtom, cropAtom,
+      openMaskEditWithAtom, openBlobClean, openIsolate, handleRenameNode,
+      handleExportNode, handleApplyMask, handleCachePeak, handleCacheArea,
+      handleCacheRatio, handleCacheRgb, handleCacheDelete, handleCacheDisplay,
+      addStep, removeStep, revertToNode, submitJob])
 
   const menuItems: MenuEntry[] = useMemo(() => {
     if (!menu) return []
@@ -4410,7 +4680,9 @@ export default function App() {
   }, [menu, fitView, picks.length, removePick, clearPicks, display, openThreshold,
       cacheObjects, openBlobClean, openIsolate, handleCacheDelete, isHsi,
       images, layouts, meta, selToLocal, bumpZ, doSelectImage, registrationEntries,
-      layers, cropAtom, deleteAtom, cropSelectedToBox])
+      layers, cropAtom, deleteAtom, cropSelectedToBox,
+      beginCoregFor, regionAtoms.length, openMaskEditWithAtom, toggleRoiSpectrum,
+      toggleImageHidden, toggleAtomVisible, startRenameAtom, roiSpectra])
 
   // application menu bar (File-menu style, extensible)
   const filesMenu: MenuEntry[] = useMemo(() => {
@@ -4759,199 +5031,9 @@ export default function App() {
         </div>
       )}
 
-      {meta && (
-        <div className={coreg ? 'pointer-events-none opacity-40' : undefined}>
-        <PropertyPanel
-          meta={meta}
-          display={display}
-          band={band}
-          onBandChange={changeBand}
-          width={panelWidth}
-          onWidthChange={setPanelWidth}
-          tab={panelTab}
-          onTabChange={setPanelTab}
-          layersLocked={transformImage != null}
-          cacheCount={cacheObjects.length}
-          imageSlot={
-            <ImagePanel
-              images={images}
-              selectedId={meta.image.id}
-              onSelect={doSelectImage}
-              onDelete={doDeleteImage}
-              onInfo={setInfoImage}
-              onLoad={() => setBrowserOpen(true)}
-              onCoregister={images.length > 1 ? beginCoregFor : null}
-              onCrop={() => {
-                setRoiDraft([])
-                setTool('crop')
-                setToast('Crop mode: click two corners of the window · Esc cancels')
-              }}
-            />
-          }
-          layersSlot={
-            <div
-              className={
-                transformImage != null
-                  ? 'pointer-events-none h-full opacity-40'
-                  : 'h-full'
-              }
-              title={transformImage != null ? 'layers are locked while transforming' : undefined}
-            >
-            <LayersPanel
-              layers={layers}
-              activeId={activeLayerId}
-              isHsi={isHsi}
-              onActivate={setActiveLayerId}
-              onReorder={(ids) =>
-                setLayers((ls) =>
-                  ids.map((id) => ls.find((l) => l.id === id))
-                    .filter(Boolean) as LayerObj[],
-                )
-              }
-              onCreate={() => createLayer()}
-              onCreateFromCacheMask={() => setLayerMaskPicker(true)}
-              onCreateFromLocalMask={() => setLayerMaskFile(true)}
-              onRename={(id) => {
-                const l = layers.find((x) => x.id === id)
-                if (l) setRenameLayerState({ id, name: l.name })
-              }}
-              onChooseColor={chooseLayerColor}
-              onSelectionChange={handlePanelSelChange}
-              onDelete={(id) => {
-                setLayers((ls) => ls.filter((l) => l.id !== id))
-                setActiveLayerId((cur) => (cur === id ? null : cur))
-              }}
-              onToggleVisible={(id) =>
-                setLayers((ls) =>
-                  ls.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)),
-                )
-              }
-              onDeleteAtom={deleteAtom}
-              onToggleAtomVisible={toggleAtomVisible}
-              onSetAtomsVisibleMany={setAtomsVisibleMany}
-              onDeleteAtomsMany={deleteAtomsMany}
-              onCombineAtoms={combineAtomsMany}
-              onRenameAtom={startRenameAtom}
-              onToggleRoiSpectrum={(layerId, atomId) => {
-                const layer = layers.find((l) => l.id === layerId)
-                const atom = layer?.atoms.find((a) => a.id === atomId)
-                if (layer && atom) void toggleRoiSpectrum(layer, atom)
-              }}
-              roiSpectrumKeys={roiSpectra.map((r) => `${r.layerId}:${r.atomId}`)}
-              canCoregister={images.length > 1}
-              onCoregister={(layerId, x, y) => setCoregPick({ movingLayerId: layerId, x, y })}
-              onExportLayers={(ids) => setExportState({ kind: 'layers', ids })}
-              onExportRoiCubes={(ids) => setExportState({ kind: 'roicubes', layerIds: ids })}
-              hasMasks={cacheObjects.some((o) => o.kind === 'mask')}
-              onEditMaskWithAtom={(layerId, atomId) => {
-                const layer = layers.find((l) => l.id === layerId)
-                const atom = layer?.atoms.find((a) => a.id === atomId)
-                if (layer && atom) openMaskEditWithAtom(layer, atom)
-              }}
-              onCropToAtom={(layerId, atomId) => {
-                const layer = layers.find((l) => l.id === layerId)
-                const atom = layer?.atoms.find((a) => a.id === atomId)
-                if (atom?.kind === 'roi') {
-                  const [bx0, by0, bx1, by1] = partsBbox(atom.parts)
-                  cropSelectedToBox(bx0, by0, bx1, by1)
-                }
-              }}
-              onCropAtomToImage={(layerId, atomId) => {
-                const layer = layers.find((l) => l.id === layerId)
-                const atom = layer?.atoms.find((a) => a.id === atomId)
-                if (layer && atom) void cropAtom(layer, atom)
-              }}
-              onSetVisibleMany={setLayersVisibleMany}
-              onDeleteMany={deleteLayersMany}
-              onCombine={combineLayersMany}
-            />
-            </div>
-          }
-          preprocessSlot={
-            isHsi ? <PreprocessPanel
-              datasetName={meta.name}
-              dataLabel={meta.pipeline.label}
-              axisUnit={meta.axis.unit}
-              items={pipeItems}
-              onAddStep={addStep}
-              onRemoveStep={removeStep}
-              onReorderPending={reorderPending}
-              onPickMaskFromCache={setMaskPickerStep as (uid: number) => void}
-              onPickMaskFromLocal={setMaskFileStep as (uid: number) => void}
-              onEditParams={setParamStep as (uid: number) => void}
-              onSubmit={submitJob}
-              onRenameNode={handleRenameNode}
-              onExportNode={handleExportNode}
-              onRevertNode={revertToNode}
-              onNodeInfo={setInfoNodeUid as (uid: number) => void}
-            /> : null
-          }
-          spectrumSlot={
-            isHsi ? <SpectrumPanel
-              meta={meta}
-              mode={spectrumMode}
-              onModeChange={setSpectrumMode}
-              avgValues={avgSpec?.values ?? null}
-              nValid={avgSpec?.n_valid ?? null}
-              picks={picks}
-              roiSeries={roiSeriesResolved}
-              currentBand={display.kind === 'band' ? display.band : null}
-              displayedRegion={
-                display.kind === 'integral' ? { i0: display.i0, i1: display.i1 } : null
-              }
-              regions={regions}
-              onAddRegion={(i0, i1) =>
-                setRegions((rs) => [...rs, { id: ++regionSeq.current, i0, i1 }])
-              }
-              onRemoveRegion={(id) => setRegions((rs) => rs.filter((r) => r.id !== id))}
-              onDisplayRegion={(r) => setDisplay({ kind: 'integral', i0: r.i0, i1: r.i1 })}
-              onCachePeak={handleCachePeak}
-              onCacheArea={handleCacheArea}
-              onExportSpectra={(lo, hi) => setExportState({ kind: 'spectra', lo, hi })}
-              onBandChange={changeBand}
-            /> : null
-          }
-          cacheSlot={
-            isHsi ? <CachePanel
-              objects={cacheObjects}
-              selected={cacheSel}
-              onSelectedChange={setCacheSel}
-              displayedId={display.kind === 'cached' ? display.id : null}
-              onDisplay={handleCacheDisplay}
-              onDelete={handleCacheDelete}
-              onRatio={handleCacheRatio}
-              onRgb={handleCacheRgb}
-              onApplyMask={handleApplyMask}
-              onCleanBlobs={openBlobClean}
-              onIsolate={openIsolate}
-              onImportMask={() => setMaskFileBrowser(true)}
-              onImportFromImage={
-                images.length > 1 ? () => setCacheImportOpen(true) : null
-              }
-              onEditWithRoi={
-                regionAtoms.length ? (obj) => setMaskEditPickRoi(obj.id) : null
-              }
-            /> : null
-          }
-        />
-        </div>
-      )}
+      {propertyPanelEl}
 
-      {meta && viewState && (
-        <div className={coreg ? 'pointer-events-none opacity-40' : undefined}>
-        <Toolbar
-          tool={tool}
-          onToolChange={setTool}
-          stretch={stretch}
-          onStretchChange={setStretch}
-          cmap={cmap}
-          onCmapChange={setCmap}
-          cmapDisabled={display.kind === 'cached' && display.rgb}
-          onAddAtom={enterAtomMode}
-          atomsDisabled={transformImage != null || coreg != null}
-        />
-        </div>
-      )}
+      {meta && viewState && toolbarEl}
 
       {/* marching ants: the active layer's effective editing region */}
       {antsPaths && viewState && meta && !coreg && atomMode && !scrubbing && (
@@ -5423,52 +5505,7 @@ export default function App() {
       )}
 
       {/* Define-Atoms mode bar (atom types + per-type tools) */}
-      {meta && atomMode && !coreg && (
-        <AtomModeBar
-          layers={layers}
-          activeLayerId={activeLayerId}
-          onActivateLayer={(id) => {
-            finishBrushAtom()
-            setActiveLayerId(id)
-          }}
-          onCreateLayer={() => createLayer()}
-          type={atomMode.type}
-          onPickType={(t) => {
-            setAtomMode({ type: t })
-            setErasing(false)
-            if (t === 'roi') startRoi(roiShape)
-            else if (t === 'landmark') setTool('landmark')
-            else setTool('drag')
-          }}
-          roiShape={roiShape}
-          onCycleShape={() => {
-            // shape and eraser behave as one radio pair: clicking the shape
-            // tool while erasing simply comes BACK to it. Only a click on the
-            // ALREADY-ARMED tool cycles the shape — returning from the eraser
-            // must never silently change what you were drawing with.
-            if (erasing) {
-              startRoi(roiShape)
-              return
-            }
-            const order: RoiShape[] = ['rect', 'polygon', 'brush']
-            startRoi(order[(order.indexOf(roiShape) + 1) % order.length])
-          }}
-          erasing={erasing}
-          onToggleErase={() => {
-            if (erasing) return // already armed: clicking it again is a no-op
-            setErasing(true)
-            setRoiDraft([])
-            setTool('erase')
-          }}
-          brushSize={brushSize}
-          onBrushSize={setBrushSize}
-          eraserSize={eraserSize}
-          onEraserSize={setEraserSize}
-          brushStrokes={brushAtomStrokes}
-          onFinishBrushAtom={finishBrushAtom}
-          onExit={exitAtomMode}
-        />
-      )}
+      {meta && !coreg && atomModeBarEl}
 
       {/* isolate components (mask → ROI atoms) */}
       {isolate && (

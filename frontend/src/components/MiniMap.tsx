@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import type { ImageEntryInfo } from '../lib/api'
 import { imageQuad, type ImgTransform } from '../lib/transform'
 
@@ -35,7 +36,11 @@ const PAD = 8
 
 /** Bottom-right overview box: relative placement of every image layer,
     numbered in load order and colored to match the canvas outlines. */
-export function MiniMap({ images, layouts, zOrder, selectedId, onSelect, onToggleHidden }: Props) {
+/** memo: every prop is a stable reference between edits, so pan/zoom
+    re-renders of the app skip the minimap entirely */
+export const MiniMap = memo(function MiniMap(
+  { images, layouts, zOrder, selectedId, onSelect, onToggleHidden }: Props,
+) {
   if (images.length < 2) return null
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
@@ -113,4 +118,4 @@ export function MiniMap({ images, layouts, zOrder, selectedId, onSelect, onToggl
       })}
     </div>
   )
-}
+})
