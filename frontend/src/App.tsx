@@ -77,6 +77,7 @@ import {
   type Atom,
   type NodeInfo,
   type PipeItem,
+  type NoteAtom,
   type RoiAtom,
   type RoiPart,
   type RoiShape,
@@ -116,6 +117,7 @@ import { MaskPicker } from './components/MaskPicker'
 import { MaskEditDialog } from './components/MaskEditDialog'
 import { RoiPicker } from './components/RoiPicker'
 import { MaskImportDialog } from './components/MaskImportDialog'
+import { NotesOverlay, type NoteItem } from './components/NotesOverlay'
 import { CacheImportDialog } from './components/CacheImportDialog'
 import { RegLinks, type RegLinkInfo } from './components/RegLinks'
 import { RegImportDialog } from './components/RegImportDialog'
@@ -372,6 +374,10 @@ function atomDisplayName(layer: LayerObj, atom: Atom): string {
   if (atom.kind === 'landmark') {
     return `${layer.name} · lm (${atom.point[0].toFixed(1)}, ${atom.point[1].toFixed(1)})`
   }
+  if (atom.kind === 'note') {
+    const first = atom.text.split('\n')[0]
+    return `${layer.name} · note "${first.slice(0, 24)}${first.length > 24 ? '…' : ''}"`
+  }
   if (atom.parts.length > 1) return `${layer.name} · roi ∪ ${atom.parts.length} parts`
   return `${layer.name} · ${atom.parts[0]?.shape ?? 'roi'} #${atom.id}`
 }
@@ -498,6 +504,126 @@ export default function App() {
     }
   }, [brushStroke])
 
+  /** in-place note editing target */
+  const [noteEdit, setNoteEdit] = useState<{ layerId: number; atomId: number } | null>(null)
+  /** context menu opened from a note box on the canvas */
+  const [noteMenu, setNoteMenu] = useState<
+    { layerId: number; atomId: number; x: number; y: number } | null
+  >(null)
+
+  const updateNote = useCallback(
+    (layerId: number, atomId: number, patch: Partial<NoteAtom>) => {
+      setLayers((ls) =>
+        ls.map((l) =>
+          l.id === layerId
+            ? {
+                ...l,
+                atoms: l.atoms.map((a) =>
+                  a.id === atomId && a.kind === 'note' ? { ...a, ...patch } : a,
+                ),
+              }
+            : l,
+        ),
+      )
+    },
+    [],
+  )
+
+  const commitNoteText = useCallback(
+    (layerId: number, atomId: number, text: string) => {
+      setNoteEdit(null)
+      if (text.trim() === '') {
+        // an empty note annotates nothing — remove it (also the cancel path
+        // for a box that was just placed)
+        setLayers((ls) =>
+          ls.map((l) =>
+            l.id === layerId
+              ? { ...l, atoms: l.atoms.filter((a) => a.id !== atomId) }
+              : l,
+          ),
+        )
+        return
+      }
+      updateNote(layerId, atomId, { text })
+    },
+    [updateNote],
+  )
+
+  const placeNote = useCallback(
+    (point: [number, number]) => {
+      atomSeq.current += 1
+      const atom: NoteAtom = {
+        id: atomSeq.current,
+        kind: 'note',
+        point,
+        text: '',
+        fontPt: 14,
+        bold: false,
+        color: '#ffffff',
+      }
+      let target = activeLayerId
+      setLayers((ls) => {
+        if (target == null || !ls.some((l) => l.id === target)) {
+          layerSeq.current += 1
+          target = layerSeq.current
+          setActiveLayerId(target)
+          const names = new Set(ls.map((l) => l.name))
+          let name = 'Layer'
+          let n = 2
+          while (names.has(name)) name = `Layer (${n++})`
+          return [
+            ...ls,
+            {
+              id: target, name, visible: true, atoms: [atom],
+              color: LAYER_PALETTE[(target - 1) % LAYER_PALETTE.length],
+            },
+          ]
+        }
+        return ls.map((l) => (l.id === target ? { ...l, atoms: [...l.atoms, atom] } : l))
+      })
+      setNoteEdit({ layerId: target!, atomId: atom.id })
+    },
+    [activeLayerId],
+  )
+
+  const NOTE_PT_PRESETS = [10, 12, 14, 18, 24, 32]
+
+  /** One menu for a note wherever it is right-clicked (canvas box or panel
+      row): text, PowerPoint-style size presets, bold, colour, then the
+      standard atom operations. */
+  const noteMenuEntries = useCallback(
+    (layerId: number, atomId: number): MenuEntry[] => {
+      const layer = layers.find((l) => l.id === layerId)
+      const atom = layer?.atoms.find((a) => a.id === atomId)
+      if (!layer || atom?.kind !== 'note') return []
+      return [
+        {
+          label: 'Edit text…',
+          hint: 'double-click the box also works',
+          onClick: () => setNoteEdit({ layerId, atomId }),
+        },
+        { divider: true, label: 'style' } as MenuEntry,
+        ...NOTE_PT_PRESETS.map((pt) => ({
+          label: `${pt} pt`,
+          hint: atom.fontPt === pt ? '●' : undefined,
+          onClick: () => updateNote(layerId, atomId, { fontPt: pt }),
+        })),
+        {
+          label: atom.bold ? 'Bold ✓' : 'Bold',
+          onClick: () => updateNote(layerId, atomId, { bold: !atom.bold }),
+        },
+        {
+          label: 'Choose colour…',
+          hint: atom.color,
+          onClick: () =>
+            setColorDialog({ kind: 'note', id: atomId, layerId, initial: atom.color }),
+        },
+      ]
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [layers, updateNote],
+  )
+
   /** Close the ROI the brush is building; the next stroke starts a new one. */
   const finishBrushAtom = useCallback(() => {
     brushAtomId.current = null
@@ -586,8 +712,9 @@ export default function App() {
   const regionSeq = useRef(0)
   const pickSeq = useRef(0)
   // one shared colour dialog serves every colourable object kind
-  const [colorDialog, setColorDialog] =
-    useState<{ kind: 'pick' | 'layer'; id: number; initial: string } | null>(null)
+  const [colorDialog, setColorDialog] = useState<
+    { kind: 'pick' | 'layer' | 'note'; id: number; layerId?: number; initial: string } | null
+  >(null)
   // panel selection mirrored up for canvas edge-highlighting (layers tab)
   const [panelSel, setPanelSel] = useState<{
     layers: number[]
@@ -670,6 +797,41 @@ export default function App() {
     return [ex[0] - o[0], ex[1] - o[1], ey[0] - o[0], ey[1] - o[1], o[0], o[1]]
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selLayout.dx, selLayout.dy, selLayout.rot, selLayout.sx, selLayout.sy, selW, selH])
+  /** Every visible note across all visible images — selected image's are
+      interactive, the rest render faded read-only (frozen convention). */
+  const noteItems = useMemo((): NoteItem[] => {
+    if (!meta) return []
+    const out: NoteItem[] = []
+    const interactiveTool = tool === 'drag' || tool === 'note'
+    for (const im of images) {
+      const l = layouts[im.id] ?? DEFAULT_LAYOUT
+      if (l.hidden) continue
+      const sel = im.id === meta.image.id
+      const ls = sel ? layers : (imageBundles.current.get(im.id)?.layers ?? [])
+      let aff: [number, number, number, number, number, number]
+      if (sel) aff = selAffine
+      else {
+        const o = applyT(l, im.shape[1], im.shape[0], [0, 0])
+        const ex = applyT(l, im.shape[1], im.shape[0], [1, 0])
+        const ey = applyT(l, im.shape[1], im.shape[0], [0, 1])
+        aff = [ex[0] - o[0], ex[1] - o[1], ey[0] - o[0], ey[1] - o[1], o[0], o[1]]
+      }
+      for (const layer of ls) {
+        if (!layer.visible) continue
+        for (const at of layer.atoms) {
+          if (at.kind !== 'note' || at.visible === false) continue
+          out.push({
+            layerId: layer.id,
+            atom: at,
+            affine: aff,
+            interactive: sel && interactiveTool,
+          })
+        }
+      }
+    }
+    return out
+  }, [meta, images, layouts, layers, selAffine, tool])
+
   const selMatrix = useMemo(
     () => modelMatrixOf(selLayout, selW, selH),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1632,8 +1794,8 @@ export default function App() {
         cache_ids: atom.cacheIds,
       }
     }
-    if (atom.kind === 'landmark') {
-      // landmarks have no region; callers must not request one
+    if (atom.kind === 'landmark' || atom.kind === 'note') {
+      // landmarks and notes have no region; callers must not request one
       return { parts: [] as RoiPart[] }
     }
     return {
@@ -1982,8 +2144,8 @@ export default function App() {
       // combine only operates within one atom type: ROI vectors and
       // combined-region masks are both REGION atoms and union together;
       // landmarks are points and cannot combine at all
-      if (atoms.some((a) => a.kind === 'landmark')) {
-        setToast('Landmarks cannot be combined — combine works within region atoms only')
+      if (atoms.some((a) => a.kind === 'landmark' || a.kind === 'note')) {
+        setToast('Only region atoms (ROI / mask) can be combined')
         return
       }
       const vec = atoms.filter((a): a is RoiAtom => a.kind === 'roi')
@@ -2070,7 +2232,7 @@ export default function App() {
   useEffect(() => {
     if (atomMode) return
     if (tool !== 'roi' && tool !== 'landmark' && tool !== 'crop' &&
-        tool !== 'brush' && tool !== 'erase') return
+        tool !== 'brush' && tool !== 'erase' && tool !== 'note') return
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
       setRoiDraft((d) => {
@@ -2571,6 +2733,13 @@ export default function App() {
             }
           }
         } else if (a.kind === 'landmark') {
+          const [px, py] = a.point
+          const ring: [number, number][] = Array.from({ length: 13 }, (_, k) => {
+            const ang = (k / 12) * 2 * Math.PI
+            return [px + 9 * Math.cos(ang), py + 9 * Math.sin(ang)]
+          })
+          haloPaths.push({ path: ring, color: rgbC })
+        } else if (a.kind === 'note') {
           const [px, py] = a.point
           const ring: [number, number][] = Array.from({ length: 13 }, (_, k) => {
             const ang = (k / 12) * 2 * Math.PI
@@ -3962,6 +4131,7 @@ export default function App() {
             }
             continue
           }
+          if (a.kind === 'note') continue // notes hit-test in their own overlay
           if (pointInAtom(a, lx, ly)) {
             atomHit = { layerId: activeLayer.id, atomId: a.id }
             break
@@ -4207,6 +4377,7 @@ export default function App() {
             setErasing(false)
             if (t === 'roi') startRoi(roiShape)
             else if (t === 'landmark') setTool('landmark')
+            else if (t === 'note') setTool('note')
             else setTool('drag')
           }}
           roiShape={roiShape}
@@ -4346,6 +4517,7 @@ export default function App() {
               onExportLayers={(ids) => setExportState({ kind: 'layers', ids })}
               onExportRoiCubes={(ids) => setExportState({ kind: 'roicubes', layerIds: ids })}
               hasMasks={cacheObjects.some((o) => o.kind === 'mask')}
+              noteEntries={noteMenuEntries}
               onEditMaskWithAtom={(layerId, atomId) => {
                 const layer = layers.find((l) => l.id === layerId)
                 const atom = layer?.atoms.find((a) => a.id === atomId)
@@ -4451,7 +4623,7 @@ export default function App() {
       openMaskEditWithAtom, openBlobClean, openIsolate, handleRenameNode,
       handleExportNode, handleApplyMask, handleCachePeak, handleCacheArea,
       handleCacheRatio, handleCacheRgb, handleCacheDelete, handleCacheDisplay,
-      addStep, removeStep, revertToNode, submitJob])
+      addStep, removeStep, revertToNode, submitJob, noteMenuEntries])
 
   const menuItems: MenuEntry[] = useMemo(() => {
     if (!menu) return []
@@ -4483,7 +4655,10 @@ export default function App() {
         // the same object must offer the same operations wherever it is
         // right-clicked
         const out: MenuEntry[] = []
-        if (isHsi && atom.kind !== 'landmark') {
+        if (atom.kind === 'note') {
+          out.push(...noteMenuEntries(layer.id, atom.id))
+        }
+        if (isHsi && atom.kind !== 'landmark' && atom.kind !== 'note') {
           const shown = roiSpectra.some(
             (r) => r.layerId === layer.id && r.atomId === atom.id,
           )
@@ -4682,7 +4857,8 @@ export default function App() {
       images, layouts, meta, selToLocal, bumpZ, doSelectImage, registrationEntries,
       layers, cropAtom, deleteAtom, cropSelectedToBox,
       beginCoregFor, regionAtoms.length, openMaskEditWithAtom, toggleRoiSpectrum,
-      toggleImageHidden, toggleAtomVisible, startRenameAtom, roiSpectra])
+      toggleImageHidden, toggleAtomVisible, startRenameAtom, roiSpectra,
+      noteMenuEntries])
 
   // application menu bar (File-menu style, extensible)
   const filesMenu: MenuEntry[] = useMemo(() => {
@@ -4968,6 +5144,16 @@ export default function App() {
               }
               return
             }
+            if (tool === 'note') {
+              const ev = event as { leftButton?: boolean }
+              if (ev.leftButton === false || !meta || !info.coordinate) return
+              const [wx, wy] = info.coordinate as number[]
+              // notes may sit ANYWHERE — beside the frame, outside the mask:
+              // they are display annotations with no region semantics
+              const [lx, ly] = selToLocal(wx, wy)
+              placeNote([Number(lx.toFixed(1)), Number(ly.toFixed(1))])
+              return
+            }
             if (tool === 'landmark') {
               const ev = event as { leftButton?: boolean }
               if (ev.leftButton === false || !meta || !info.coordinate) return
@@ -4989,7 +5175,8 @@ export default function App() {
             dragImage
               ? 'move'
               : tool === 'pick' || tool === 'roi' || tool === 'landmark' ||
-                  tool === 'crop' || tool === 'brush' || tool === 'erase'
+                  tool === 'crop' || tool === 'brush' || tool === 'erase' ||
+                  tool === 'note'
                 ? 'crosshair'
                 : transformImage != null
                   ? 'default'
@@ -5034,6 +5221,44 @@ export default function App() {
       {propertyPanelEl}
 
       {meta && viewState && toolbarEl}
+
+      {/* note text boxes: always ABOVE the canvas and every other atom */}
+      {viewState && meta && !coreg && !scrubbing && noteItems.length > 0 && (
+        <NotesOverlay
+          notes={noteItems}
+          viewState={viewState}
+          size={size}
+          editing={noteEdit}
+          onCommitText={commitNoteText}
+          onStartEdit={(layerId, atomId) => setNoteEdit({ layerId, atomId })}
+          onMove={(layerId, atomId, point) => updateNote(layerId, atomId, { point })}
+          onMenu={(layerId, atomId, x, y) => setNoteMenu({ layerId, atomId, x, y })}
+        />
+      )}
+      {noteMenu && (
+        <ContextMenu
+          x={noteMenu.x}
+          y={noteMenu.y}
+          items={[
+            ...noteMenuEntries(noteMenu.layerId, noteMenu.atomId),
+            { divider: true } as MenuEntry,
+            {
+              label: 'Hide atom',
+              onClick: () => toggleAtomVisible(noteMenu.layerId, noteMenu.atomId),
+            },
+            {
+              label: 'Rename atom…',
+              onClick: () => startRenameAtom(noteMenu.layerId, noteMenu.atomId),
+            },
+            {
+              label: 'Delete atom',
+              onClick: () => deleteAtom(noteMenu.layerId, noteMenu.atomId),
+            },
+          ]}
+          header={{ type: 'note', name: 'text box' }}
+          onClose={() => setNoteMenu(null)}
+        />
+      )}
 
       {/* marching ants: the active layer's effective editing region */}
       {antsPaths && viewState && meta && !coreg && atomMode && !scrubbing && (
@@ -5979,13 +6204,21 @@ export default function App() {
 
       {colorDialog && (
         <ColorPickerDialog
-          title={colorDialog.kind === 'pick' ? 'Point colour' : 'Layer colour'}
+          title={
+            colorDialog.kind === 'pick'
+              ? 'Point colour'
+              : colorDialog.kind === 'note'
+                ? 'Note colour'
+                : 'Layer colour'
+          }
           initial={colorDialog.initial}
           onSave={(color) => {
             if (colorDialog.kind === 'pick') {
               setPicks((current) =>
                 current.map((p) => (p.id === colorDialog.id ? { ...p, color } : p)),
               )
+            } else if (colorDialog.kind === 'note') {
+              updateNote(colorDialog.layerId!, colorDialog.id, { color })
             } else {
               setLayers((ls) =>
                 ls.map((l) => (l.id === colorDialog.id ? { ...l, color } : l)),

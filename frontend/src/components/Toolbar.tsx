@@ -1,7 +1,7 @@
 import { useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import type { Stretch } from '../lib/api'
 
-export type Tool = 'drag' | 'pick' | 'roi' | 'landmark' | 'crop' | 'brush' | 'erase'
+export type Tool = 'drag' | 'pick' | 'roi' | 'landmark' | 'crop' | 'brush' | 'erase' | 'note'
 
 /** Science-plot colour schemes cycled by the popover button. The CSS stops
     only draw the swatch preview — the real LUT is applied server-side. */

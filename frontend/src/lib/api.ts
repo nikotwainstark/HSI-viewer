@@ -147,7 +147,23 @@ export interface LandmarkAtom {
   visible?: boolean
 }
 
-export type Atom = RoiAtom | MaskAtom | LandmarkAtom
+/** Note atom: a PowerPoint-style text box anchored at a native-coords point.
+    Display-only annotation — no region semantics, so it is never clipped by
+    the layer's mask and always draws ON TOP of the canvas and other atoms.
+    The anchor may sit outside the image (annotating beside the frame). */
+export interface NoteAtom {
+  id: number
+  kind: 'note'
+  point: [number, number] // top-left anchor, native coords
+  text: string
+  fontPt: number // PowerPoint-style point size, scales with zoom
+  bold: boolean
+  color: string // default white
+  name?: string
+  visible?: boolean
+}
+
+export type Atom = RoiAtom | MaskAtom | LandmarkAtom | NoteAtom
 
 export type LayerMaskSource =
   | { kind: 'cache'; ids: number[]; label: string }

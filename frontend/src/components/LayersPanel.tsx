@@ -11,6 +11,10 @@ export function atomLabel(atom: Atom): string {
   if (atom.kind === 'landmark') {
     return `landmark · (${atom.point[0].toFixed(1)}, ${atom.point[1].toFixed(1)})`
   }
+  if (atom.kind === 'note') {
+    const first = atom.text.split('\n')[0]
+    return `note · "${first.slice(0, 24)}${first.length > 24 ? '…' : ''}"`
+  }
   const erased = atom.parts.filter((p) => p.op === 'erase').length
   const addParts = atom.parts.filter((p) => p.op !== 'erase')
   const adds = addParts.length
@@ -36,6 +40,7 @@ export function atomLabel(atom: Atom): string {
 function atomGlyph(atom: Atom): string {
   if (atom.kind === 'mask') return '▩'
   if (atom.kind === 'landmark') return '✛'
+  if (atom.kind === 'note') return 'T'
   if (atom.parts.some((p) => p.op === 'erase')) return '◌'
   const addParts = atom.parts.filter((p) => p.op !== 'erase')
   if (addParts.length > 1) {
@@ -83,6 +88,8 @@ interface Props {
   onCropToAtom: (layerId: number, atomId: number) => void
   /** boolean-edit a cached mask with this atom's region */
   onEditMaskWithAtom: (layerId: number, atomId: number) => void
+  /** note-specific menu entries (text / font / colour), spliced in first */
+  noteEntries?: (layerId: number, atomId: number) => MenuEntry[]
   /** true when the cache holds at least one mask object */
   hasMasks: boolean
   /** crop the atom's region into a NEW image entry (copy semantics) */
@@ -101,7 +108,7 @@ export function LayersPanel({
   onRenameAtom, onToggleRoiSpectrum, roiSpectrumKeys,
   onSetVisibleMany, onDeleteMany, onCombine, onSelectionChange,
   canCoregister, onCoregister, onExportLayers, onExportRoiCubes,
-  onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks,
+  onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks, noteEntries,
 }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; target: MenuTarget } | null>(null)
   const [creerOpen, setCreerOpen] = useState<{ x: number; y: number } | null>(null)
@@ -241,7 +248,10 @@ export function LayersPanel({
       // the same object must offer the same operations wherever it is
       // right-clicked
       const out: MenuEntry[] = []
-      if (isHsi && atom.kind !== 'landmark') {
+      if (atom.kind === 'note' && noteEntries) {
+        out.push(...noteEntries(layer.id, atom.id))
+      }
+      if (isHsi && atom.kind !== 'landmark' && atom.kind !== 'note') {
         const shown = roiSpectrumKeys.includes(`${layer.id}:${atom.id}`)
         out.push({
           label: shown ? 'Remove ROI spectrum from SEL' : 'Display mean ROI spectrum',

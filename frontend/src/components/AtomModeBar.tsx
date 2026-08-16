@@ -3,7 +3,7 @@ import type { LayerObj, RoiShape } from '../lib/api'
 
 /** Atom types offered by the Define-Atoms bar. Scrolls horizontally as more
     types appear. */
-export type AtomType = 'roi' | 'landmark'
+export type AtomType = 'roi' | 'landmark' | 'note'
 
 const ROI_SHAPE_ICON: Record<RoiShape, ReactNode> = {
   rect: <rect x="5" y="7" width="14" height="10" rx="1" />,
@@ -29,6 +29,17 @@ const TYPE_META: Record<AtomType, { label: string; icon: ReactNode; color: strin
       <>
         <circle cx="12" cy="12" r="6" />
         <path d="M12 2v5M12 17v5M2 12h5M17 12h5" />
+      </>
+    ),
+  },
+  note: {
+    label: 'Note',
+    color: '#fde68a',
+    icon: (
+      <>
+        <path d="M5 5h14" />
+        <path d="M12 5v14" />
+        <path d="M9 19h6" />
       </>
     ),
   },
@@ -249,6 +260,16 @@ export function AtomModeBar({
             <span className="shrink-0 font-mono text-[12px] text-slate-300">
               {TYPE_META[type].label} Atom
             </span>
+            {type === 'note' && (
+              <span className="text-[11px] text-slate-500">
+                click canvas to place · double-click a box to edit · drag to move
+              </span>
+            )}
+            {type === 'landmark' && (
+              <span className="text-[11px] text-slate-500">
+                click to place · order defines the pairing
+              </span>
+            )}
             <div className="flex items-center gap-1.5">
               {type === 'roi' && (
                 <>
