@@ -117,7 +117,7 @@ import { MaskPicker } from './components/MaskPicker'
 import { MaskEditDialog } from './components/MaskEditDialog'
 import { RoiPicker } from './components/RoiPicker'
 import { MaskImportDialog } from './components/MaskImportDialog'
-import { NotesOverlay, type NoteItem } from './components/NotesOverlay'
+import { NotesOverlay, NoteSizeSlider, type NoteItem } from './components/NotesOverlay'
 import { CacheImportDialog } from './components/CacheImportDialog'
 import { RegLinks, type RegLinkInfo } from './components/RegLinks'
 import { RegImportDialog } from './components/RegImportDialog'
@@ -586,10 +586,9 @@ export default function App() {
     [activeLayerId],
   )
 
-  const NOTE_PT_PRESETS = [10, 12, 14, 18, 24, 32]
-
   /** One menu for a note wherever it is right-clicked (canvas box or panel
-      row): text, PowerPoint-style size presets, bold, colour, then the
+      row): text, a live font-size slider (adjusting does not close the menu,
+      so the size reads directly off the canvas), bold, colour, then the
       standard atom operations. */
   const noteMenuEntries = useCallback(
     (layerId: number, atomId: number): MenuEntry[] => {
@@ -603,11 +602,14 @@ export default function App() {
           onClick: () => setNoteEdit({ layerId, atomId }),
         },
         { divider: true, label: 'style' } as MenuEntry,
-        ...NOTE_PT_PRESETS.map((pt) => ({
-          label: `${pt} pt`,
-          hint: atom.fontPt === pt ? '●' : undefined,
-          onClick: () => updateNote(layerId, atomId, { fontPt: pt }),
-        })),
+        {
+          custom: (
+            <NoteSizeSlider
+              value={atom.fontPt}
+              onChange={(pt) => updateNote(layerId, atomId, { fontPt: pt })}
+            />
+          ),
+        } as MenuEntry,
         {
           label: atom.bold ? 'Bold ✓' : 'Bold',
           onClick: () => updateNote(layerId, atomId, { bold: !atom.bold }),

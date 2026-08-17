@@ -1,4 +1,5 @@
 import { createPortal } from 'react-dom'
+import type { ReactNode } from 'react'
 
 export interface MenuItem {
   label: string
@@ -12,7 +13,13 @@ export interface MenuDivider {
   label?: string
 }
 
-export type MenuEntry = MenuItem | MenuDivider
+/** Arbitrary inline content (e.g. a slider); interacting with it does NOT
+    close the menu — live adjustment reads its effect on the canvas. */
+export interface MenuCustom {
+  custom: ReactNode
+}
+
+export type MenuEntry = MenuItem | MenuDivider | MenuCustom
 
 /** Object identity shown at the top-left of the menu (type badge + name). */
 export interface MenuHeader {
@@ -63,7 +70,11 @@ export function ContextMenu({ x, y, items, header, onClose }: Props) {
           </div>
         )}
         {items.map((item, i) =>
-          'divider' in item ? (
+          'custom' in item ? (
+            <div key={`cu${i}`} className="px-2.5 py-1.5">
+              {item.custom}
+            </div>
+          ) : 'divider' in item ? (
             <div key={`div${i}`} className="my-1 flex items-center gap-2 px-2">
               <div className="h-px flex-1 bg-white/10" />
               {item.label && (

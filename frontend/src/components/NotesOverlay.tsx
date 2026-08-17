@@ -4,6 +4,52 @@ import type { Size } from '../hooks/useElementSize'
 import type { ViewState } from '../lib/view'
 import type { Affine } from './AntsOverlay'
 
+const NOTE_PT_MIN = 6
+const NOTE_PT_MAX = 256
+
+/** Font-size control for the note menu: slider + numeric box, live. The
+    slider is quadratic so the useful small sizes get most of the travel
+    while 256 pt stays reachable. */
+export function NoteSizeSlider({
+  value, onChange,
+}: {
+  value: number
+  onChange: (pt: number) => void
+}) {
+  const toT = (pt: number) =>
+    Math.sqrt((pt - NOTE_PT_MIN) / (NOTE_PT_MAX - NOTE_PT_MIN))
+  const fromT = (t: number) =>
+    Math.round(NOTE_PT_MIN + (NOTE_PT_MAX - NOTE_PT_MIN) * t * t)
+  return (
+    <div className="flex w-56 items-center gap-2.5">
+      <span className="shrink-0 font-serif text-[13px] text-slate-400">pt</span>
+      <input
+        type="range"
+        min={0}
+        max={1000}
+        value={Math.round(toT(value) * 1000)}
+        className="min-w-0 flex-1 accent-amber-300"
+        onChange={(e) => onChange(fromT(Number(e.target.value) / 1000))}
+      />
+      <input
+        type="number"
+        min={NOTE_PT_MIN}
+        max={NOTE_PT_MAX}
+        value={value}
+        className="w-14 shrink-0 rounded-md border border-white/10 bg-slate-950/60 px-1.5
+                   py-0.5 text-right font-mono text-[12px] text-slate-200 outline-none
+                   focus:border-amber-400/50"
+        onChange={(e) => {
+          const v = Number(e.target.value)
+          if (Number.isFinite(v)) {
+            onChange(Math.max(NOTE_PT_MIN, Math.min(NOTE_PT_MAX, Math.round(v))))
+          }
+        }}
+      />
+    </div>
+  )
+}
+
 export interface NoteItem {
   layerId: number
   atom: NoteAtom

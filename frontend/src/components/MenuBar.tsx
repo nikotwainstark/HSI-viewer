@@ -65,7 +65,11 @@ export function MenuBar({ menus, status }: Props) {
                          p-1.5 shadow-2xl shadow-black/50"
             >
               {menu.entries.map((item, j) =>
-                'divider' in item ? (
+                'custom' in item ? (
+                  <div key={`c${j}`} className="px-2.5 py-1.5">
+                    {item.custom}
+                  </div>
+                ) : 'divider' in item ? (
                   <div key={`d${j}`} className="my-1 flex items-center gap-2 px-2">
                     <div className="h-px flex-1 bg-white/10" />
                     {item.label && (
