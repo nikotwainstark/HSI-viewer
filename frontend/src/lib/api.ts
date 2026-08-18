@@ -305,8 +305,27 @@ export async function exportRoiCubes(body: {
     cache_ids?: number[]
     path?: string
   }[]
+  label_layers?: LabelLayerSpec[]
 }): Promise<PipelineStatus> {
   return postJson('/api/layers/export_cubes', body)
+}
+
+/** One label layer for dataset exports: atoms keyed by NAME (same-name atoms
+    share a label int); rasterized to a plane/column on the backend. */
+export interface LabelLayerSpec {
+  name: string
+  atoms: { label: string; parts?: RoiPart[]; mask_cache_ids?: number[] }[]
+  cache_ids?: number[]
+  path?: string
+}
+
+export async function exportPixels(body: {
+  path: string
+  format: ExportFormat
+  regions: { atoms?: RoiPart[]; mask_atoms?: number[][]; cache_ids?: number[]; path?: string }[]
+  label_layers: LabelLayerSpec[]
+}): Promise<PipelineStatus> {
+  return postJson('/api/export/pixels', body)
 }
 
 /** Fresh-image in-place crop: REPLACES the selected image entry with the
@@ -315,6 +334,8 @@ export async function bakeRegistration(body: {
   img: number
   matrix: number[]
   target_shape: [number, number]
+  /** bilinear (smooth, antialiased) | nearest (measured spectra, repeated) */
+  method?: 'bilinear' | 'nearest'
 }): Promise<{ state: string }> {
   return postJson('/api/registration/bake', body)
 }

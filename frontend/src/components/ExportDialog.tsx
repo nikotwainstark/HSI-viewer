@@ -24,12 +24,19 @@ interface Props {
   info?: ReactNode
   /** folder mode: the name field is a FOLDER to create/fill, not a file */
   folderMode?: boolean
-  onSave: (path: string, format: ExportFormat, toggleOn?: boolean) => void
+  /** optional label-layer checklist for dataset exports: each selected layer
+      contributes one label plane/column keyed by atom NAME */
+  labelChoices?: { id: number; name: string; summary: string; warn?: string }[]
+  onSave: (path: string, format: ExportFormat, toggleOn?: boolean,
+           labelIds?: number[]) => void
   onClose: () => void
 }
 
 export function ExportDialog({ title, defaultName, storageKey, formats, toggle, info,
-                              folderMode, onSave, onClose }: Props) {
+                              folderMode, labelChoices, onSave, onClose }: Props) {
+  const [labelIds, setLabelIds] = useState<number[]>(
+    () => (labelChoices ?? []).map((c) => c.id),
+  )
   const FORMATS = formats ?? ALL_FORMATS
   const memDir = `hsiviewer.export.${storageKey}.dir`
   const memFmt = `hsiviewer.export.${storageKey}.format`
@@ -89,7 +96,8 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
     localStorage.setItem(memDir, listing!.path)
     localStorage.setItem(memFmt, format)
     if (toggle) localStorage.setItem(memTgl, toggleOn ? '1' : '0')
-    onSave(targetPath, format, toggle ? toggleOn : undefined)
+    onSave(targetPath, format, toggle ? toggleOn : undefined,
+           labelChoices ? labelIds : undefined)
   }
 
   return (
@@ -128,6 +136,41 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
           {info && (
             <div className="mb-1.5 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
               {info}
+            </div>
+          )}
+          {labelChoices && labelChoices.length > 0 && (
+            <div className="mb-1.5 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
+              <p className="mb-1.5 text-[10px] tracking-wider text-slate-400 uppercase">
+                attach labels from layers
+              </p>
+              {labelChoices.map((c) => (
+                <label
+                  key={c.id}
+                  className="flex cursor-pointer items-baseline gap-2 rounded px-1 py-0.5
+                             hover:bg-white/5"
+                >
+                  <input
+                    type="checkbox"
+                    className="translate-y-0.5 accent-violet-400"
+                    checked={labelIds.includes(c.id)}
+                    onChange={(e) =>
+                      setLabelIds((ids) =>
+                        e.target.checked ? [...ids, c.id] : ids.filter((i) => i !== c.id),
+                      )
+                    }
+                  />
+                  <span className="text-[12px] text-slate-200">{c.name}</span>
+                  <span className="ml-auto shrink-0 text-[10px] text-slate-500">{c.summary}</span>
+                </label>
+              ))}
+              {labelChoices.some((c) => c.warn && labelIds.includes(c.id)) && (
+                <p className="mt-1 text-[10px] leading-relaxed text-amber-300">
+                  {labelChoices
+                    .filter((c) => c.warn && labelIds.includes(c.id))
+                    .map((c) => c.warn)
+                    .join(' · ')}
+                </p>
+              )}
             </div>
           )}
           {toggle && (() => {

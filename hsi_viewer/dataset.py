@@ -1299,34 +1299,63 @@ class HSIDataset:
                                   result.astype(np.float32))
 
     def resample_to_grid(self, matrix: list[float], out_shape: tuple[int, int],
-                         progress: ProgressFn) -> np.ndarray:
+                         progress: ProgressFn,
+                         method: str = "bilinear") -> np.ndarray:
         """Bake a registration into the data: warp the LIVE cube onto another
         image's grid, returning (out_h, out_w, B) float32.
 
-        `matrix` maps this image's native px -> output-grid native px. Data
-        is sampled bilinearly at pixel centres; the valid mask travels
-        CONSERVATIVELY (an output pixel touched by any invalid or
-        out-of-bounds source is invalid) and invalid pixels are zeroed across
-        all bands, so the standard valid-pixel rules of the new image inherit
-        every invalidity source. The disk original is untouched — reload it
-        to undo.
+        `matrix` maps this image's native px -> output-grid native px.
+
+        Downsampling is an AGGREGATION problem, upsampling an interpolation
+        one: along any axis whose scale shrinks, a Gaussian prefilter matched
+        to the reduction factor does the averaging (the affine generalization
+        of AvgPool — exact block mean in the integer axis-aligned case), and
+        the bilinear step afterwards merely reads the smoothed field at the
+        warped position. Axes that grow skip the prefilter.
+
+        `method`: "bilinear" (smooth; antialiased on downscale) or "nearest"
+        (every output pixel is a genuine measured spectrum, only repeated —
+        spectral purity for per-pixel ML at the cost of blocky geometry; no
+        prefilter, since averaging is exactly what it avoids).
+
+        The valid mask travels CONSERVATIVELY through the same pipeline (an
+        output pixel touched by any invalid or out-of-bounds source is
+        invalid) and invalid pixels are zeroed across all bands. The disk
+        original is untouched — reload it to undo.
         """
         from scipy import ndimage
 
+        if method not in ("bilinear", "nearest"):
+            raise ValueError(f"unknown resampling method {method!r}")
         assert self.full is not None and self.full_valid is not None
         out_h, out_w = int(out_shape[0]), int(out_shape[1])
         mat_rc, off = _inverse_rc(matrix)
+        order = 1 if method == "bilinear" else 0
+        # source-axis footprint of one output pixel = row norms of the
+        # inverse map; a factor f > 1 means downscaling along that axis and
+        # wants a prefilter of sigma = (f - 1) / 2 (skimage's antialias rule)
+        f_r = float(np.hypot(mat_rc[0, 0], mat_rc[0, 1]))
+        f_c = float(np.hypot(mat_rc[1, 0], mat_rc[1, 1]))
+        sigmas = (max(0.0, (f_r - 1.0) / 2.0), max(0.0, (f_c - 1.0) / 2.0))
+        prefilter = method == "bilinear" and max(sigmas) > 1e-3
+
         arr = np.empty((out_h, out_w, self.bands), dtype=np.float32)
         for b in range(self.bands):
             if b % 16 == 0:
                 progress(0.05 + 0.75 * b / self.bands, f"warping band {b + 1}/{self.bands}")
+            src = self.full[b]
+            if prefilter:
+                src = ndimage.gaussian_filter(src, sigmas)
             arr[:, :, b] = ndimage.affine_transform(
-                self.full[b], matrix=mat_rc, offset=off,
-                output_shape=(out_h, out_w), order=1, mode="constant", cval=0.0)
+                src, matrix=mat_rc, offset=off,
+                output_shape=(out_h, out_w), order=order, mode="constant", cval=0.0)
         progress(0.82, "warping valid mask")
+        vsrc = self.full_valid.astype(np.float32)
+        if prefilter:
+            vsrc = ndimage.gaussian_filter(vsrc, sigmas)
         vw = ndimage.affine_transform(
-            self.full_valid.astype(np.float32), matrix=mat_rc, offset=off,
-            output_shape=(out_h, out_w), order=1, mode="constant", cval=0.0)
+            vsrc, matrix=mat_rc, offset=off,
+            output_shape=(out_h, out_w), order=order, mode="constant", cval=0.0)
         arr[vw < 0.999] = 0.0
         return arr
 
@@ -1892,17 +1921,87 @@ class HSIDataset:
         logger.info("data object exported -> %s", p)
         return {"path": str(p)}
 
+    def label_maps(self, label_layers: list[dict]) -> tuple[np.ndarray, list[dict]]:
+        """Rasterize label LAYERS into aligned uint16 maps for dataset export.
+
+        Each layer becomes one (H, W) plane: 0 = unlabelled, and labels are
+        keyed by NAME — atoms sharing a name (e.g. two rectangles of the same
+        patient) share one label int. Atoms paint in list order, later ones
+        overwriting earlier (the app-wide overlap rule). An atom's region is
+        its vector parts or its cache mask, ∩ the layer's bound mask if any.
+
+        Returns (maps (L, H, W) uint16, legends: per layer
+        {"layer": name, "legend": {int: name}}).
+        """
+        maps = np.zeros((len(label_layers), self.height, self.width), dtype=np.uint16)
+        legends: list[dict] = []
+        for li, spec in enumerate(label_layers):
+            clip: np.ndarray | None = None
+            if spec.get("cache_ids") or spec.get("path"):
+                clip = self._resolve_step_mask(
+                    {"cache_ids": spec.get("cache_ids"), "path": spec.get("path")})
+            ids: dict[str, int] = {}
+            for atom in spec.get("atoms") or []:
+                name = str(atom.get("label") or "").strip() or "unnamed"
+                if name not in ids:
+                    if len(ids) >= 65535:
+                        raise ValueError(
+                            f"layer {spec.get('name')!r} has more than 65535 distinct labels")
+                    ids[name] = len(ids) + 1
+                if atom.get("parts"):
+                    region = self._rasterize_parts(
+                        atom["parts"], self.height, self.width)[0]
+                elif atom.get("mask_cache_ids"):
+                    region = self._resolve_step_mask(
+                        {"cache_ids": atom["mask_cache_ids"]})
+                else:
+                    continue
+                if clip is not None:
+                    region &= clip
+                maps[li][region] = ids[name]
+            legends.append({
+                "layer": str(spec.get("name") or f"layer {li + 1}"),
+                "legend": {str(v): k for k, v in ids.items()},
+            })
+        return maps, legends
+
+    @staticmethod
+    def _dominant_labels(maps: np.ndarray, legends: list[dict],
+                         region: np.ndarray) -> dict:
+        """Convenience scalars: the most frequent non-zero label of each layer
+        within `region`, by NAME (empty string when nothing is labelled)."""
+        out: dict[str, str] = {}
+        for li, entry in enumerate(legends):
+            vals = maps[li][region]
+            vals = vals[vals > 0]
+            if vals.size == 0:
+                out[entry["layer"]] = ""
+                continue
+            counts = np.bincount(vals)
+            out[entry["layer"]] = entry["legend"].get(str(int(counts.argmax())), "")
+        return out
+
     def export_roi_cubes(self, folder: str, fmt: str, rois: list[dict],
-                         progress: ProgressFn) -> dict:
+                         progress: ProgressFn,
+                         label_layers: list[dict] | None = None) -> dict:
         """Export ONE HSI cube per ROI atom into `folder` (created if needed),
         named after each atom. Each cube is the atom's bounding box with
         everything outside the region / layer mask / valid set zero-filled —
         the same invalid semantics as an ROI crop, so the files re-import with
-        their valid masks intact. Typical use: 20 TMA cores → 20 cubes."""
+        their valid masks intact. Typical use: 20 TMA cores → 20 cubes.
+
+        With `label_layers`, each cube also carries the label planes of those
+        layers cropped to its bbox (`labels` (L, h, w) uint16 + legends) and
+        the per-layer dominant label in its metadata — a TMA core exports with
+        its core id, patient id and annotation map attached."""
         if fmt not in ("zarr", "npz"):
             raise ValueError("ROI data export supports zarr or npz")
         from datetime import datetime, timezone
 
+        maps: np.ndarray | None = None
+        legends: list[dict] = []
+        if label_layers:
+            maps, legends = self.label_maps(label_layers)
         root = Path(folder).expanduser()
         root.mkdir(parents=True, exist_ok=True)
         used: set[str] = set()
@@ -1919,6 +2018,10 @@ class HSIDataset:
             progress(i / n, f"cropping {name}")
             arr = self.crop_roi(roi["parts"], roi.get("mask_step"))
             valid = np.any(np.isfinite(arr) & (arr != 0), axis=2)
+            cube_labels: np.ndarray | None = None
+            if maps is not None:
+                x0, y0, x1, y1 = self._parts_bbox(roi["parts"])
+                cube_labels = maps[:, y0:y1, x0:x1]
             meta = {
                 "app": "Hyperspectral Cube Viewer",
                 "dataset": self.name,
@@ -1931,6 +2034,17 @@ class HSIDataset:
                 "n_valid": int(valid.sum()),
                 "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
+            if cube_labels is not None:
+                # dominant labels are voted over the cube's VALID pixels, in
+                # full-image coordinates (the label maps live there)
+                region_full = np.zeros((self.height, self.width), dtype=bool)
+                x0b, y0b, _, _ = self._parts_bbox(roi["parts"])
+                region_full[y0b:y0b + valid.shape[0],
+                            x0b:x0b + valid.shape[1]] = valid
+                meta["label_layers"] = [e["layer"] for e in legends]
+                meta["legends"] = legends
+                meta["dominant_labels"] = self._dominant_labels(
+                    maps, legends, region_full)
             axis_name = {"wavenumber": "wavenumber", "mz": "mass"}.get(self.axis_kind, "axis")
             wn = np.asarray(self.wavenumbers, dtype=np.float64)
             if fmt == "zarr":
@@ -1946,19 +2060,111 @@ class HSIDataset:
                 wv[:] = wn
                 vm = g.create_array("valid_mask", shape=valid.shape, dtype="uint8")
                 vm[:] = valid.astype(np.uint8)
+                if cube_labels is not None:
+                    lb = g.create_array("labels", shape=cube_labels.shape,
+                                        dtype="uint16")
+                    lb[:] = cube_labels
                 g.attrs.update(meta)
             else:
                 p = root / f"{name}.npz"
                 if p.exists():
                     raise ValueError(f"target already exists: {p}")
+                extra = ({"labels": cube_labels}
+                         if cube_labels is not None else {})
                 np.savez_compressed(p, hypercube=arr,
                                     valid_mask=valid.astype(np.uint8),
                                     metadata=json.dumps(meta),
-                                    **{axis_name: wn})
+                                    **{axis_name: wn}, **extra)
             out.append(str(p))
             logger.info("ROI cube exported -> %s %s", p, arr.shape)
         progress(1.0, f"exported {len(out)} ROI cube(s) to {root}")
         return {"path": str(root), "files": out, "count": len(out)}
+
+    def export_pixels(self, path: str, fmt: str, region_specs: list[dict],
+                      label_layers: list[dict], progress: ProgressFn) -> dict:
+        """Export a PIXEL dataset: one row per (region ∩ valid) pixel.
+
+        spectra (N, B) float32 · coords (N, 2) int32 native (row, col) ·
+        labels (N, L) uint16 (0 = unlabelled — kept, they are the negatives)
+        + per-layer legends + the spectral axis. coords make the set
+        auditable: any row maps back to its pixel. Invalid pixels are
+        excluded (all-zero carries no signal); the count is recorded.
+        """
+        if fmt not in ("zarr", "npz"):
+            raise ValueError("pixel export supports zarr or npz")
+        from datetime import datetime, timezone
+
+        assert self.full is not None and self.full_valid is not None
+        progress(0.02, "resolving region")
+        region: np.ndarray | None = None
+        for spec in region_specs:
+            r = self._spec_region(spec)
+            if r is not None:
+                region = r if region is None else (region | r)
+        if region is None or not region.any():
+            raise ValueError("the selected region is empty")
+        n_region = int(region.sum())
+        picked = region & self.full_valid
+        n = int(picked.sum())
+        if n == 0:
+            raise ValueError("the region holds no valid pixels")
+
+        maps: np.ndarray | None = None
+        legends: list[dict] = []
+        if label_layers:
+            progress(0.08, "rasterizing label layers")
+            maps, legends = self.label_maps(label_layers)
+
+        rows, cols = np.nonzero(picked)
+        coords = np.stack([rows, cols], axis=1).astype(np.int32)
+        spectra = np.empty((n, self.bands), dtype=np.float32)
+        step = max(1, self.bands // 20)
+        for b in range(self.bands):
+            if b % step == 0:
+                progress(0.1 + 0.7 * b / self.bands,
+                         f"gathering band {b + 1}/{self.bands}")
+            spectra[:, b] = self.full[b][rows, cols]
+        labels = (np.stack([m[rows, cols] for m in maps], axis=1)
+                  if maps is not None else np.zeros((n, 0), dtype=np.uint16))
+
+        meta = {
+            "app": "Hyperspectral Cube Viewer",
+            "dataset": self.name,
+            "state": self.data_label,
+            "steps": list(self.applied_steps),
+            "n_pixels": n,
+            "n_invalid_excluded": n_region - n,
+            "image_shape": [self.height, self.width],
+            "axis": self.axis_label,
+            "label_layers": [e["layer"] for e in legends],
+            "legends": legends,
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        axis_name = {"wavenumber": "wavenumber", "mz": "mass"}.get(self.axis_kind, "axis")
+        wn = np.asarray(self.wavenumbers, dtype=np.float64)
+        progress(0.85, f"writing {n} pixels")
+        p_out = self._prepare_export_path(path, fmt)
+        if fmt == "zarr":
+            g = zarr.open_group(str(p_out), mode="w")
+            sp = g.create_array("spectra", shape=spectra.shape, dtype="float32",
+                                chunks=(min(65536, n), self.bands))
+            sp[:] = spectra
+            co = g.create_array("coords", shape=coords.shape, dtype="int32")
+            co[:] = coords
+            lb = g.create_array("labels", shape=labels.shape, dtype="uint16")
+            lb[:] = labels
+            ax = g.create_array(axis_name, shape=wn.shape, dtype="float64")
+            ax[:] = wn
+            g.attrs.update(meta)
+        else:
+            np.savez_compressed(p_out, spectra=spectra, coords=coords,
+                                labels=labels, metadata=json.dumps(meta),
+                                **{axis_name: wn})
+        progress(1.0, f"exported {n} pixels")
+        logger.info("pixel dataset exported -> %s (%d px, %d label layers)",
+                    p_out, n, len(legends))
+        return {"path": str(p_out), "n_pixels": n,
+                "n_invalid_excluded": n_region - n}
 
     def reset_to_imported(self, progress: ProgressFn) -> None:
         """Reload the in-memory cube from the stored zarr pointer, reverting

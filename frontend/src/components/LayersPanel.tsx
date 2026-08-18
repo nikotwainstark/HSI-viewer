@@ -84,6 +84,9 @@ interface Props {
   onExportLayers: (ids: number[]) => void
   /** export one HSI cube per ROI atom of these layers into a folder */
   onExportRoiCubes: (ids: number[]) => void
+  onExportPixels: (ids: number[]) => void
+  /** copy layers to a SAME-GRID image (null: no candidates loaded) */
+  onCopyToImage: ((ids: number[], x: number, y: number) => void) | null
   /** crop the selected image in place to a ROI atom's bbox (replaces it) */
   onCropToAtom: (layerId: number, atomId: number) => void
   /** boolean-edit a cached mask with this atom's region */
@@ -107,7 +110,7 @@ export function LayersPanel({
   onToggleAtomVisible, onSetAtomsVisibleMany, onDeleteAtomsMany, onCombineAtoms,
   onRenameAtom, onToggleRoiSpectrum, roiSpectrumKeys,
   onSetVisibleMany, onDeleteMany, onCombine, onSelectionChange,
-  canCoregister, onCoregister, onExportLayers, onExportRoiCubes,
+  canCoregister, onCoregister, onExportLayers, onExportRoiCubes, onExportPixels, onCopyToImage,
   onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks, noteEntries,
 }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; target: MenuTarget } | null>(null)
@@ -315,6 +318,18 @@ export function LayersPanel({
               label: 'Export HSI data by ROI…',
               hint: 'one cube per ROI → folder',
               onClick: () => onExportRoiCubes(group),
+            },
+            {
+              label: 'Export pixel dataset…',
+              hint: 'spectra + coords + labels',
+              onClick: () => onExportPixels(group),
+            }]
+          : []),
+        ...(onCopyToImage
+          ? [{
+              label: 'Copy layers to image…',
+              hint: 'same grid only · vector atoms',
+              onClick: () => onCopyToImage(group, menu?.x ?? 200, menu?.y ?? 200),
             }]
           : []),
         { divider: true } as MenuEntry,
@@ -337,6 +352,20 @@ export function LayersPanel({
             label: 'Export HSI data by ROI…',
             hint: 'one cube per ROI → folder',
             onClick: () => onExportRoiCubes([layer.id]),
+          }]
+        : []),
+      ...(isHsi && layer.atoms.some((a) => a.kind === 'roi' || a.kind === 'mask')
+        ? [{
+            label: 'Export pixel dataset…',
+            hint: 'spectra + coords + labels',
+            onClick: () => onExportPixels([layer.id]),
+          }]
+        : []),
+      ...(onCopyToImage
+        ? [{
+            label: 'Copy layer to image…',
+            hint: 'same grid only · vector atoms',
+            onClick: () => onCopyToImage([layer.id], menu?.x ?? 200, menu?.y ?? 200),
           }]
         : []),
       ...(nLandmarks > 0 && canCoregister

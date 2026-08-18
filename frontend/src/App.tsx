@@ -36,6 +36,7 @@ import {
   cropImageInPlace,
   cropRoi,
   exportLayers,
+  exportPixels,
   exportRoiCubes,
   fetchImages,
   fetchMaskOutline,
@@ -77,6 +78,7 @@ import {
   type Atom,
   type NodeInfo,
   type PipeItem,
+  type LabelLayerSpec,
   type NoteAtom,
   type RoiAtom,
   type RoiPart,
@@ -760,6 +762,7 @@ export default function App() {
     | { kind: 'data'; name: string; created?: string }
     | { kind: 'layers'; ids: number[] }
     | { kind: 'roicubes'; layerIds: number[] }
+    | { kind: 'pixels'; layerIds: number[]; atomId?: number }
     | null
   >(null)
 
@@ -1807,6 +1810,51 @@ export default function App() {
     }
   }
 
+  /** A layer as a LABEL layer for dataset exports: every visible region atom
+      keyed by its display name (same-name atoms share one label). */
+  const labelLayerSpec = useCallback(
+    (l: LayerObj): LabelLayerSpec => ({
+      name: l.name,
+      atoms: l.atoms
+        .filter((a) => a.visible !== false && (a.kind === 'roi' || a.kind === 'mask'))
+        .map((a) => ({
+          label: (a.name ?? atomLabel(a)).trim(),
+          ...(a.kind === 'roi' ? { parts: a.parts } : {}),
+          ...(a.kind === 'mask' ? { mask_cache_ids: a.cacheIds } : {}),
+        })),
+      ...(l.maskSource?.kind === 'cache' ? { cache_ids: l.maskSource.ids } : {}),
+      ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
+    }),
+    [],
+  )
+
+  /** Checklist rows for the export dialogs: layers that can contribute a
+      label column, with a summary and an unnamed-atom warning. */
+  const labelChoicesFor = useCallback(
+    (excludeIds: number[]) =>
+      layers
+        .filter((l) => l.visible && !excludeIds.includes(l.id))
+        .map((l) => {
+          const regionAtomsOf = l.atoms.filter(
+            (a) => a.visible !== false && (a.kind === 'roi' || a.kind === 'mask'),
+          )
+          const named = new Set(
+            regionAtomsOf.map((a) => (a.name ?? atomLabel(a)).trim()),
+          )
+          const unnamed = regionAtomsOf.filter((a) => !a.name).length
+          return {
+            id: l.id,
+            name: l.name,
+            summary: `${regionAtomsOf.length} atoms · ${named.size} labels`,
+            ...(unnamed
+              ? { warn: `"${l.name}": ${unnamed} unnamed atom(s) enter the legend with geometric names` }
+              : {}),
+          }
+        })
+        .filter((c) => !c.summary.startsWith('0 ')),
+    [layers],
+  )
+
   // Server-side layer regions (mask-bound layers, or layers holding raster
   // mask atoms) are composited by the BACKEND into ONE image per layer —
   // same reason as the client-side texture: per-atom images blend twice
@@ -2138,6 +2186,78 @@ export default function App() {
   /** Union-combine selected atoms of one layer (∩ its bound mask) into a
       raster MASK ATOM that replaces them INSIDE the same layer — combine
       always stays at the operands' level (atoms→atom, layers→layer). */
+  /** picker state: which layers are waiting for a target image */
+  const [copyLayersFor, setCopyLayersFor] = useState<
+    { layerIds: number[]; x: number; y: number } | null
+  >(null)
+
+  /** Copy layers onto another SAME-GRID image (the coregistered-H&E flow:
+      bake first, then stamp the same annotation/CoreID/PatientID layers on).
+      Vector atoms (roi / landmark / note) copy exactly — coordinates are
+      native and the grids coincide. Mask atoms and cache-bound layer masks
+      reference THIS image's cache, which does not exist over there: they are
+      skipped and counted. */
+  const copyLayersToImage = useCallback(
+    (layerIds: number[], targetId: number) => {
+      if (!meta) return
+      const target = images.find((i) => i.id === targetId)
+      if (!target) return
+      const src = layers.filter((l) => layerIds.includes(l.id))
+      let skipped = 0
+      const copies: LayerObj[] = []
+      for (const l of src) {
+        layerSeq.current += 1
+        const atoms: Atom[] = []
+        for (const a of l.atoms) {
+          if (a.kind === 'mask') {
+            skipped += 1
+            continue
+          }
+          atomSeq.current += 1
+          atoms.push({ ...a, id: atomSeq.current })
+        }
+        copies.push({
+          id: layerSeq.current,
+          name: l.name,
+          color: l.color,
+          visible: l.visible,
+          atoms,
+          ...(l.maskSource?.kind === 'local' ? { maskSource: l.maskSource } : {}),
+        })
+        if (l.maskSource?.kind === 'cache') skipped += 1
+      }
+      const bundle = imageBundles.current.get(targetId)
+      if (bundle) {
+        imageBundles.current.set(targetId, {
+          ...bundle,
+          layers: [...bundle.layers, ...copies],
+        })
+      } else {
+        imageBundles.current.set(targetId, {
+          display: target.type === 'hsi' ? { kind: 'sum' } : { kind: 'flat' },
+          band: 0,
+          stretch: { lo: 2, hi: 98 },
+          cmap: 'grey',
+          picks: [],
+          regions: [],
+          spectrumMode: 'avg',
+          pipeItems: [{ kind: 'data', uid: 0, name: 'Imported data' }],
+          layers: copies,
+          activeLayerId: null,
+          roiSpectra: [],
+        })
+      }
+      const nAtoms = copies.reduce((n, l) => n + l.atoms.length, 0)
+      setToast(
+        `Copied ${copies.length} layer(s) · ${nAtoms} atoms → "${target.name}"` +
+          (skipped
+            ? ` · ${skipped} cache-bound item(s) skipped (they belong to this image's cache)`
+            : ''),
+      )
+    },
+    [meta, images, layers],
+  )
+
   const combineAtomsMany = useCallback(
     async (layerId: number, atomIds: number[]) => {
       const layer = layers.find((l) => l.id === layerId)
@@ -3693,13 +3813,14 @@ export default function App() {
       untouched — reload the source to undo). The record is consumed: after
       baking, the two grids coincide and the old matrix would be a lie. */
   const bakeRegistrationRec = useCallback(
-    async (rec: RegistrationRecord) => {
+    async (rec: RegistrationRecord, method: 'bilinear' | 'nearest') => {
       setRegLinkMenu(null)
       await runPipelineJob(
         () => bakeRegistration({
           img: rec.movingId,
           matrix: rec.matrix,
           target_shape: rec.targetShape,
+          method,
         }),
         async (st) => {
           const l = await fetchImages()
@@ -3939,7 +4060,8 @@ export default function App() {
   )
 
   const doExport = useCallback(
-    async (path: string, format: ExportFormat, includeLayers?: boolean) => {
+    async (path: string, format: ExportFormat, includeLayers?: boolean,
+           labelIds?: number[]) => {
       if (!exportState) return
       setExportState(null)
       // data-object export is a long job (11.5 GB): run it with the
@@ -3954,6 +4076,41 @@ export default function App() {
         return
       }
       // per-ROI HSI cubes: one file per atom, named after it, inside a folder
+      if (exportState.kind === 'pixels') {
+        if (format !== 'zarr' && format !== 'npz') return
+        const src = layers.filter((l) => exportState.layerIds.includes(l.id))
+        const regions = src.map((l) => {
+          const vis = l.atoms.filter(
+            (a) => a.visible !== false &&
+              (exportState.atomId == null || a.id === exportState.atomId),
+          )
+          const rasters = vis.filter((a) => a.kind === 'mask')
+          return {
+            atoms: vis
+              .filter((a): a is RoiAtom => a.kind === 'roi')
+              .flatMap((a) => a.parts),
+            ...(rasters.length
+              ? { mask_atoms: rasters.map((a) => (a as Extract<Atom, { kind: 'mask' }>).cacheIds) }
+              : {}),
+            ...(l.maskSource?.kind === 'cache' ? { cache_ids: l.maskSource.ids } : {}),
+            ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
+          }
+        })
+        // the source layer(s) always label their own pixels; extra layers by
+        // the dialog's checklist
+        const labelIdsAll = [
+          ...exportState.layerIds,
+          ...(labelIds ?? []).filter((i) => !exportState.layerIds.includes(i)),
+        ]
+        const label_layers = layers
+          .filter((l) => labelIdsAll.includes(l.id))
+          .map(labelLayerSpec)
+        await runPipelineJob(
+          () => exportPixels({ path, format, regions, label_layers }),
+          async (st) => setToast(st.message || 'Pixel dataset exported'),
+        )
+        return
+      }
       if (exportState.kind === 'roicubes') {
         if (format !== 'zarr' && format !== 'npz') return
         const rois = layers
@@ -3973,8 +4130,14 @@ export default function App() {
           setToast('No visible ROI atoms to export')
           return
         }
+        const label_layers = layers
+          .filter((l) => (labelIds ?? []).includes(l.id))
+          .map(labelLayerSpec)
         await runPipelineJob(
-          () => exportRoiCubes({ folder: path.replace(/\/$/, ''), format, rois }),
+          () => exportRoiCubes({
+            folder: path.replace(/\/$/, ''), format, rois,
+            ...(label_layers.length ? { label_layers } : {}),
+          }),
           async (st) => setToast(st.message || 'ROI cubes exported'),
         )
         return
@@ -4518,6 +4681,15 @@ export default function App() {
               onCoregister={(layerId, x, y) => setCoregPick({ movingLayerId: layerId, x, y })}
               onExportLayers={(ids) => setExportState({ kind: 'layers', ids })}
               onExportRoiCubes={(ids) => setExportState({ kind: 'roicubes', layerIds: ids })}
+              onExportPixels={(ids) => setExportState({ kind: 'pixels', layerIds: ids })}
+              onCopyToImage={
+                meta && images.some(
+                  (i) => i.id !== meta.image.id &&
+                    i.shape[0] === meta.shape[0] && i.shape[1] === meta.shape[1],
+                )
+                  ? (ids, x, y) => setCopyLayersFor({ layerIds: ids, x, y })
+                  : null
+              }
               hasMasks={cacheObjects.some((o) => o.kind === 'mask')}
               noteEntries={noteMenuEntries}
               onEditMaskWithAtom={(layerId, atomId) => {
@@ -4675,6 +4847,12 @@ export default function App() {
             label: 'Crop ROI data to new image',
             hint: 'append to IMAGE tab',
             onClick: () => cropAtom(layer, atom),
+          })
+          out.push({
+            label: 'Export pixel dataset…',
+            hint: 'this atom · spectra + coords + labels',
+            onClick: () =>
+              setExportState({ kind: 'pixels', layerIds: [layer.id], atomId: atom.id }),
           })
           if (cacheObjects.some((o) => o.kind === 'mask')) {
             out.push({
@@ -5424,6 +5602,26 @@ export default function App() {
         </>
       )}
 
+      {/* copy-layers target picker: SAME-GRID images only */}
+      {copyLayersFor && meta && (
+        <ContextMenu
+          x={copyLayersFor.x}
+          y={copyLayersFor.y}
+          items={images
+            .filter(
+              (i) => i.id !== meta.image.id &&
+                i.shape[0] === meta.shape[0] && i.shape[1] === meta.shape[1],
+            )
+            .map((im) => ({
+              label: im.name,
+              hint: `${im.shape[0]}×${im.shape[1]}`,
+              onClick: () => copyLayersToImage(copyLayersFor.layerIds, im.id),
+            }))}
+          header={{ type: 'copy layers', name: 'choose target image (same grid)' }}
+          onClose={() => setCopyLayersFor(null)}
+        />
+      )}
+
       {/* coreg step 1: choose the target image */}
       {coregPick && meta && (
         <ContextMenu
@@ -5561,8 +5759,13 @@ export default function App() {
             },
             {
               label: 'Bake into data (in place)…',
-              hint: 'resample onto the target grid · replaces the moving image',
-              onClick: () => void bakeRegistrationRec(regLinkMenu.rec),
+              hint: 'bilinear, antialiased · replaces the moving image',
+              onClick: () => void bakeRegistrationRec(regLinkMenu.rec, 'bilinear'),
+            },
+            {
+              label: 'Bake into data (nearest)…',
+              hint: 'measured spectra only, repeated · for per-pixel ML',
+              onClick: () => void bakeRegistrationRec(regLinkMenu.rec, 'nearest'),
             },
             { divider: true, label: 'share' } as MenuEntry,
             {
@@ -5980,7 +6183,9 @@ export default function App() {
                 ? `${base}_layers`
                 : exportState.kind === 'roicubes'
                   ? `${base}_roi_cubes`
-                  : `${base}_${clean(exportState.name)}`
+                  : exportState.kind === 'pixels'
+                    ? `${base}_pixels`
+                    : `${base}_${clean(exportState.name)}`
         const layerLegend =
           exportState.kind === 'layers'
             ? layers.filter((l) => exportState.ids.includes(l.id))
@@ -6010,16 +6215,26 @@ export default function App() {
                     ? `Export ${layerLegend.length} layer${layerLegend.length > 1 ? 's' : ''} as…`
                     : exportState.kind === 'roicubes'
                       ? 'Export HSI data by ROI…'
-                      : `Export "${exportState.name}" as…`
+                      : exportState.kind === 'pixels'
+                        ? 'Export pixel dataset…'
+                        : `Export "${exportState.name}" as…`
             }
             defaultName={name}
             storageKey={exportState.kind}
             formats={
-              exportState.kind === 'data' || exportState.kind === 'roicubes'
+              exportState.kind === 'data' || exportState.kind === 'roicubes' ||
+              exportState.kind === 'pixels'
                 ? ['zarr', 'npz']
                 : undefined
             }
             folderMode={exportState.kind === 'roicubes'}
+            labelChoices={
+              exportState.kind === 'roicubes'
+                ? labelChoicesFor(exportState.layerIds)
+                : exportState.kind === 'pixels'
+                  ? labelChoicesFor(exportState.layerIds)
+                  : undefined
+            }
             toggle={
               exportState.kind === 'canvas'
                 ? {
@@ -6074,7 +6289,8 @@ export default function App() {
                 </>
               ) : undefined
             }
-            onSave={doExport}
+            onSave={(path, format, toggleOn, labelIds) =>
+              void doExport(path, format, toggleOn, labelIds)}
             onClose={() => setExportState(null)}
           />
         )

@@ -228,7 +228,8 @@ class DatasetManager:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def export_roi_cubes_async(self, folder: str, fmt: str, rois: list[dict]) -> None:
+    def export_roi_cubes_async(self, folder: str, fmt: str, rois: list[dict],
+                               label_layers: list[dict] | None = None) -> None:
         """One HSI cube per ROI atom, written into `folder` (job)."""
         ds = self.require()
         with self._lock:
@@ -245,7 +246,8 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                res = ds.export_roi_cubes(folder, fmt, rois, progress=on_progress)
+                res = ds.export_roi_cubes(folder, fmt, rois, progress=on_progress,
+                                          label_layers=label_layers)
                 with self._lock:
                     self.pipe_state = "idle"
                     self.pipe_progress = 1.0
@@ -253,6 +255,39 @@ class DatasetManager:
                                          f"to {res['path']}")
             except Exception as exc:
                 logger.exception("ROI cube export job failed")
+                with self._lock:
+                    self.pipe_state = "error"
+                    self.pipe_error = str(exc)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def export_pixels_async(self, path: str, fmt: str, region_specs: list[dict],
+                            label_layers: list[dict]) -> None:
+        """Pixel dataset (spectra + coords + labels) written to `path` (job)."""
+        ds = self.require()
+        with self._lock:
+            if self.pipe_state == "running":
+                raise HTTPException(status_code=409, detail="a pipeline job is already running")
+            self.pipe_state = "running"
+            self.pipe_progress = 0.0
+            self.pipe_message = "starting"
+            self.pipe_error = None
+
+        def work() -> None:
+            def on_progress(frac: float, msg: str) -> None:
+                self.pipe_progress = frac
+                self.pipe_message = msg
+
+            try:
+                res = ds.export_pixels(path, fmt, region_specs, label_layers,
+                                       progress=on_progress)
+                with self._lock:
+                    self.pipe_state = "idle"
+                    self.pipe_progress = 1.0
+                    self.pipe_message = (f"exported {res['n_pixels']} pixels "
+                                         f"to {res['path']}")
+            except Exception as exc:
+                logger.exception("pixel export job failed")
                 with self._lock:
                     self.pipe_state = "error"
                     self.pipe_error = str(exc)
@@ -289,7 +324,8 @@ class DatasetManager:
         threading.Thread(target=work, daemon=True).start()
 
     def bake_async(self, img_id: int, matrix: list[float],
-                   out_shape: tuple[int, int]) -> None:
+                   out_shape: tuple[int, int],
+                   method: str = "bilinear") -> None:
         """Warp image `img_id`'s data onto a registration's target grid and
         REPLACE the entry — fresh-image semantics like the in-place crop: new
         dataset, empty recipe/cache, old memory freed, disk untouched."""
@@ -313,7 +349,8 @@ class DatasetManager:
                 if entry.itype == "hsi":
                     ds = entry.dataset
                     assert ds is not None
-                    arr = ds.resample_to_grid(matrix, out_shape, on_progress)
+                    arr = ds.resample_to_grid(matrix, out_shape, on_progress,
+                                              method=method)
                     new_entry = images_mod.entry_from_array(
                         entry.id, name, f"{ds.key_path}::baked{entry.id}", arr,
                         ds.wavenumbers.copy() if ds.has_wavenumbers else None,
@@ -329,19 +366,28 @@ class DatasetManager:
                     src = entry.array
                     mat_rc, off = _inverse_rc(matrix)
                     oh, ow = int(out_shape[0]), int(out_shape[1])
+                    order = 1 if method == "bilinear" else 0
+                    f_r = float(np.hypot(mat_rc[0, 0], mat_rc[0, 1]))
+                    f_c = float(np.hypot(mat_rc[1, 0], mat_rc[1, 1]))
+                    sigmas = (max(0.0, (f_r - 1.0) / 2.0),
+                              max(0.0, (f_c - 1.0) / 2.0))
+                    pre = order == 1 and max(sigmas) > 1e-3
+
+                    def _warp(plane: "np.ndarray") -> "np.ndarray":
+                        if pre:
+                            plane = ndimage.gaussian_filter(plane, sigmas)
+                        return ndimage.affine_transform(
+                            plane, matrix=mat_rc, offset=off,
+                            output_shape=(oh, ow), order=order,
+                            mode="constant", cval=0.0)
                     if src.ndim == 3:
-                        chans = [ndimage.affine_transform(
-                            src[..., c].astype(np.float32), matrix=mat_rc,
-                            offset=off, output_shape=(oh, ow), order=1,
-                            mode="constant", cval=0.0) for c in range(src.shape[2])]
-                        out = np.stack(chans, axis=-1)
+                        out = np.stack(
+                            [_warp(src[..., c].astype(np.float32))
+                             for c in range(src.shape[2])], axis=-1)
                         if entry.itype == "rgb":
                             out = np.clip(np.round(out), 0, 255).astype(np.uint8)
                     else:
-                        out = ndimage.affine_transform(
-                            src.astype(np.float32), matrix=mat_rc, offset=off,
-                            output_shape=(oh, ow), order=1, mode="constant",
-                            cval=0.0)
+                        out = _warp(src.astype(np.float32))
                     new_entry = images_mod.ImageEntry(
                         entry.id, name, f"{entry.path}::baked{entry.id}",
                         entry.itype, array=out, dtype_label=entry.dtype_label)
@@ -721,6 +767,9 @@ class BakeRequest(BaseModel):
     img: int
     matrix: list[float]  # 2x3, this image's native px -> target-grid native px
     target_shape: list[int]  # [h, w] of the output grid
+    #: bilinear (smooth, antialiased on downscale) | nearest (measured
+    #: spectra only, repeated)
+    method: str = "bilinear"
 
 
 @app.post("/api/registration/bake")
@@ -729,7 +778,8 @@ def registration_bake(req: BakeRequest) -> dict:
     the image in place (job; poll /api/pipeline/status)."""
     if len(req.matrix) != 6 or len(req.target_shape) != 2:
         raise HTTPException(status_code=400, detail="matrix must be 2x3, target_shape [h, w]")
-    manager.bake_async(req.img, req.matrix, (req.target_shape[0], req.target_shape[1]))
+    manager.bake_async(req.img, req.matrix, (req.target_shape[0], req.target_shape[1]),
+                       req.method)
     return {"state": "running"}
 
 
@@ -812,6 +862,26 @@ class ExportRoiCubesRequest(BaseModel):
     folder: str
     format: str  # zarr | npz
     rois: list[dict]  # [{label, layer, parts, cache_ids?, path?}]
+    #: label layers attached to every cube: [{name, atoms: [{label, parts? |
+    #: mask_cache_ids?}], cache_ids?, path?}]
+    label_layers: list[dict] | None = None
+
+
+class ExportPixelsRequest(BaseModel):
+    path: str
+    format: str  # zarr | npz
+    #: region = union of these specs (same shape as combine specs)
+    regions: list[dict]
+    label_layers: list[dict] = []
+
+
+@app.post("/api/export/pixels")
+def export_pixels_ep(req: ExportPixelsRequest) -> dict:
+    """Pixel dataset export: spectra + coords + per-layer labels (job)."""
+    if not req.regions:
+        raise HTTPException(status_code=400, detail="export needs a region")
+    manager.export_pixels_async(req.path, req.format, req.regions, req.label_layers)
+    return manager.pipeline_status()
 
 
 @app.post("/api/layers/export_cubes")
@@ -825,7 +895,7 @@ def layers_export_cubes(req: ExportRoiCubesRequest) -> dict:
                        if (r.get("cache_ids") or r.get("path")) else None)}
         for r in req.rois
     ]
-    manager.export_roi_cubes_async(req.folder, req.format, rois)
+    manager.export_roi_cubes_async(req.folder, req.format, rois, req.label_layers)
     return manager.pipeline_status()
 
 
