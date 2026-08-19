@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { lastDir, recentDirs, rememberDir } from '../lib/recentDirs'
 import { listDir, makeDir, type ExportFormat, type FsListing } from '../lib/api'
 
 const ALL_FORMATS: ExportFormat[] = ['zarr', 'npz', 'png', 'tiff']
@@ -68,8 +69,9 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
   }, [])
 
   useEffect(() => {
-    // reopen at the folder this export kind last used
-    navigate(localStorage.getItem(memDir) ?? undefined, true)
+    // reopen at the folder this export kind last used; a kind used for the
+    // first time starts where the app last worked (shared recents)
+    navigate(localStorage.getItem(memDir) ?? lastDir(), true)
   }, [navigate, memDir])
 
   const changeFormat = (f: ExportFormat) => setFormat(f)
@@ -94,6 +96,7 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
   const save = () => {
     if (!ready) return
     localStorage.setItem(memDir, listing!.path)
+    rememberDir(listing!.path)
     localStorage.setItem(memFmt, format)
     if (toggle) localStorage.setItem(memTgl, toggleOn ? '1' : '0')
     onSave(targetPath, format, toggle ? toggleOn : undefined,
@@ -220,6 +223,20 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
           >
             Go
           </button>
+          {recentDirs().length > 0 && (
+            <select
+              className="max-w-36 rounded-lg border border-white/10 bg-slate-900 px-2 py-1.5
+                         text-[12px] text-slate-300 outline-none focus:border-sky-400/50"
+              value=""
+              title="recently used folders"
+              onChange={(e) => e.target.value && navigate(e.target.value)}
+            >
+              <option value="">recent…</option>
+              {recentDirs().map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+          )}
           <button
             className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-[12px]
                        text-slate-300 hover:border-sky-400/40 hover:text-sky-200"

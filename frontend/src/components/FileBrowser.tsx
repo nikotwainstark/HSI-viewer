@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { listDir, type FsEntry, type FsListing } from '../lib/api'
+import { lastDir, recentDirs, rememberDir } from '../lib/recentDirs'
 
 export type AxisOrder = 'auto' | 'hwc' | 'chw'
 
@@ -64,14 +65,29 @@ export function FileBrowser({
   }, [filesFilter])
 
   useEffect(() => {
-    navigate()
-  }, [navigate])
+    // reopen where the app last worked; the backend default is the fallback
+    const start = lastDir()
+    setError(null)
+    setSelected(null)
+    listDir(start, filesFilter)
+      .then((l) => {
+        setListing(l)
+        setPathInput(l.path)
+      })
+      .catch(() => navigate())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const pickable = (entry: FsEntry) => !pickKinds || pickKinds.includes(entry.kind)
 
+  const doOpen = (path: string) => {
+    if (listing) rememberDir(listing.path)
+    onOpen(path, axisOrder)
+  }
+
   const handleRowDoubleClick = (entry: FsEntry) => {
     if (entry.kind === 'zarr-array' || entry.kind === 'file') {
-      if (pickable(entry)) onOpen(entry.path, axisOrder)
+      if (pickable(entry)) doOpen(entry.path)
     } else {
       navigate(entry.path)
     }
@@ -108,6 +124,20 @@ export function FileBrowser({
           >
             Go
           </button>
+          {recentDirs().length > 0 && (
+            <select
+              className="max-w-40 rounded-lg border border-white/10 bg-slate-900 px-2 py-1.5
+                         text-[12px] text-slate-300 outline-none focus:border-sky-400/50"
+              value=""
+              title="recently used folders"
+              onChange={(e) => e.target.value && navigate(e.target.value)}
+            >
+              <option value="">recent…</option>
+              {recentDirs().map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+          )}
         </div>
 
         {/* entries */}
@@ -187,7 +217,7 @@ export function FileBrowser({
                          hover:bg-sky-400/25 disabled:cursor-not-allowed disabled:opacity-40"
               disabled={!selected || !pickable(selected)}
               onClick={() =>
-                selected && pickable(selected) && onOpen(selected.path, axisOrder)
+                selected && pickable(selected) && doOpen(selected.path)
               }
             >
               Open
