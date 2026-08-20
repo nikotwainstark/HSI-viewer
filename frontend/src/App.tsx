@@ -2054,12 +2054,19 @@ export default function App() {
     if (tool !== 'roi' && tool !== 'crop') setRoiDraft([])
   }, [tool])
 
-  // marching-ants outline of the ACTIVE layer's effective editing region
+  // Marching-ants outline of the ACTIVE layer's effective editing region.
+  // For mask-bound layers the trace is VIEWPORT-scoped and screen-resolution:
+  // zoomed in it is the exact native boundary of the visible window; zoomed
+  // out the crop is pooled toward screen resolution first (a native pixel is
+  // sub-screen-pixel there, so nothing visible is lost). Display only — the
+  // mask itself always stays native for every computation. Requests debounce
+  // behind pan/zoom and the previous trace stays up until the fresh one
+  // lands, so the ants never blink out mid-navigation.
   const [antsPaths, setAntsPaths] = useState<[number, number][][] | null>(null)
-  const outlineCache = useRef(new Map<string, [number, number][][]>())
+  const antsReq = useRef(0)
   useEffect(() => {
     const layer = layers.find((l) => l.id === activeLayerId)
-    if (!meta || !layer || !layer.visible) {
+    if (!meta || !layer || !layer.visible || !atomMode) {
       setAntsPaths(null)
       return
     }
@@ -2068,31 +2075,44 @@ export default function App() {
       setAntsPaths([[[0, 0], [w, 0], [w, h], [0, h], [0, 0]]])
       return
     }
-    const key = `${meta.image.id}:${layer.id}`
-    const cached = outlineCache.current.get(key)
-    if (cached) {
-      setAntsPaths(cached)
-      return
-    }
-    setAntsPaths(null)
-    fetchMaskOutline(
-      layer.maskSource.kind === 'cache'
-        ? { cache_ids: layer.maskSource.ids }
-        : { path: layer.maskSource.path },
-    )
-      .then(({ contours, total }) => {
-        outlineCache.current.set(key, contours)
-        setAntsPaths(contours)
-        if (total > contours.length) {
-          setToast(
-            `Outline draws the ${contours.length} largest of ${total} mask boundaries — ` +
-            'the rest are specks too small to trace. The whole mask is still used ' +
-            'for spectra, crops and exports.',
-          )
-        }
+    if (!viewState) return
+    const seq = ++antsReq.current
+    const timer = window.setTimeout(() => {
+      // visible window in image-local native coords (bbox of the unprojected
+      // screen corners through the image's inverse transform, padded)
+      const corners: [number, number][] = [
+        [0, 0], [size.width, 0], [0, size.height], [size.width, size.height],
+      ].map(([sx, sy]) => {
+        const [wx, wy] = unproject(sx, sy, viewState, size)
+        return selToLocal(wx, wy)
       })
-      .catch((e) => setToast((e as Error).message))
-  }, [activeLayerId, layers, meta])
+      const pad = 8
+      const wx0 = Math.min(...corners.map((c) => c[0])) - pad
+      const wy0 = Math.min(...corners.map((c) => c[1])) - pad
+      const wx1 = Math.max(...corners.map((c) => c[0])) + pad
+      const wy1 = Math.max(...corners.map((c) => c[1])) + pad
+      // native px per screen px along the denser axis
+      const a0 = selToLocal(...unproject(0, 0, viewState, size))
+      const a1 = selToLocal(...unproject(1, 0, viewState, size))
+      const a2 = selToLocal(...unproject(0, 1, viewState, size))
+      const detail = Math.max(
+        Math.hypot(a1[0] - a0[0], a1[1] - a0[1]),
+        Math.hypot(a2[0] - a0[0], a2[1] - a0[1]),
+      )
+      fetchMaskOutline({
+        ...(layer.maskSource!.kind === 'cache'
+          ? { cache_ids: layer.maskSource!.ids }
+          : { path: layer.maskSource!.path }),
+        window: [wx0, wy0, wx1, wy1],
+        detail_px: Number(detail.toFixed(3)),
+      })
+        .then(({ contours }) => {
+          if (antsReq.current === seq) setAntsPaths(contours)
+        })
+        .catch(() => {/* display only — keep the previous trace */})
+    }, 180)
+    return () => window.clearTimeout(timer)
+  }, [activeLayerId, layers, meta, atomMode, viewState, size, selToLocal])
 
   const setLayersVisibleMany = useCallback((ids: number[], visible: boolean) => {
     setLayers((ls) => ls.map((l) => (ids.includes(l.id) ? { ...l, visible } : l)))

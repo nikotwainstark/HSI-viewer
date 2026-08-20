@@ -184,6 +184,10 @@ export interface LayerObj {
 export async function fetchMaskOutline(body: {
   cache_ids?: number[]
   path?: string
+  /** visible native rect [x0, y0, x1, y1] — display trace scoped to it */
+  window?: [number, number, number, number]
+  /** native px per screen px; > 1 pools the display trace to screen res */
+  detail_px?: number
 }): Promise<{ contours: [number, number][][]; total: number }> {
   const res = await postJson<{ contours: [number, number][][]; total?: number }>(
     '/api/layers/outline', body,

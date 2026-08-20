@@ -649,6 +649,10 @@ def layers_clip(req: RoiClipRequest) -> Response:
 class RoiOutlineRequest(BaseModel):
     cache_ids: list[int] | None = None
     path: str | None = None
+    #: visible native rect [x0, y0, x1, y1] — contours traced on this crop
+    window: list[float] | None = None
+    #: native px per screen px; > 1 pools the display trace toward screen res
+    detail_px: float = 1.0
 
 
 class IsolateComponentsRequest(BaseModel):
@@ -705,7 +709,8 @@ def layers_outline(req: RoiOutlineRequest) -> dict:
         raise HTTPException(status_code=400, detail="mask source required")
     ds = manager.require()
     try:
-        contours = ds.mask_outline({"cache_ids": req.cache_ids, "path": req.path})
+        contours = ds.mask_outline({"cache_ids": req.cache_ids, "path": req.path},
+                                   window=req.window, detail_px=req.detail_px)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:

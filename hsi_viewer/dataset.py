@@ -1291,16 +1291,40 @@ class HSIDataset:
         out.sort(key=len, reverse=True)
         return out
 
-    def mask_outline(self, mask_step: dict) -> list[list[list[float]]]:
-        """Boundary polylines of a binary mask, traced on the NATIVE mask.
+    def mask_outline(self, mask_step: dict,
+                     window: list[float] | None = None,
+                     detail_px: float = 1.0) -> list[list[list[float]]]:
+        """Boundary polylines of a binary mask, VIEWPORT-scoped for display.
 
-        Geometry is never downsampled: an object's position and shape are
-        data, and only the live image bitmap may be pooled for display."""
+        `window` = visible native rect [x0, y0, x1, y1]: contours are traced
+        on that crop only (plus a 1 px apron so edge contours close).
+        `detail_px` = native px per SCREEN px: zoomed out (detail_px > 1) the
+        crop is mean-pooled toward screen resolution before tracing — at that
+        magnification a native pixel is sub-screen-pixel, so the coarser
+        contour is visually identical while the vertex count stays bounded by
+        what the screen can show. Zoomed in (detail_px <= 1) tracing is
+        native and exact. The MASK ITSELF is never touched: spectra, crops
+        and exports always use the full native mask — this is display only.
+        Coordinates are returned in native px regardless of pooling."""
         from skimage import measure
 
         m = self._resolve_step_mask(mask_step)
+        ox = oy = 0
+        if window is not None:
+            x0 = max(0, int(np.floor(window[0])) - 1)
+            y0 = max(0, int(np.floor(window[1])) - 1)
+            x1 = min(self.width, int(np.ceil(window[2])) + 1)
+            y1 = min(self.height, int(np.ceil(window[3])) + 1)
+            if x1 <= x0 or y1 <= y0:
+                return []
+            m = m[y0:y1, x0:x1]
+            ox, oy = x0, y0
+        factor = max(1, int(np.floor(detail_px)))
+        if factor > 1:
+            m = pool_by(m.astype(np.float32), factor) > 0.5
         contours = measure.find_contours(m.astype(float), 0.5)
-        out = [[[float(col), float(row)] for row, col in c]
+        out = [[[float(col) * factor + ox, float(row) * factor + oy]
+                for row, col in c]
                for c in contours if len(c) >= 4]
         out.sort(key=len, reverse=True)
         return out
