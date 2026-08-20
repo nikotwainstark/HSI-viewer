@@ -3054,6 +3054,72 @@ export default function App() {
         )
       }
     }
+    // floating atom-name tags (display only, never exported): EXPLICITLY
+    // named region atoms show their name above their bounding box, so a
+    // dozen cores read as C1..C12 at a glance. Unnamed atoms stay quiet —
+    // their label falls back to the layer name, which the panel already
+    // shows. One TextLayer regardless of atom count.
+    {
+      // anchor = the DISPLAYED top edge: bbox corners go through the image's
+      // transform and the tag hangs over whichever edge ends up highest, so
+      // it stays "above" through flips and quarter turns. World coords, no
+      // modelMatrix (the transform is already applied).
+      const topAnchor = (
+        x0: number, y0: number, x1: number, y1: number,
+      ): [number, number] => {
+        const cs = [
+          selToWorld(x0, y0), selToWorld(x1, y0),
+          selToWorld(x0, y1), selToWorld(x1, y1),
+        ].sort((a, b) => a[1] - b[1])
+        return [(cs[0][0] + cs[1][0]) / 2, (cs[0][1] + cs[1][1]) / 2]
+      }
+      const tags: { p: [number, number]; t: string; c: [number, number, number] }[] = []
+      for (const layer of layers) {
+        if (!layer.visible) continue
+        const rgbT = hexToRgb(layer.color)
+        for (const a of layer.atoms) {
+          if (a.visible === false || !a.name) continue
+          if (a.kind === 'roi') {
+            const [bx0, by0, bx1, by1] = partsBbox(a.parts)
+            tags.push({ p: topAnchor(bx0, by0, bx1, by1), t: a.name, c: rgbT })
+          } else if (a.kind === 'mask') {
+            const cs = maskAtomOutlines.get(`${selId}:${a.cacheIds.join(',')}`)
+            if (!cs?.length) continue
+            let mx0 = Infinity, my0 = Infinity, mx1 = -Infinity, my1 = -Infinity
+            for (const c of cs) {
+              for (const [px, py] of c) {
+                if (px < mx0) mx0 = px
+                if (px > mx1) mx1 = px
+                if (py < my0) my0 = py
+                if (py > my1) my1 = py
+              }
+            }
+            tags.push({ p: topAnchor(mx0, my0, mx1, my1), t: a.name, c: rgbT })
+          }
+        }
+      }
+      if (tags.length) {
+        result.push(
+          new TextLayer({
+            id: 'atom-name-tags',
+            data: tags,
+            getPosition: (d: { p: [number, number] }) => d.p,
+            getText: (d: { t: string }) => d.t,
+            getSize: 11,
+            sizeUnits: 'pixels',
+            getColor: (d: { c: [number, number, number] }) =>
+              [...d.c, 235] as [number, number, number, number],
+            getPixelOffset: [0, -9] as [number, number],
+            getTextAnchor: 'middle' as const,
+            getAlignmentBaseline: 'bottom' as const,
+            fontFamily: 'monospace',
+            outlineWidth: 3,
+            outlineColor: [10, 14, 20, 235] as [number, number, number, number],
+            fontSettings: { sdf: true },
+          }),
+        )
+      }
+    }
     // isolate-components preview: numbered candidate boxes on the canvas
     if (isolate?.preview?.length) {
       const boxes = isolate.preview.map((c) => ({
@@ -3178,7 +3244,7 @@ export default function App() {
     return result
     // NOTE: the in-progress draft lives in `draftLayers` — keep fast-changing
     // pointer state (brushStroke / roiDraft / mouseWorld) out of this memo
-  }, [meta, bitmap, bitmapFresh, picks, zOrder, layouts, images, layerUrls, selMatrix,
+  }, [meta, bitmap, bitmapFresh, picks, zOrder, layouts, images, layerUrls, selMatrix, selToWorld,
       layers, clipBitmaps, scrubbing,
       panelSel, maskAtomOutlines, partsOutlines, layerRasters, layerClipKey,
       layerRasterFactorFor, transformImage, rotOffsetWorld, coreg, isolate, affinePreview])
