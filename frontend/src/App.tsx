@@ -3362,8 +3362,7 @@ export default function App() {
         : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0]
       const rgbD = hexToRgb(c)
       const width = erasingNow ? eraserSize : brushSize
-      // a hairline is its own mark: draw it solid like committed thin atoms
-      const alpha = erasingNow ? 0.55 : width <= 4 ? 0.8 : 0.45
+      const alpha = erasingNow ? 0.55 : 0.45
       const BAKE_EVERY = 64
       let cache = strokeCache.current
       if (!cache || cache.width !== width || cache.color !== c) {

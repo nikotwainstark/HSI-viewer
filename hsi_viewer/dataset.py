@@ -1266,37 +1266,28 @@ class HSIDataset:
             clip = pool_by(self._resolve_step_mask(mask_step).astype(np.float32),
                            factor) > 0.5
 
-        # a thin painted stroke IS the mark: ringing a 1 px stroke with a
-        # border would triple its apparent width, so thin atoms are drawn
-        # solid and unringed instead
-        def thin_atom(parts: list[dict]) -> bool:
-            adds = [p for p in parts if p.get("op") != "erase"]
-            return bool(adds) and all(
-                p["shape"] == "brush" and float(p.get("width", 1)) <= 4 for p in adds)
-
-        regions: list[tuple[np.ndarray, bool]] = []
+        # one rendering rule for EVERY atom — the same fill alpha and the
+        # same pixel-edge rim regardless of nib width, so a layer never
+        # shows two different opacities (the old thin-stroke special case)
+        regions: list[np.ndarray] = []
         for parts in atoms:
             r, drawn = self._rasterize_parts(parts, hp, wp, scale=factor)
             if drawn == 0:
                 continue
-            regions.append((r if clip is None else (r & clip), thin_atom(parts)))
+            regions.append(r if clip is None else (r & clip))
         for ids in mask_atoms or []:
             r = pool_by(self._resolve_step_mask({"cache_ids": ids}).astype(np.float32),
                         factor) > 0.5
-            regions.append((r if clip is None else (r & clip), False))
+            regions.append(r if clip is None else (r & clip))
         if not regions:
             # a mask-bound layer with no atoms still shows its editable area
             if clip is None:
                 raise ValueError("invalid ROI geometry")
-            regions = [(clip, False)]
+            regions = [clip]
 
         fill = np.zeros((hp, wp), dtype=bool)
-        thin = np.zeros((hp, wp), dtype=bool)
         edge = np.zeros((hp, wp), dtype=bool)
-        for r, is_thin in regions:
-            if is_thin:
-                thin |= r
-                continue
+        for r in regions:
             fill |= r
             if outline:
                 # inner rim: the border never extends past the real region,
@@ -1315,7 +1306,6 @@ class HSIDataset:
         rgba = np.zeros((hp, wp, 4), dtype=np.uint8)
         rgba[fill] = [*rgb, int(np.clip(alpha, 0.0, 1.0) * 255)]
         rgba[edge] = [*rgb, 242]
-        rgba[thin] = [*rgb, 204]
         buf = io.BytesIO()
         Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", compress_level=PNG_FAST)
         return buf.getvalue()

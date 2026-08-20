@@ -20,9 +20,6 @@ import type { LayerObj, RoiAtom } from './api'
 import { partsBounds, rasterizeParts, regionEdges, type PixelRegion } from './pixelRegion'
 
 const FILL_ALPHA = 0.28
-// a thin painted stroke IS the mark, so it is drawn solid rather than tinted
-const THIN_PX = 4
-const THIN_ALPHA = 0.8
 /** Texture budget per layer: 32 Mpx ≈ 128 MB of RGBA. Only a region larger
     than a very large cube's full frame is pooled, and pooling by an integer
     factor keeps the overlay's pixel edges on the native grid — coarser, never
@@ -60,15 +57,6 @@ function hexToRgb(hex: string): [number, number, number] {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
 }
 
-/** True when every additive part is a brush stroke no wider than THIN_PX.
-    Such an atom IS its own mark: it is drawn solid and gets no border, or the
-    rim would double the apparent width of a hairline. */
-export function isThinAtom(atom: RoiAtom): boolean {
-  const adds = atom.parts.filter((p) => p.op !== 'erase')
-  return adds.length > 0 &&
-    adds.every((p) => p.shape === 'brush' && (p.width ?? 1) <= THIN_PX)
-}
-
 /**
  * Paint every visible ROI atom of a layer into one RGBA texture and trace the
  * borders, from a single rasterization pass so the two can never disagree.
@@ -99,15 +87,14 @@ export async function renderLayerRaster(
   const area = (nx1 - nx0) * (ny1 - ny0)
   const s = area > MAX_TEXTURE_PX ? Math.ceil(Math.sqrt(area / MAX_TEXTURE_PX)) : 1
 
-  const regions: { region: PixelRegion; thin: boolean }[] = []
+  const regions: PixelRegion[] = []
   let tx0 = Infinity, ty0 = Infinity, tx1 = -Infinity, ty1 = -Infinity
   const edges: [number, number][][] = []
   for (const atom of atoms) {
     const region = rasterizeParts(atom.parts, w, h, s)
     if (!region) continue
-    const thin = isThinAtom(atom)
-    regions.push({ region, thin })
-    if (!thin) edges.push(...regionEdges(region))
+    regions.push(region)
+    edges.push(...regionEdges(region))
     tx0 = Math.min(tx0, region.x0); ty0 = Math.min(ty0, region.y0)
     tx1 = Math.max(tx1, region.x0 + region.w); ty1 = Math.max(ty1, region.y0 + region.h)
   }
@@ -116,13 +103,11 @@ export async function renderLayerRaster(
   const bw = tx1 - tx0
   const bh = ty1 - ty0
   const broad = new Uint8Array(bw * bh)
-  const thinPlane = new Uint8Array(bw * bh)
-  for (const { region, thin } of regions) {
-    const plane = thin ? thinPlane : broad
+  for (const region of regions) {
     for (let y = 0; y < region.h; y++) {
       const row = (region.y0 - ty0 + y) * bw + (region.x0 - tx0)
       for (let x = 0; x < region.w; x++) {
-        if (region.data[y * region.w + x]) plane[row + x] = 1
+        if (region.data[y * region.w + x]) broad[row + x] = 1
       }
     }
   }
@@ -133,9 +118,8 @@ export async function renderLayerRaster(
   const img = ctx.createImageData(bw, bh)
   const [cr, cg, cb] = hexToRgb(layer.color)
   const aBroad = Math.round(FILL_ALPHA * 255)
-  const aThin = Math.round(THIN_ALPHA * 255)
   for (let i = 0, p = 0; i < broad.length; i++, p += 4) {
-    const a = thinPlane[i] ? aThin : broad[i] ? aBroad : 0
+    const a = broad[i] ? aBroad : 0
     if (!a) continue
     img.data[p] = cr
     img.data[p + 1] = cg
