@@ -201,28 +201,83 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
           {labelsOn && labelChoices.length > 0 && (
             <div className="mb-1.5 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
               <p className="mb-1.5 text-[10px] tracking-wider text-slate-400 uppercase">
-                attach labels from layers
+                attach meta labels · only layers overlapping the export
               </p>
-              {labelChoices.map((c) => (
-                <label
-                  key={c.id}
-                  className="flex cursor-pointer items-baseline gap-2 rounded px-1 py-0.5
-                             hover:bg-white/5"
-                >
-                  <input
-                    type="checkbox"
-                    className="translate-y-0.5 accent-violet-400"
-                    checked={labelIds.includes(c.id)}
-                    onChange={(e) =>
-                      setLabelIds((ids) =>
-                        e.target.checked ? [...ids, c.id] : ids.filter((i) => i !== c.id),
-                      )
-                    }
-                  />
-                  <span className="text-[12px] text-slate-200">{c.name}</span>
-                  <span className="ml-auto shrink-0 text-[10px] text-slate-500">{c.summary}</span>
-                </label>
-              ))}
+              {labelChoices.map((c) => {
+                const pos = labelIds.indexOf(c.id)
+                const on = pos >= 0
+                return (
+                  <div
+                    key={c.id}
+                    className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-white/5"
+                  >
+                    <label className="flex min-w-0 flex-1 cursor-pointer items-baseline gap-2">
+                      <input
+                        type="checkbox"
+                        className="translate-y-0.5 accent-violet-400"
+                        checked={on}
+                        onChange={(e) =>
+                          setLabelIds((ids) =>
+                            e.target.checked
+                              ? [...ids, c.id]
+                              : ids.filter((i) => i !== c.id),
+                          )
+                        }
+                      />
+                      {on && (
+                        <span className="shrink-0 rounded bg-violet-400/20 px-1 font-mono
+                                         text-[10px] text-violet-200">
+                          col {pos + 1}
+                        </span>
+                      )}
+                      <span className="truncate text-[12px] text-slate-200">{c.name}</span>
+                      <span className="ml-auto shrink-0 text-[10px] text-slate-500">
+                        {c.summary}
+                      </span>
+                    </label>
+                    {on && (
+                      <span className="flex shrink-0 gap-0.5">
+                        <button
+                          className="rounded px-1 text-[11px] text-slate-400
+                                     hover:bg-white/10 hover:text-slate-100
+                                     disabled:opacity-30"
+                          disabled={pos === 0}
+                          title="move column earlier"
+                          onClick={() =>
+                            setLabelIds((ids) => {
+                              const next = [...ids]
+                              ;[next[pos - 1], next[pos]] = [next[pos], next[pos - 1]]
+                              return next
+                            })
+                          }
+                        >
+                          ▲
+                        </button>
+                        <button
+                          className="rounded px-1 text-[11px] text-slate-400
+                                     hover:bg-white/10 hover:text-slate-100
+                                     disabled:opacity-30"
+                          disabled={pos === labelIds.length - 1}
+                          title="move column later"
+                          onClick={() =>
+                            setLabelIds((ids) => {
+                              const next = [...ids]
+                              ;[next[pos], next[pos + 1]] = [next[pos + 1], next[pos]]
+                              return next
+                            })
+                          }
+                        >
+                          ▼
+                        </button>
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+              <p className="mt-1 text-[10px] leading-relaxed text-slate-500">
+                column order = the order above · every column also lands as a named
+                array (label_&lt;i&gt;__&lt;layer&gt;) with its int→name legend
+              </p>
               {labelChoices.some((c) => c.warn && labelIds.includes(c.id)) && (
                 <p className="mt-1 text-[10px] leading-relaxed text-amber-300">
                   {labelChoices

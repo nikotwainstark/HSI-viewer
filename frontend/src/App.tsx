@@ -1834,11 +1834,35 @@ export default function App() {
   )
 
   /** Checklist rows for the export dialogs: layers that can contribute a
-      label column, with a summary and an unnamed-atom warning. */
+      label column. Candidates that CANNOT touch the exported region are
+      dropped — a label layer with no overlap would only ever write 0s. The
+      test is bbox-level on vector atoms (cheap, conservative: bbox contact
+      admits a layer whose exact region misses, and its column then simply
+      reads 0); mask atoms and mask-bound layers are admitted outright, their
+      extent lives server-side. */
   const labelChoicesFor = useCallback(
-    (excludeIds: number[]) =>
-      layers
-        .filter((l) => l.visible && !excludeIds.includes(l.id))
+    (sourceIds: number[]) => {
+      const boxesOf = (l: LayerObj): [number, number, number, number][] =>
+        l.atoms
+          .filter((a): a is RoiAtom => a.kind === 'roi' && a.visible !== false)
+          .map((a) => partsBbox(a.parts))
+      const hasRaster = (l: LayerObj) =>
+        !!l.maskSource ||
+        l.atoms.some((a) => a.kind === 'mask' && a.visible !== false)
+      const srcLayers = layers.filter((l) => sourceIds.includes(l.id))
+      const srcBoxes = srcLayers.flatMap(boxesOf)
+      const srcHasRaster = srcLayers.some(hasRaster)
+      const touches = (l: LayerObj): boolean => {
+        if (srcHasRaster || hasRaster(l)) return true
+        const cb = boxesOf(l)
+        return srcBoxes.some(([ax0, ay0, ax1, ay1]) =>
+          cb.some(([bx0, by0, bx1, by1]) =>
+            ax0 <= bx1 && bx0 <= ax1 && ay0 <= by1 && by0 <= ay1,
+          ),
+        )
+      }
+      return layers
+        .filter((l) => l.visible && !sourceIds.includes(l.id) && touches(l))
         .map((l) => {
           const regionAtomsOf = l.atoms.filter(
             (a) => a.visible !== false && (a.kind === 'roi' || a.kind === 'mask'),
@@ -1856,7 +1880,8 @@ export default function App() {
               : {}),
           }
         })
-        .filter((c) => !c.summary.startsWith('0 ')),
+        .filter((c) => !c.summary.startsWith('0 '))
+    },
     [layers],
   )
 
@@ -4299,8 +4324,9 @@ export default function App() {
             ...exportState.layerIds,
             ...(labelIds ?? []).filter((i) => !exportState.layerIds.includes(i)),
           ]
-          const label_layers = layers
-            .filter((l) => labelIdsAll.includes(l.id))
+          const label_layers = labelIdsAll
+            .map((id) => layers.find((l) => l.id === id))
+            .filter((l): l is LayerObj => !!l)
             .map(labelLayerSpec)
           await runPipelineJob(
             () => exportPixels({ path, format, regions, label_layers, orient }),
@@ -4325,9 +4351,10 @@ export default function App() {
             setToast('No visible ROI atoms to export')
             return
           }
-          const label_layers = layers
-            .filter((l) => (labelIds ?? []).includes(l.id) &&
-              !exportState.layerIds.includes(l.id))
+          const label_layers = (labelIds ?? [])
+            .filter((id) => !exportState.layerIds.includes(id))
+            .map((id) => layers.find((l) => l.id === id))
+            .filter((l): l is LayerObj => !!l)
             .map(labelLayerSpec)
           await runPipelineJob(
             () => exportRoiCubes({

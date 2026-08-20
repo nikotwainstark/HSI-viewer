@@ -2234,13 +2234,24 @@ class HSIDataset:
                     lb = g.create_array("labels", shape=cube_labels.shape,
                                         dtype="uint16")
                     lb[:] = cube_labels
+                    for li, e in enumerate(legends):
+                        za = g.create_array(
+                            f"label_{li}__{_safe_filename(e['layer'])}",
+                            shape=cube_labels.shape[1:], dtype="uint16")
+                        za[:] = cube_labels[li]
+                        za.attrs.update({"layer": e["layer"],
+                                         "legend": e["legend"], "plane": li})
                 g.attrs.update(meta)
             else:
                 p = root / f"{name}.npz"
                 if p.exists():
                     raise ValueError(f"target already exists: {p}")
-                extra = ({"labels": cube_labels}
-                         if cube_labels is not None else {})
+                extra: dict = {}
+                if cube_labels is not None:
+                    extra["labels"] = cube_labels
+                    for li, e in enumerate(legends):
+                        extra[f"label_{li}__{_safe_filename(e['layer'])}"] = \
+                            cube_labels[li]
                 np.savez_compressed(p, hypercube=arr,
                                     valid_mask=valid.astype(np.uint8),
                                     metadata=json.dumps(meta),
@@ -2320,6 +2331,13 @@ class HSIDataset:
         wn = np.asarray(self.wavenumbers, dtype=np.float64)
         progress(0.85, f"writing {n} pixels")
         p_out = self._prepare_export_path(path, fmt)
+        # every label layer ALSO lands as its own instance-length array named
+        # after the layer, carrying its legend — the column ↔ name mapping is
+        # in the file itself, not only in the packed (N, L) block
+        named_cols = {
+            f"label_{i}__{_safe_filename(e['layer'])}": labels[:, i]
+            for i, e in enumerate(legends)
+        }
         if fmt == "zarr":
             g = zarr.open_group(str(p_out), mode="w")
             sp = g.create_array("spectra", shape=spectra.shape, dtype="float32",
@@ -2329,13 +2347,18 @@ class HSIDataset:
             co[:] = coords
             lb = g.create_array("labels", shape=labels.shape, dtype="uint16")
             lb[:] = labels
+            for i, (key, col) in enumerate(named_cols.items()):
+                za = g.create_array(key, shape=col.shape, dtype="uint16")
+                za[:] = col
+                za.attrs.update({"layer": legends[i]["layer"],
+                                 "legend": legends[i]["legend"], "column": i})
             ax = g.create_array(axis_name, shape=wn.shape, dtype="float64")
             ax[:] = wn
             g.attrs.update(meta)
         else:
             np.savez_compressed(p_out, spectra=spectra, coords=coords,
                                 labels=labels, metadata=json.dumps(meta),
-                                **{axis_name: wn})
+                                **named_cols, **{axis_name: wn})
         progress(1.0, f"exported {n} pixels")
         logger.info("pixel dataset exported -> %s (%d px, %d label layers)",
                     p_out, n, len(legends))
