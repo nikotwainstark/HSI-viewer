@@ -4,11 +4,13 @@ import logging
 import os
 import threading
 import webbrowser
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -18,6 +20,80 @@ from .dataset import HSIDataset, zarr_array_shape, zarr_node_kind
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 logger = logging.getLogger("hsi.main")
+
+
+class DataGate:
+    """Reader/writer gate between data ENDPOINTS and mutating JOBS.
+
+    The live cube, valid mask and cache registry are mutated in place by
+    worker threads (pipeline, revert, crop, bake, cache edits) while request
+    threads read them — without exclusion a preview can render a half-
+    normalized frame and, far worse, a cache/export request can FIX a torn
+    frame into a persistent object. Data must not lie, so:
+
+    - readers (renders, spectra, outlines, exports) run concurrently;
+    - a writer is exclusive: it fails fast if another writer is active,
+      then waits for in-flight readers to drain before touching anything;
+    - readers arriving while a writer holds the gate fail fast with 409
+      instead of queueing (the UI blocks interaction during jobs anyway,
+      and an honest "busy" beats a silently torn answer).
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writing = False
+
+    @contextmanager
+    def read(self) -> "Iterator[None]":
+        with self._cond:
+            if self._writing:
+                raise HTTPException(
+                    status_code=409,
+                    detail="data is being modified — retry when the job finishes")
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if not self._readers:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def write(self, block: bool = False) -> "Iterator[None]":
+        with self._cond:
+            if self._writing and not block:
+                # HTTP mutators fail fast; JOBS pass block=True and queue
+                # behind a transient writer instead of erroring out
+                raise HTTPException(status_code=409,
+                                    detail="a job is already running")
+            while self._writing:
+                self._cond.wait()
+            self._writing = True
+            while self._readers:
+                self._cond.wait()
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writing = False
+                self._cond.notify_all()
+
+
+gate = DataGate()
+
+
+def read_guard():
+    """FastAPI dependency: hold the read side for the whole request."""
+    with gate.read():
+        yield
+
+
+def write_guard():
+    """FastAPI dependency: exclusive access for cache-mutating requests."""
+    with gate.write():
+        yield
 
 app = FastAPI(title="HSI Viewer backend")
 app.add_middleware(
@@ -177,11 +253,12 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                ds.run_pipeline(steps, progress=on_progress)
-                with self._lock:
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
-                    self.pipe_message = "done"
+                with gate.write(block=True):
+                    ds.run_pipeline(steps, progress=on_progress)
+                    with self._lock:
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
+                        self.pipe_message = "done"
             except Exception as exc:
                 logger.exception("pipeline job failed")
                 with self._lock:
@@ -211,15 +288,16 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                if steps:
-                    ds.reset_to_imported(lambda f, m: on_progress(0.35 * f, m))
-                    ds.run_pipeline(steps, lambda f, m: on_progress(0.35 + 0.65 * f, m))
-                else:
-                    ds.reset_to_imported(on_progress)
-                with self._lock:
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
-                    self.pipe_message = "done"
+                with gate.write(block=True):
+                    if steps:
+                        ds.reset_to_imported(lambda f, m: on_progress(0.35 * f, m))
+                        ds.run_pipeline(steps, lambda f, m: on_progress(0.35 + 0.65 * f, m))
+                    else:
+                        ds.reset_to_imported(on_progress)
+                    with self._lock:
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
+                        self.pipe_message = "done"
             except Exception as exc:
                 logger.exception("revert job failed")
                 with self._lock:
@@ -247,13 +325,14 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                res = ds.export_roi_cubes(folder, fmt, rois, progress=on_progress,
-                                          label_layers=label_layers, orient=orient)
-                with self._lock:
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
-                    self.pipe_message = (f"exported {res['count']} ROI cube(s) "
-                                         f"to {res['path']}")
+                with gate.read():
+                    res = ds.export_roi_cubes(folder, fmt, rois, progress=on_progress,
+                                              label_layers=label_layers, orient=orient)
+                    with self._lock:
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
+                        self.pipe_message = (f"exported {res['count']} ROI cube(s) "
+                                             f"to {res['path']}")
             except Exception as exc:
                 logger.exception("ROI cube export job failed")
                 with self._lock:
@@ -281,13 +360,14 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                res = ds.export_pixels(path, fmt, region_specs, label_layers,
-                                       progress=on_progress, orient=orient)
-                with self._lock:
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
-                    self.pipe_message = (f"exported {res['n_pixels']} pixels "
-                                         f"to {res['path']}")
+                with gate.read():
+                    res = ds.export_pixels(path, fmt, region_specs, label_layers,
+                                           progress=on_progress, orient=orient)
+                    with self._lock:
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
+                        self.pipe_message = (f"exported {res['n_pixels']} pixels "
+                                             f"to {res['path']}")
             except Exception as exc:
                 logger.exception("pixel export job failed")
                 with self._lock:
@@ -313,12 +393,13 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                res = ds.export_cache(path, fmt, ids, progress=on_progress)
-                with self._lock:
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
-                    self.pipe_message = (f"saved {res['count']} cache object(s) "
-                                         f"to {res['path']}")
+                with gate.read():
+                    res = ds.export_cache(path, fmt, ids, progress=on_progress)
+                    with self._lock:
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
+                        self.pipe_message = (f"saved {res['count']} cache object(s) "
+                                             f"to {res['path']}")
             except Exception as exc:
                 logger.exception("cache export job failed")
                 with self._lock:
@@ -345,11 +426,12 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                ds.export_data(path, fmt, node, progress=on_progress, created=created,
-                               orient=orient)
-                with self._lock:
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
+                with gate.read():
+                    ds.export_data(path, fmt, node, progress=on_progress, created=created,
+                                   orient=orient)
+                    with self._lock:
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
             except Exception as exc:
                 logger.exception("data export job failed")
                 with self._lock:
@@ -379,59 +461,60 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                base = entry.name.split("\u00b7 ")[-1].strip()
-                name = f"aligned {out_shape[1]}x{out_shape[0]} \u00b7 {base}"
-                if entry.itype == "hsi":
-                    ds = entry.dataset
-                    assert ds is not None
-                    arr = ds.resample_to_grid(matrix, out_shape, on_progress,
-                                              method=method)
-                    new_entry = images_mod.entry_from_array(
-                        entry.id, name, f"{ds.key_path}::baked{entry.id}", arr,
-                        ds.wavenumbers.copy() if ds.has_wavenumbers else None,
-                        lambda f, m: on_progress(0.85 + 0.15 * f, m),
-                        axis_kind=ds.axis_kind)
-                else:
-                    # flat images (rgb / scalar maps) warp channel by channel;
-                    # the entry keeps its own display type
-                    from scipy import ndimage
-
-                    from .dataset import _inverse_rc
-                    assert entry.array is not None
-                    src = entry.array
-                    mat_rc, off = _inverse_rc(matrix)
-                    oh, ow = int(out_shape[0]), int(out_shape[1])
-                    order = 1 if method == "bilinear" else 0
-                    f_r = float(np.hypot(mat_rc[0, 0], mat_rc[0, 1]))
-                    f_c = float(np.hypot(mat_rc[1, 0], mat_rc[1, 1]))
-                    sigmas = (max(0.0, (f_r - 1.0) / 2.0),
-                              max(0.0, (f_c - 1.0) / 2.0))
-                    pre = order == 1 and max(sigmas) > 1e-3
-
-                    def _warp(plane: "np.ndarray") -> "np.ndarray":
-                        if pre:
-                            plane = ndimage.gaussian_filter(plane, sigmas)
-                        return ndimage.affine_transform(
-                            plane, matrix=mat_rc, offset=off,
-                            output_shape=(oh, ow), order=order,
-                            mode="constant", cval=0.0)
-                    if src.ndim == 3:
-                        out = np.stack(
-                            [_warp(src[..., c].astype(np.float32))
-                             for c in range(src.shape[2])], axis=-1)
-                        if entry.itype == "rgb":
-                            out = np.clip(np.round(out), 0, 255).astype(np.uint8)
+                with gate.write(block=True):
+                    base = entry.name.split("\u00b7 ")[-1].strip()
+                    name = f"aligned {out_shape[1]}x{out_shape[0]} \u00b7 {base}"
+                    if entry.itype == "hsi":
+                        ds = entry.dataset
+                        assert ds is not None
+                        arr = ds.resample_to_grid(matrix, out_shape, on_progress,
+                                                  method=method)
+                        new_entry = images_mod.entry_from_array(
+                            entry.id, name, f"{ds.key_path}::baked{entry.id}", arr,
+                            ds.wavenumbers.copy() if ds.has_wavenumbers else None,
+                            lambda f, m: on_progress(0.85 + 0.15 * f, m),
+                            axis_kind=ds.axis_kind)
                     else:
-                        out = _warp(src.astype(np.float32))
-                    new_entry = images_mod.ImageEntry(
-                        entry.id, name, f"{entry.path}::baked{entry.id}",
-                        entry.itype, array=out, dtype_label=entry.dtype_label)
-                with self._lock:
-                    self.images[entry.id] = new_entry
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
-                    self.pipe_message = f'registration baked \u2192 "{name}"'
-                logger.info("bake replaced image %d: %s", entry.id, name)
+                        # flat images (rgb / scalar maps) warp channel by channel;
+                        # the entry keeps its own display type
+                        from scipy import ndimage
+
+                        from .dataset import _inverse_rc
+                        assert entry.array is not None
+                        src = entry.array
+                        mat_rc, off = _inverse_rc(matrix)
+                        oh, ow = int(out_shape[0]), int(out_shape[1])
+                        order = 1 if method == "bilinear" else 0
+                        f_r = float(np.hypot(mat_rc[0, 0], mat_rc[0, 1]))
+                        f_c = float(np.hypot(mat_rc[1, 0], mat_rc[1, 1]))
+                        sigmas = (max(0.0, (f_r - 1.0) / 2.0),
+                                  max(0.0, (f_c - 1.0) / 2.0))
+                        pre = order == 1 and max(sigmas) > 1e-3
+
+                        def _warp(plane: "np.ndarray") -> "np.ndarray":
+                            if pre:
+                                plane = ndimage.gaussian_filter(plane, sigmas)
+                            return ndimage.affine_transform(
+                                plane, matrix=mat_rc, offset=off,
+                                output_shape=(oh, ow), order=order,
+                                mode="constant", cval=0.0)
+                        if src.ndim == 3:
+                            out = np.stack(
+                                [_warp(src[..., c].astype(np.float32))
+                                 for c in range(src.shape[2])], axis=-1)
+                            if entry.itype == "rgb":
+                                out = np.clip(np.round(out), 0, 255).astype(np.uint8)
+                        else:
+                            out = _warp(src.astype(np.float32))
+                        new_entry = images_mod.ImageEntry(
+                            entry.id, name, f"{entry.path}::baked{entry.id}",
+                            entry.itype, array=out, dtype_label=entry.dtype_label)
+                    with self._lock:
+                        self.images[entry.id] = new_entry
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
+                        self.pipe_message = f'registration baked \u2192 "{name}"'
+                    logger.info("bake replaced image %d: %s", entry.id, name)
             except Exception as exc:
                 logger.exception("bake failed")
                 with self._lock:
@@ -461,21 +544,22 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                on_progress(0.05, "cropping live data")
-                arr = ds.crop_roi(parts, None)
-                base = entry.name.split("\u00b7 ")[-1].strip()
-                name = f"crop {arr.shape[1]}x{arr.shape[0]} \u00b7 {base}"
-                new_entry = images_mod.entry_from_array(
-                    entry.id, name, f"{ds.key_path}::icrop{entry.id}", arr,
-                    ds.wavenumbers.copy() if ds.has_wavenumbers else None,
-                    lambda f, m: on_progress(0.1 + 0.9 * f, m),
-                    axis_kind=ds.axis_kind)
-                with self._lock:
-                    self.images[entry.id] = new_entry
-                    self.pipe_state = "idle"
-                    self.pipe_progress = 1.0
-                    self.pipe_message = f'cropped in place \u2192 "{name}"'
-                logger.info("in-place crop replaced image %d: %s", entry.id, name)
+                with gate.write(block=True):
+                    on_progress(0.05, "cropping live data")
+                    arr = ds.crop_roi(parts, None)
+                    base = entry.name.split("\u00b7 ")[-1].strip()
+                    name = f"crop {arr.shape[1]}x{arr.shape[0]} \u00b7 {base}"
+                    new_entry = images_mod.entry_from_array(
+                        entry.id, name, f"{ds.key_path}::icrop{entry.id}", arr,
+                        ds.wavenumbers.copy() if ds.has_wavenumbers else None,
+                        lambda f, m: on_progress(0.1 + 0.9 * f, m),
+                        axis_kind=ds.axis_kind)
+                    with self._lock:
+                        self.images[entry.id] = new_entry
+                        self.pipe_state = "idle"
+                        self.pipe_progress = 1.0
+                        self.pipe_message = f'cropped in place \u2192 "{name}"'
+                    logger.info("in-place crop replaced image %d: %s", entry.id, name)
             except Exception as exc:
                 logger.exception("in-place crop failed")
                 with self._lock:
@@ -627,7 +711,7 @@ class RoiClipRequest(BaseModel):
     pf: int = 4
 
 
-@app.post("/api/layers/clip")
+@app.post("/api/layers/clip", dependencies=[Depends(read_guard)])
 def layers_clip(req: RoiClipRequest) -> Response:
     """Display-resolution RGBA fill of an ROI, clipped by the layer's mask."""
     ds = manager.dataset_by(req.img)
@@ -664,7 +748,7 @@ class IsolateComponentsRequest(BaseModel):
     square: bool = False   # force a common square frame per component
 
 
-@app.post("/api/cache/isolate")
+@app.post("/api/cache/isolate", dependencies=[Depends(read_guard)])
 def cache_isolate(req: IsolateComponentsRequest) -> dict:
     """Bounding boxes of a cached mask's biggest components, reading order."""
     ds = manager.require()
@@ -684,7 +768,7 @@ class PartsOutlineRequest(BaseModel):
     path: str | None = None
 
 
-@app.post("/api/layers/parts_outline")
+@app.post("/api/layers/parts_outline", dependencies=[Depends(read_guard)])
 def layers_parts_outline(req: PartsOutlineRequest) -> dict:
     """Outer silhouette of a multi-part ROI (union of its parts)."""
     ds = manager.require()
@@ -702,7 +786,7 @@ def layers_parts_outline(req: PartsOutlineRequest) -> dict:
 ANTS_VERTEX_BUDGET = 60_000
 
 
-@app.post("/api/layers/outline")
+@app.post("/api/layers/outline", dependencies=[Depends(read_guard)])
 def layers_outline(req: RoiOutlineRequest) -> dict:
     """Mask boundary polylines at native resolution (geometry is data).
 
@@ -737,7 +821,7 @@ class RegionPixelsRequest(BaseModel):
     path: str | None = None
 
 
-@app.post("/api/layers/region_pixels")
+@app.post("/api/layers/region_pixels", dependencies=[Depends(read_guard)])
 def layers_region_pixels(req: RegionPixelsRequest) -> dict:
     """Pixel count of (atoms' union ∩ the given mask) — 0 means the geometry
     lies entirely outside the layer's effective region."""
@@ -756,7 +840,7 @@ class CombineLayersRequest(BaseModel):
     label: str | None = None
 
 
-@app.post("/api/layers/combine")
+@app.post("/api/layers/combine", dependencies=[Depends(write_guard)])
 def layers_combine(req: CombineLayersRequest) -> dict:
     """Combine regions into a new cache mask object: union within each layer
     spec and union across specs (a single spec = within-layer combine)."""
@@ -780,7 +864,7 @@ class ImportFromImageRequest(BaseModel):
     matrix: list[float] | None = None
 
 
-@app.post("/api/cache/import_from_image")
+@app.post("/api/cache/import_from_image", dependencies=[Depends(write_guard)])
 def cache_import_from_image(req: ImportFromImageRequest) -> dict:
     """Copy (or warp, via a registration matrix) a mask object from another
     image's cache into the SELECTED image's cache."""
@@ -821,7 +905,7 @@ class ImportCacheFileRequest(BaseModel):
     path: str
 
 
-@app.post("/api/cache/import_file")
+@app.post("/api/cache/import_file", dependencies=[Depends(write_guard)])
 def cache_import_file(req: ImportCacheFileRequest) -> dict:
     """Load a cache bundle into the selected image's cache."""
     ds = manager.require()
@@ -857,7 +941,7 @@ def registration_bake(req: BakeRequest) -> dict:
     return {"state": "running"}
 
 
-@app.post("/api/cache/inspect_mask")
+@app.post("/api/cache/inspect_mask", dependencies=[Depends(read_guard)])
 def cache_inspect_mask(req: ImportMaskRequest) -> dict:
     """What a mask file holds and whether its shape fits the selected image."""
     ds = manager.require()
@@ -867,7 +951,7 @@ def cache_inspect_mask(req: ImportMaskRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/cache/import_mask")
+@app.post("/api/cache/import_mask", dependencies=[Depends(write_guard)])
 def cache_import_mask(req: ImportMaskRequest) -> dict:
     """Import an offline mask file as cache mask object(s)."""
     ds = manager.require()
@@ -884,7 +968,7 @@ class EditMaskRequest(BaseModel):
     label: str | None = None
 
 
-@app.post("/api/cache/edit_mask")
+@app.post("/api/cache/edit_mask", dependencies=[Depends(write_guard)])
 def cache_edit_mask(req: EditMaskRequest) -> dict:
     """Boolean-edit a cached mask with a region, into a NEW cache mask."""
     ds = manager.require()
@@ -905,7 +989,7 @@ class ExportLayersRequest(BaseModel):
 
 
 
-@app.post("/api/layers/export")
+@app.post("/api/layers/export", dependencies=[Depends(read_guard)])
 def layers_export(req: ExportLayersRequest) -> dict:
     """Export layer regions: integer label map (data) or exact-colour render."""
     if not req.layers:
@@ -995,7 +1079,7 @@ def images_crop_inplace(req: CropInplaceRequest) -> dict:
     return manager.pipeline_status()
 
 
-@app.post("/api/roi/spectrum")
+@app.post("/api/roi/spectrum", dependencies=[Depends(read_guard)])
 def roi_spectrum(req: RoiCropRequest) -> dict:
     """Mean spectrum over the valid pixels inside an ROI (live data)."""
     ds = manager.require()
@@ -1041,7 +1125,7 @@ class ExportSpectraRequest(BaseModel):
     rois: list[dict] = []
 
 
-@app.post("/api/export/canvas")
+@app.post("/api/export/canvas", dependencies=[Depends(read_guard)])
 def export_canvas(req: ExportCanvasRequest) -> dict:
     ds = manager.require()
     try:
@@ -1055,7 +1139,7 @@ def export_canvas(req: ExportCanvasRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/export/spectra")
+@app.post("/api/export/spectra", dependencies=[Depends(read_guard)])
 def export_spectra(req: ExportSpectraRequest) -> dict:
     ds = manager.require()
     rois = [
@@ -1185,7 +1269,7 @@ def _live_spec(kind: str, band: int | None, i0: int | None, i1: int | None,
     return {"kind": kind, "band": band, "i0": i0, "i1": i1, "obj": obj}
 
 
-@app.get("/api/live/stats")
+@app.get("/api/live/stats", dependencies=[Depends(read_guard)])
 def live_stats(
     kind: str,
     band: int | None = Query(default=None),
@@ -1201,7 +1285,7 @@ def live_stats(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/api/live/value")
+@app.get("/api/live/value", dependencies=[Depends(read_guard)])
 def live_value(
     kind: str,
     row: int = Query(ge=0),
@@ -1220,7 +1304,7 @@ def live_value(
     return {"value": v}
 
 
-@app.get("/api/preview/threshold")
+@app.get("/api/preview/threshold", dependencies=[Depends(read_guard)])
 def get_preview_threshold(
     kind: str,
     thr: float,
@@ -1287,13 +1371,13 @@ class CleanMaskRequest(BaseModel):
     proportion: float = 0.95
 
 
-@app.get("/api/cache/list")
+@app.get("/api/cache/list", dependencies=[Depends(read_guard)])
 def cache_list(img: int | None = None) -> dict:
     """Cache objects of the selected image, or of `img` when given."""
     return {"objects": manager.dataset_by(img).cache_list()}
 
 
-@app.post("/api/cache/peak")
+@app.post("/api/cache/peak", dependencies=[Depends(write_guard)])
 def cache_peak(req: CachePeakRequest) -> dict:
     ds = manager.require()
     if not 0 <= req.band < ds.bands:
@@ -1301,7 +1385,7 @@ def cache_peak(req: CachePeakRequest) -> dict:
     return ds.cache_add_peak(req.band)
 
 
-@app.post("/api/cache/area")
+@app.post("/api/cache/area", dependencies=[Depends(write_guard)])
 def cache_area(req: CacheAreaRequest) -> dict:
     ds = manager.require()
     if not (0 <= req.i0 < ds.bands and 0 <= req.i1 < ds.bands):
@@ -1309,7 +1393,7 @@ def cache_area(req: CacheAreaRequest) -> dict:
     return ds.cache_add_area(req.i0, req.i1)
 
 
-@app.post("/api/cache/ratio")
+@app.post("/api/cache/ratio", dependencies=[Depends(write_guard)])
 def cache_ratio(req: CacheRatioRequest) -> dict:
     try:
         return manager.require().cache_ratio(req.a, req.b)
@@ -1319,7 +1403,7 @@ def cache_ratio(req: CacheRatioRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/cache/rgb")
+@app.post("/api/cache/rgb", dependencies=[Depends(write_guard)])
 def cache_rgb(req: CacheRgbRequest) -> dict:
     try:
         return manager.require().cache_rgb(req.r, req.g, req.b)
@@ -1329,7 +1413,7 @@ def cache_rgb(req: CacheRgbRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/cache/mask")
+@app.post("/api/cache/mask", dependencies=[Depends(write_guard)])
 def cache_mask(req: CacheMaskRequest) -> dict:
     try:
         spec = _live_spec(req.kind, req.band, req.i0, req.i1, req.obj)
@@ -1340,7 +1424,7 @@ def cache_mask(req: CacheMaskRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/cache/apply_mask")
+@app.post("/api/cache/apply_mask", dependencies=[Depends(write_guard)])
 def cache_apply_mask(req: ApplyMaskRequest) -> dict:
     try:
         created = manager.require().cache_apply_mask(req.masks, req.targets)
@@ -1351,7 +1435,7 @@ def cache_apply_mask(req: ApplyMaskRequest) -> dict:
     return {"created": created}
 
 
-@app.get("/api/preview/mask_clean")
+@app.get("/api/preview/mask_clean", dependencies=[Depends(read_guard)])
 def get_preview_mask_clean(
     id: int = Query(ge=1),
     min_size: int = Query(default=500, ge=0),
@@ -1368,7 +1452,7 @@ def get_preview_mask_clean(
                     headers={"Cache-Control": "max-age=3600"})
 
 
-@app.post("/api/cache/clean_mask")
+@app.post("/api/cache/clean_mask", dependencies=[Depends(write_guard)])
 def cache_clean_mask(req: CleanMaskRequest) -> dict:
     try:
         return manager.require().cache_clean_mask(req.id, req.min_size,
@@ -1379,7 +1463,7 @@ def cache_clean_mask(req: CleanMaskRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.delete("/api/cache/{obj_id}")
+@app.delete("/api/cache/{obj_id}", dependencies=[Depends(write_guard)])
 def cache_delete(obj_id: int) -> dict:
     try:
         manager.require().cache_delete(obj_id)
@@ -1388,7 +1472,7 @@ def cache_delete(obj_id: int) -> dict:
     return {"ok": True}
 
 
-@app.get("/api/preview/cache/{obj_id}")
+@app.get("/api/preview/cache/{obj_id}", dependencies=[Depends(read_guard)])
 def get_preview_cache(
     obj_id: int,
     plo: float = Query(default=2.0),
@@ -1464,7 +1548,7 @@ def clear_images() -> dict:
     return manager.list_images()
 
 
-@app.get("/api/preview/image")
+@app.get("/api/preview/image", dependencies=[Depends(read_guard)])
 def get_preview_flat(
     plo: float = Query(default=2.0),
     phi: float = Query(default=98.0),
@@ -1482,7 +1566,7 @@ def get_preview_flat(
                     headers={"Cache-Control": "max-age=3600"})
 
 
-@app.get("/api/spectrum/avg")
+@app.get("/api/spectrum/avg", dependencies=[Depends(read_guard)])
 def get_avg_spectrum() -> dict:
     ds = manager.require()
     assert ds.avg_spectrum is not None
@@ -1501,7 +1585,7 @@ def _display_factor(pf: int) -> int:
     return pf
 
 
-@app.get("/api/preview/integral")
+@app.get("/api/preview/integral", dependencies=[Depends(read_guard)])
 def get_preview_integral(
     i0: int = Query(ge=0),
     i1: int = Query(ge=0),
@@ -1521,7 +1605,7 @@ def get_preview_integral(
                     headers={"Cache-Control": "max-age=3600"})
 
 
-@app.get("/api/preview/sum")
+@app.get("/api/preview/sum", dependencies=[Depends(read_guard)])
 def get_preview_sum(
     plo: float = Query(default=2.0),
     phi: float = Query(default=98.0),
@@ -1536,7 +1620,7 @@ def get_preview_sum(
                     headers={"Cache-Control": "max-age=3600"})
 
 
-@app.get("/api/preview/{band}")
+@app.get("/api/preview/{band}", dependencies=[Depends(read_guard)])
 def get_preview(
     band: int,
     plo: float = Query(default=2.0),
@@ -1555,7 +1639,7 @@ def get_preview(
                     headers={"Cache-Control": "max-age=3600"})
 
 
-@app.get("/api/spectrum")
+@app.get("/api/spectrum", dependencies=[Depends(read_guard)])
 def get_spectrum(row: int = Query(ge=0), col: int = Query(ge=0)) -> dict:
     ds = manager.require()
     if row >= ds.height or col >= ds.width:

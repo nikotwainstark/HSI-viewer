@@ -600,11 +600,26 @@ class HSIDataset:
 
     def _load_full(self, progress: Callable[[float], None]) -> None:
         """Read the whole cube from zarr into RAM, band-first, computing the
-        valid-pixel mask and band-mean image in the same pass."""
+        valid-pixel mask and band-mean image in the same pass.
+
+        Everything is built into LOCAL arrays and published in one assignment
+        block at the very end: a failure mid-read (moved/corrupt store) must
+        never leave `self.full` pointing at half-filled np.empty garbage —
+        the previous state stays intact and the error propagates honestly.
+        """
         t0 = time.perf_counter()
-        self.full = np.empty((self.bands, self.height, self.width), dtype=np.float32)
-        self.full_valid = np.zeros((self.height, self.width), dtype=bool)
-        self.full_sum = np.zeros((self.height, self.width), dtype=np.float32)
+        # zarr does NOT raise on a missing store — absent chunks silently
+        # read as the fill value, which would fabricate an all-zero cube and
+        # publish it as real data. Verify the backing store still exists
+        # before trusting any read (memory-backed cubes have no root).
+        store_root = getattr(getattr(self.cube, "store", None), "root", None)
+        if store_root is not None and not Path(store_root).exists():
+            raise ValueError(
+                f"the dataset's zarr store is gone: {store_root} — "
+                "the on-disk source was moved or deleted")
+        full = np.empty((self.bands, self.height, self.width), dtype=np.float32)
+        full_valid = np.zeros((self.height, self.width), dtype=bool)
+        full_sum = np.zeros((self.height, self.width), dtype=np.float32)
         if self.axes_order == "chw":
             # channel-first source is already our in-memory layout: read one
             # channel at a time (matches per-channel chunking of OME stores)
@@ -612,33 +627,36 @@ class HSIDataset:
                     if self._band_keep is not None else list(range(self.bands)))
             for out_i, src_i in enumerate(idxs):
                 block = np.asarray(self.cube[src_i], dtype=np.float32)
-                self.full[out_i] = block
-                self.full_valid |= np.isfinite(block) & (block != 0)
-                self.full_sum += block
+                full[out_i] = block
+                full_valid |= np.isfinite(block) & (block != 0)
+                full_sum += block
                 progress((out_i + 1) / len(idxs))
-            self.full_sum /= max(len(idxs), 1)
-            logger.info("full cube loaded (chw) in %.1fs (%.1f GB)",
-                        time.perf_counter() - t0, self.full.nbytes / 1e9)
-            return
-        ch, cw = self.cube.chunks[0], self.cube.chunks[1]
-        jobs = [(r, c) for r in range(0, self.height, ch) for c in range(0, self.width, cw)]
+            full_sum /= max(len(idxs), 1)
+        else:
+            ch, cw = self.cube.chunks[0], self.cube.chunks[1]
+            jobs = [(r, c) for r in range(0, self.height, ch)
+                    for c in range(0, self.width, cw)]
 
-        def read_one(rc: tuple[int, int]) -> None:
-            r, c = rc
-            block = np.asarray(self.cube[r : r + ch, c : c + cw, :], dtype=np.float32)
-            if self._band_keep is not None:
-                block = block[:, :, self._band_keep]
-            h, w = block.shape[:2]
-            self.full[:, r : r + h, c : c + w] = block.transpose(2, 0, 1)
-            self.full_valid[r : r + h, c : c + w] = \
-                np.any(np.isfinite(block) & (block != 0), axis=2)
-            self.full_sum[r : r + h, c : c + w] = np.mean(block, axis=2)
+            def read_one(rc: tuple[int, int]) -> None:
+                r, c = rc
+                block = np.asarray(self.cube[r : r + ch, c : c + cw, :], dtype=np.float32)
+                if self._band_keep is not None:
+                    block = block[:, :, self._band_keep]
+                h, w = block.shape[:2]
+                full[:, r : r + h, c : c + w] = block.transpose(2, 0, 1)
+                full_valid[r : r + h, c : c + w] = \
+                    np.any(np.isfinite(block) & (block != 0), axis=2)
+                full_sum[r : r + h, c : c + w] = np.mean(block, axis=2)
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for i, _ in enumerate(pool.map(read_one, jobs), 1):
-                progress(i / len(jobs))
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                for i, _ in enumerate(pool.map(read_one, jobs), 1):
+                    progress(i / len(jobs))
+        # atomic publish: only a fully-read cube ever becomes visible
+        self.full = full
+        self.full_valid = full_valid
+        self.full_sum = full_sum
         logger.info("full cube loaded in %.1fs (%.1f GB)",
-                    time.perf_counter() - t0, self.full.nbytes / 1e9)
+                    time.perf_counter() - t0, full.nbytes / 1e9)
 
     def _compute_full_stats(self) -> None:
         """Mean spectrum over valid pixels, from the full-resolution data."""
@@ -969,48 +987,61 @@ class HSIDataset:
         assert self.full is not None and self.full_valid is not None
         n = len(steps)
         span = 0.8 / max(n, 1)
-        for idx, step in enumerate(steps):
-            base = idx * span
+        mutated = False
+        try:
+            for idx, step in enumerate(steps):
+                base = idx * span
 
-            def cb(f: float, msg: str, _base=base) -> None:
-                progress(_base + f * span, msg)
+                def cb(f: float, msg: str, _base=base) -> None:
+                    progress(_base + f * span, msg)
 
-            t = step["type"]
-            if t == "snv":
-                self._apply_snv(cb)
-                self.applied_steps.append("SNV")
-            elif t == "mask":
-                m = self._resolve_step_mask(step)
-                cb(0.2, "applying mask")
-                self._apply_valid_update(self.full_valid & m)
-                self.applied_steps.append("binary mask")
-            elif t == "sg":
-                w = int(step.get("window_length", 9))
-                p = int(step.get("poly_order", 3))
-                d = int(step.get("deriv", 2))
-                self._apply_sg(w, p, d, cb)
-                self.applied_steps.append(f"SG (w{w} p{p} d{d})")
-            elif t == "keep_range":
-                lo, hi = float(step["lower"]), float(step["upper"])
-                self._apply_range(lo, hi, keep=True, progress=cb)
-                self.applied_steps.append(
-                    f"keep {self._fmt_val(min(lo, hi))}-{self._fmt_val(max(lo, hi))}")
-            elif t == "remove_range":
-                lo, hi = float(step["lower"]), float(step["upper"])
-                self._apply_range(lo, hi, keep=False, progress=cb)
-                self.applied_steps.append(
-                    f"remove {self._fmt_val(min(lo, hi))}-{self._fmt_val(max(lo, hi))}")
-            elif t == "min2zero":
-                self._apply_min2zero(cb)
-                self.applied_steps.append("min2zero")
-            elif t == "vector_norm":
-                self._apply_vector_norm(cb)
-                self.applied_steps.append("vector norm")
-            else:
-                raise ValueError(f"unknown step type {t!r}")
-
-        self._refresh_after_pipeline(
-            lambda f, msg: progress(0.8 + 0.2 * f, msg))
+                t = step["type"]
+                # set BEFORE dispatch: a step failing halfway has already
+                # mutated the cube — over-refreshing is harmless, missing the
+                # refresh is a lie
+                mutated = True
+                if t == "snv":
+                    self._apply_snv(cb)
+                    self.applied_steps.append("SNV")
+                elif t == "mask":
+                    m = self._resolve_step_mask(step)
+                    cb(0.2, "applying mask")
+                    self._apply_valid_update(self.full_valid & m)
+                    self.applied_steps.append("binary mask")
+                elif t == "sg":
+                    w = int(step.get("window_length", 9))
+                    p = int(step.get("poly_order", 3))
+                    d = int(step.get("deriv", 2))
+                    self._apply_sg(w, p, d, cb)
+                    self.applied_steps.append(f"SG (w{w} p{p} d{d})")
+                elif t == "keep_range":
+                    lo, hi = float(step["lower"]), float(step["upper"])
+                    self._apply_range(lo, hi, keep=True, progress=cb)
+                    self.applied_steps.append(
+                        f"keep {self._fmt_val(min(lo, hi))}-{self._fmt_val(max(lo, hi))}")
+                elif t == "remove_range":
+                    lo, hi = float(step["lower"]), float(step["upper"])
+                    self._apply_range(lo, hi, keep=False, progress=cb)
+                    self.applied_steps.append(
+                        f"remove {self._fmt_val(min(lo, hi))}-{self._fmt_val(max(lo, hi))}")
+                elif t == "min2zero":
+                    self._apply_min2zero(cb)
+                    self.applied_steps.append("min2zero")
+                elif t == "vector_norm":
+                    self._apply_vector_norm(cb)
+                    self.applied_steps.append("vector norm")
+                else:
+                    raise ValueError(f"unknown step type {t!r}")
+        finally:
+            # HONESTY OVER TIDINESS: a failing step may already have mutated
+            # the live cube (e.g. SNV succeeded, SG then rejected its window).
+            # The derived state — band mean, statistics and above all the
+            # pipeline_version cache-buster — must follow the data even on
+            # failure, or every client keeps serving cached frames of a state
+            # that no longer exists.
+            if mutated:
+                self._refresh_after_pipeline(
+                    lambda f, msg: progress(0.8 + 0.2 * f, msg))
 
     def _apply_snv(self, progress: ProgressFn) -> None:
         """Per-pixel SNV: (x - mean(x)) / std(x) along the spectral axis,
@@ -1873,19 +1904,13 @@ class HSIDataset:
             rgb = ((n >> 16) & 255, (n >> 8) & 255, n & 255)
             atoms = lay.get("atoms") or []
             bound = bool(lay.get("cache_ids") or lay.get("path"))
+            # the SAME analytic rasterizer as every computation and the
+            # canvas: brush strokes bake, erase parts punch holes — a PIL
+            # rect/polygon redraw here used to drop brushes entirely and
+            # painted erases as positive fill (a lying export)
             vec_fill = np.zeros((self.height, self.width), dtype=bool)
             if atoms:
-                canvas = Image.new("L", (self.width, self.height), 0)
-                d = ImageDraw.Draw(canvas)
-                for a in atoms:
-                    pts = [(float(x), float(y)) for x, y in a["points"]]
-                    if a["shape"] == "rect" and len(pts) == 2:
-                        (x0, y0), (x1, y1) = pts
-                        d.rectangle([min(x0, x1), min(y0, y1),
-                                     max(x0, x1), max(y0, y1)], fill=255)
-                    elif a["shape"] == "polygon" and len(pts) >= 3:
-                        d.polygon(pts, fill=255)
-                vec_fill = np.asarray(canvas) > 0
+                vec_fill, _ = self._rasterize_parts(atoms, self.height, self.width)
                 if bound:
                     vec_fill &= self._resolve_step_mask(
                         {"cache_ids": lay.get("cache_ids"), "path": lay.get("path")})
@@ -1898,14 +1923,13 @@ class HSIDataset:
             over[mask_fill] = [*rgb, 89]
             layer_img = Image.fromarray(over, mode="RGBA")
             od = ImageDraw.Draw(layer_img)
-            for a in atoms:
-                pts = [(float(x), float(y)) for x, y in a["points"]]
-                if a["shape"] == "rect" and len(pts) == 2:
-                    (x0, y0), (x1, y1) = pts
-                    od.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)],
-                                 outline=(*rgb, 230), width=lw)
-                elif a["shape"] == "polygon" and len(pts) >= 3:
-                    od.polygon(pts, outline=(*rgb, 230), width=lw)
+            # outlines walk the region's PIXEL EDGES, like the canvas
+            for region in (vec_fill, mask_fill):
+                if not region.any():
+                    continue
+                for loop in trace_pixel_edges(region):
+                    od.line([(x, y) for x, y in loop], fill=(*rgb, 230), width=lw,
+                            joint="curve")
             base = Image.alpha_composite(base, layer_img)
         return base
 
@@ -2457,22 +2481,33 @@ class HSIDataset:
         """Reload the in-memory cube from the stored zarr pointer, reverting
         every pipeline step (including spectral-axis changes). The disk store
         was never modified, so this restores the exact imported state."""
+        # FAILURE SAFETY: the disk read happens FIRST, against a snapshot of
+        # the imported dimensions, and only a successful read commits any
+        # state. If the zarr store has been moved or corrupted, the live data
+        # (and cache) stay exactly as they were and the error surfaces.
+        saved = (self.bands, self.wavenumbers, self.height, self.width)
         self.bands = self._imported_bands
         self.wavenumbers = self._wn_imported.copy()
-        # spatial crops are recipe steps too: restore the imported frame size.
-        # Fresh-image semantics: cache objects born in a DIFFERENT frame die
-        # with it (their shapes no longer match the restored frame).
         if self.axes_order == "chw":
             self.height, self.width = self.cube.shape[1], self.cube.shape[2]
         else:
             self.height, self.width = self.cube.shape[0], self.cube.shape[1]
+        try:
+            # _load_full publishes atomically at its end: self.full only ever
+            # points at a completely-read cube
+            self._load_full(lambda f: progress(0.85 * f, "reloading from zarr"))
+        except Exception:
+            self.bands, self.wavenumbers, self.height, self.width = saved
+            raise
+        # spatial crops are recipe steps too: restore the imported frame size.
+        # Fresh-image semantics: cache objects born in a DIFFERENT frame die
+        # with it (their shapes no longer match the restored frame).
         kept = [o for o in self.cache_objects
                 if o["image"].shape[-2:] == (self.height, self.width)]
         if len(kept) != len(self.cache_objects):
             logger.info("reset dropped %d cache object(s) from another frame",
                         len(self.cache_objects) - len(kept))
         self.cache_objects = kept
-        self._load_full(lambda f: progress(0.85 * f, "reloading from zarr"))
         progress(0.88, "computing statistics")
         self._compute_full_stats()
         self.applied_steps = []

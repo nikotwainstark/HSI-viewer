@@ -1118,14 +1118,18 @@ export default function App() {
       // landmark pairing is EXPLICIT on both sides: one chosen layer each,
       // pairs matched by placement order within that layer (no cross-layer
       // pooling — that would make the pairing order arbitrary)
+      // hidden landmarks are EXCLUDED — the canvas numbers only visible
+      // ones, and the pairing must match what the user can verify on screen
       const movingLayer = layers.find((l) => l.id === opts.movingLayerId)
       const p = (movingLayer?.atoms ?? [])
-        .filter((a): a is Extract<Atom, { kind: 'landmark' }> => a.kind === 'landmark')
+        .filter((a): a is Extract<Atom, { kind: 'landmark' }> =>
+          a.kind === 'landmark' && a.visible !== false)
         .map((a) => a.point)
       const tb = imageBundles.current.get(targetId)
       const targetLayer = (tb?.layers ?? []).find((l) => l.id === opts.targetLayerId)
       const q = (targetLayer?.atoms ?? [])
-        .filter((a): a is Extract<Atom, { kind: 'landmark' }> => a.kind === 'landmark')
+        .filter((a): a is Extract<Atom, { kind: 'landmark' }> =>
+          a.kind === 'landmark' && a.visible !== false)
         .map((a) => a.point)
       const savedMoving = layouts[meta.image.id] ?? DEFAULT_LAYOUT
       const savedTarget = layouts[targetId] ?? DEFAULT_LAYOUT
@@ -1443,6 +1447,14 @@ export default function App() {
       }
       setRoiDraft([])
       setPanelSel({ layers: [], atoms: { layerId: -1, ids: [] } })
+      // editors holding OTHER-image state must not survive a switch: a
+      // lingering isolate preview would stamp the previous image's component
+      // boxes here, a pending affine ghost would commit the wrong layout
+      setIsolate(null)
+      setAffinePreview(null)
+      setNoteEdit(null)
+      finishBrushAtom()
+      setErasing(false)
       setAvgSpec(null)
       refreshCache()
       setThreshold(null)
@@ -1464,7 +1476,7 @@ export default function App() {
         setPanelTab((t) => (t === 'layers' ? t : 'image'))
       }
     },
-    [refreshCache, animateTargetTo],
+    [refreshCache, animateTargetTo, finishBrushAtom],
   )
 
   const snapshotBundle = useCallback(
@@ -1965,7 +1977,7 @@ export default function App() {
       })
         .then((blob) => createImageBitmap(blob))
         .then((bm) => setClipBitmaps((m) => new Map(m).set(key, bm)))
-        .catch(() => {/* display only */})
+        .catch((e) => setToast(`Layer "${layer.name}" failed to render: ${(e as Error).message}`))
         .finally(() => clipPending.current.delete(key))
     }
   }, [layers, meta, layerRasterFactorFor, clipBitmaps, layerClipKey])
@@ -4055,6 +4067,18 @@ export default function App() {
           if (m) {
             imageBundles.current.delete(m.image.id) // frame-bound state is void
             history.clear(m.image.id) // the id is reused, the frame is not
+            // registrations touching this image describe the OLD grid
+            setRegistrations((rs) => {
+              const dropped = rs.filter(
+                (r) => r.movingId === m.image.id || r.targetId === m.image.id,
+              ).length
+              if (dropped) {
+                setToast(`${dropped} registration(s) touching this image were invalidated by the crop`)
+              }
+              return rs.filter(
+                (r) => r.movingId !== m.image.id && r.targetId !== m.image.id,
+              )
+            })
             applySelectedMeta(m)
           }
           setToast(st.message || 'Cropped in place')
@@ -4096,11 +4120,20 @@ export default function App() {
               },
             }
           })
-          setRegistrations((rs) =>
-            rs.filter(
-              (r) => !(r.movingId === rec.movingId && r.targetId === rec.targetId),
-            ),
-          )
+          // the moving image's GRID just changed: every record touching it
+          // (either role) now describes pixels that no longer exist — a
+          // stale matrix silently applied later would corrupt data
+          setRegistrations((rs) => {
+            const dropped = rs.filter(
+              (r) => r.movingId === rec.movingId || r.targetId === rec.movingId,
+            ).length
+            if (dropped > 1) {
+              setToast(`${dropped - 1} other registration(s) touching this image were invalidated by the bake`)
+            }
+            return rs.filter(
+              (r) => r.movingId !== rec.movingId && r.targetId !== rec.movingId,
+            )
+          })
           const m = await fetchMeta()
           if (m) applySelectedMeta(m)
           setToast(st.message || 'Registration baked into data')
@@ -5952,7 +5985,9 @@ export default function App() {
           ls
             .map((l) => ({
               layer: l,
-              n: l.atoms.filter((a) => a.kind === 'landmark').length,
+              n: l.atoms.filter(
+                (a) => a.kind === 'landmark' && a.visible !== false,
+              ).length,
             }))
             .filter((e) => e.n > 0)
         const movingSide = landmarksOf(
@@ -6415,9 +6450,21 @@ export default function App() {
           pickKinds={['file', 'zarr-array']}
           onOpen={(path) => {
             const base = path.split('/').pop() ?? path
-            createLayer({ kind: 'local', path, label: base })
+            // the mask is DATA for this layer: validate the grid before the
+            // layer exists, instead of a silently-empty layer later
+            void inspectMaskFile(path)
+              .then((info) => {
+                if (!info.matches) {
+                  setToast(
+                    `Loading failed, the imported file has [${info.shape[0]},${info.shape[1]}], ` +
+                    `but the canvas is [${info.expected[0]},${info.expected[1]}]`)
+                  return
+                }
+                createLayer({ kind: 'local', path, label: base })
+                setPanelTab('layers')
+              })
+              .catch((e) => setToast((e as Error).message))
             setLayerMaskFile(false)
-            setPanelTab('layers')
           }}
           onClose={() => setLayerMaskFile(false)}
         />
@@ -6541,12 +6588,16 @@ export default function App() {
                       label: 'Label map (mask)',
                       hint: 'uint16 map + legend · one int per layer',
                       formats: ['zarr', 'npz'],
+                      disabled: exportState.atomId != null
+                        ? 'atom scope — use pixels' : null,
                     },
                     {
                       id: 'figure',
                       label: 'Figure',
                       hint: 'exact layer colours on black',
                       formats: ['png', 'tiff'],
+                      disabled: exportState.atomId != null
+                        ? 'atom scope — use pixels' : null,
                     },
                   ]
                 : undefined
