@@ -1389,6 +1389,92 @@ class HSIDataset:
         return self._cache_append("mask", name, "imp", out.astype(np.float32),
                                   source=source_label)
 
+    def export_cache(self, path: str, fmt: str, obj_ids: list[int],
+                     progress: ProgressFn) -> dict:
+        """Save cache objects into ONE bundle file (zarr group / npz), so a
+        session's derived maps survive a restart and travel with the data.
+        Arrays are written as-is (full resolution); kind/name/source and the
+        source grid go into the metadata for validation on import."""
+        if fmt not in ("zarr", "npz"):
+            raise ValueError("cache export supports zarr or npz")
+        from datetime import datetime, timezone
+
+        objs = [self._cache_get(i) for i in obj_ids]
+        if not objs:
+            raise ValueError("no cache objects selected")
+        meta = {
+            "app": "Hyperspectral Cube Viewer",
+            "kind": "cache",
+            "dataset": self.name,
+            "state": self.data_label,
+            "shape": [self.height, self.width],
+            "objects": [
+                {"kind": o["kind"], "name": o["name"], "short": o["short"],
+                 "source": o["source"]}
+                for o in objs
+            ],
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        p_out = self._prepare_export_path(path, fmt)
+        n = len(objs)
+        if fmt == "zarr":
+            g = zarr.open_group(str(p_out), mode="w")
+            for i, o in enumerate(objs):
+                progress(i / n, f"writing {o['name']}")
+                arr = np.asarray(o["image"], dtype=np.float32)
+                za = g.create_array(f"obj_{i}", shape=arr.shape, dtype="float32")
+                za[:] = arr
+            g.attrs.update(meta)
+        else:
+            progress(0.1, f"compressing {n} object(s)")
+            np.savez_compressed(
+                p_out, cache_metadata=json.dumps(meta),
+                **{f"obj_{i}": np.asarray(o["image"], dtype=np.float32)
+                   for i, o in enumerate(objs)})
+        progress(1.0, f"saved {n} cache object(s)")
+        logger.info("cache exported -> %s (%d objects)", p_out, n)
+        return {"path": str(p_out), "count": n}
+
+    def import_cache_file(self, path: str) -> list[dict]:
+        """Load a cache bundle back into this image's cache. The grid must
+        match exactly (cache maps mean "these pixels"). Raises ValueError with
+        a routing hint when the file is not a cache bundle, so the caller can
+        fall back to the plain-mask import."""
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise ValueError(f"path does not exist: {path}")
+        meta: dict | None = None
+        arrays: list[np.ndarray] = []
+        if zarr_node_kind(p) == "group":
+            g = zarr.open_group(str(p), mode="r")
+            attrs = dict(g.attrs)
+            if attrs.get("kind") == "cache":
+                meta = attrs
+                arrays = [np.asarray(g[f"obj_{i}"][:])
+                          for i in range(len(attrs.get("objects", [])))]
+        elif p.suffix.lower() == ".npz":
+            z = np.load(p, allow_pickle=True)
+            if "cache_metadata" in z:
+                meta = json.loads(str(z["cache_metadata"]))
+                arrays = [np.asarray(z[f"obj_{i}"])
+                          for i in range(len(meta.get("objects", [])))]
+        if meta is None:
+            raise ValueError("not a cache bundle")
+        h, w = (int(v) for v in meta.get("shape", [0, 0]))
+        if (h, w) != (self.height, self.width):
+            raise ValueError(
+                f"Loading failed, the imported file has [{h},{w}], "
+                f"but the canvas is [{self.height},{self.width}]")
+        base = p.name
+        out = []
+        for spec, arr in zip(meta["objects"], arrays):
+            out.append(self._cache_append(
+                str(spec.get("kind", "peak")), str(spec.get("name", "imported")),
+                str(spec.get("short", "imp")), arr.astype(np.float32),
+                source=f"imported · {base}"))
+        logger.info("cache imported <- %s (%d objects)", p, len(out))
+        return out
+
     def inspect_mask_file(self, path: str) -> dict:
         """What a mask file holds, and whether it fits this image — reported
         BEFORE importing so a mismatch is explained rather than just refused."""

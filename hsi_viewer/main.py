@@ -294,6 +294,37 @@ class DatasetManager:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def export_cache_async(self, path: str, fmt: str, ids: list[int]) -> None:
+        """Cache bundle written to `path` (job — objects can be GBs)."""
+        ds = self.require()
+        with self._lock:
+            if self.pipe_state == "running":
+                raise HTTPException(status_code=409, detail="a pipeline job is already running")
+            self.pipe_state = "running"
+            self.pipe_progress = 0.0
+            self.pipe_message = "starting"
+            self.pipe_error = None
+
+        def work() -> None:
+            def on_progress(frac: float, msg: str) -> None:
+                self.pipe_progress = frac
+                self.pipe_message = msg
+
+            try:
+                res = ds.export_cache(path, fmt, ids, progress=on_progress)
+                with self._lock:
+                    self.pipe_state = "idle"
+                    self.pipe_progress = 1.0
+                    self.pipe_message = (f"saved {res['count']} cache object(s) "
+                                         f"to {res['path']}")
+            except Exception as exc:
+                logger.exception("cache export job failed")
+                with self._lock:
+                    self.pipe_state = "error"
+                    self.pipe_error = str(exc)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def export_data_async(self, path: str, fmt: str, node: str,
                           created: str | None = None) -> None:
         ds = self.require()
@@ -753,6 +784,35 @@ def cache_import_from_image(req: ImportFromImageRequest) -> dict:
     try:
         return dest.import_mask_array(
             obj["image"], req.name or obj["name"], label, req.matrix)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ExportCacheRequest(BaseModel):
+    path: str
+    format: str  # zarr | npz
+    ids: list[int]
+
+
+@app.post("/api/cache/export")
+def cache_export(req: ExportCacheRequest) -> dict:
+    """Save cache objects into one bundle file (job)."""
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="no cache objects selected")
+    manager.export_cache_async(req.path, req.format, req.ids)
+    return manager.pipeline_status()
+
+
+class ImportCacheFileRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/cache/import_file")
+def cache_import_file(req: ImportCacheFileRequest) -> dict:
+    """Load a cache bundle into the selected image's cache."""
+    ds = manager.require()
+    try:
+        return {"objects": ds.import_cache_file(req.path)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

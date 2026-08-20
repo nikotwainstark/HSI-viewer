@@ -14,8 +14,10 @@ interface Props {
   onApplyMask: (maskIds: number[], targetIds: number[]) => void
   onCleanBlobs: (obj: CacheObject) => void
   onIsolate: (obj: CacheObject) => void
-  /** import an offline mask file as a cache object */
+  /** import a cache bundle or an offline mask file */
   onImportMask: () => void
+  /** save the selected cache objects into one bundle file */
+  onSaveToFile: (ids: number[]) => void
   /** bring a mask over from another image's cache (null = no other images) */
   onImportFromImage: (() => void) | null
   /** boolean-edit this mask with a ROI region (null = no regions to offer) */
@@ -33,7 +35,7 @@ const KIND_BADGE: Record<CacheObject['kind'], string> = {
 export function CachePanel({
   objects, selected, onSelectedChange, displayedId,
   onDisplay, onDelete, onRatio, onRgb, onApplyMask, onCleanBlobs, onIsolate, onEditWithRoi,
-  onImportMask, onImportFromImage,
+  onImportMask, onImportFromImage, onSaveToFile,
 }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; obj: CacheObject; sel: number[] } | null>(null)
   const anchorId = useRef<number | null>(null)
@@ -135,6 +137,11 @@ export function CachePanel({
     }
     items.push({ divider: true })
     items.push({
+      label: sel.length > 1 ? `Save ${sel.length} objects to file…` : 'Save to file…',
+      hint: 'cache bundle · zarr / npz',
+      onClick: () => onSaveToFile(sel),
+    })
+    items.push({
       label: sel.length > 1 ? `Delete ${sel.length} objects` : 'Delete',
       onClick: () => onDelete(sel),
     })
@@ -147,11 +154,11 @@ export function CachePanel({
         className="flex flex-1 items-center justify-center gap-2 rounded-lg border-2 border-dashed
                    border-white/20 bg-[#0a0e14]/90 px-3 py-2 opacity-60 backdrop-blur-sm
                    transition-all hover:border-violet-400/50 hover:opacity-100"
-        title="a full-resolution mask prepared elsewhere — the shape must match this image"
+        title="a saved cache bundle, or a full-resolution mask — the grid must match this image"
         onClick={onImportMask}
       >
         <span className="text-[15px] leading-none text-slate-400">＋</span>
-        <span className="text-[12px] text-slate-300">mask from file…</span>
+        <span className="text-[12px] text-slate-300">cache from file…</span>
       </button>
       {onImportFromImage && (
         <button

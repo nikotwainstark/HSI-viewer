@@ -29,6 +29,7 @@ import {
   bakeRegistration,
   combineLayers,
   editMask,
+  importCacheFile,
   importCacheFromImage,
   importMaskFile,
   inspectMaskFile,
@@ -36,6 +37,7 @@ import {
   cropImageInPlace,
   cropRoi,
   exportLayers,
+  exportCache,
   exportPixels,
   exportRoiCubes,
   fetchImages,
@@ -764,6 +766,7 @@ export default function App() {
     | { kind: 'layers'; ids: number[] }
     | { kind: 'roicubes'; layerIds: number[] }
     | { kind: 'pixels'; layerIds: number[]; atomId?: number }
+    | { kind: 'cache'; ids: number[] }
     | null
   >(null)
 
@@ -3486,12 +3489,28 @@ export default function App() {
 
   const inspectMask = useCallback(async (path: string) => {
     setMaskFileBrowser(false)
+    // plain single-mask files go through the inspect dialog; anything else
+    // is tried as a cache bundle first and falls back to the mask flow
+    const lower = path.toLowerCase()
+    const plainMask = ['.npy', '.png', '.tif', '.tiff'].some((e) => lower.endsWith(e))
     try {
+      if (!plainMask) {
+        try {
+          const { objects } = await importCacheFile(path)
+          await refreshCache()
+          setPanelTab('cache')
+          setToast(`Loaded ${objects.length} cache object(s) from file`)
+          return
+        } catch (e) {
+          if (!(e as Error).message.includes('not a cache bundle')) throw e
+        }
+      }
       setMaskImport(await inspectMaskFile(path))
     } catch (e) {
       setToast((e as Error).message)
     }
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshCache])
 
   const doImportMask = useCallback(
     async (splitLabels: boolean, name: string) => {
@@ -4150,6 +4169,14 @@ export default function App() {
         return
       }
       // per-ROI HSI cubes: one file per atom, named after it, inside a folder
+      if (exportState.kind === 'cache') {
+        if (format !== 'zarr' && format !== 'npz') return
+        await runPipelineJob(
+          () => exportCache({ path, format, ids: exportState.ids }),
+          async (st) => setToast(st.message || 'Cache saved'),
+        )
+        return
+      }
       if (exportState.kind === 'pixels') {
         if (format !== 'zarr' && format !== 'npz') return
         const src = layers.filter((l) => exportState.layerIds.includes(l.id))
@@ -4850,6 +4877,7 @@ export default function App() {
               onCleanBlobs={openBlobClean}
               onIsolate={openIsolate}
               onImportMask={() => setMaskFileBrowser(true)}
+              onSaveToFile={(ids) => setExportState({ kind: 'cache', ids })}
               onImportFromImage={
                 images.length > 1 ? () => setCacheImportOpen(true) : null
               }
@@ -6154,10 +6182,10 @@ export default function App() {
       )}
       {maskFileBrowser && (
         <FileBrowser
-          title="Import mask into cache"
-          subtitle="Full-resolution mask: .npy, .png, .tif or a zarr array"
-          filesFilter="npy,png,tif,tiff"
-          pickKinds={['file', 'zarr-array']}
+          title="Load cache from file"
+          subtitle="A saved cache bundle (.npz / zarr group) or a full-resolution mask (.npy, .png, .tif, zarr array)"
+          filesFilter="npy,png,tif,tiff,npz"
+          pickKinds={['file', 'zarr-array', 'zarr-group']}
           onOpen={(path) => void inspectMask(path)}
           onClose={() => setMaskFileBrowser(false)}
         />
@@ -6273,7 +6301,9 @@ export default function App() {
                   ? `${base}_roi_cubes`
                   : exportState.kind === 'pixels'
                     ? `${base}_pixels`
-                    : `${base}_${clean(exportState.name)}`
+                    : exportState.kind === 'cache'
+                      ? `${base}_cache`
+                      : `${base}_${clean(exportState.name)}`
         const layerLegend =
           exportState.kind === 'layers'
             ? layers.filter((l) => exportState.ids.includes(l.id))
@@ -6305,13 +6335,15 @@ export default function App() {
                       ? 'Export HSI data by ROI…'
                       : exportState.kind === 'pixels'
                         ? 'Export pixel dataset…'
-                        : `Export "${exportState.name}" as…`
+                        : exportState.kind === 'cache'
+                          ? `Save ${exportState.ids.length} cache object(s) to file…`
+                          : `Export "${exportState.name}" as…`
             }
             defaultName={name}
             storageKey={exportState.kind}
             formats={
               exportState.kind === 'data' || exportState.kind === 'roicubes' ||
-              exportState.kind === 'pixels'
+              exportState.kind === 'pixels' || exportState.kind === 'cache'
                 ? ['zarr', 'npz']
                 : undefined
             }

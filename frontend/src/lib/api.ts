@@ -252,6 +252,18 @@ export async function importCacheFromImage(body: {
   return postJson('/api/cache/import_from_image', body)
 }
 
+export async function exportCache(body: {
+  path: string
+  format: ExportFormat
+  ids: number[]
+}): Promise<PipelineStatus> {
+  return postJson('/api/cache/export', body)
+}
+
+export async function importCacheFile(path: string): Promise<{ objects: CacheObject[] }> {
+  return postJson('/api/cache/import_file', { path })
+}
+
 export async function inspectMaskFile(path: string): Promise<MaskFileInfo> {
   return postJson('/api/cache/inspect_mask', { path })
 }
