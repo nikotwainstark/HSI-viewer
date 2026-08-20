@@ -120,6 +120,7 @@ import { MaskEditDialog } from './components/MaskEditDialog'
 import { RoiPicker } from './components/RoiPicker'
 import { MaskImportDialog } from './components/MaskImportDialog'
 import { NotesOverlay, NoteSizeSlider, type NoteItem } from './components/NotesOverlay'
+import { parseLayersJson, serializeLayers } from './lib/layerFile'
 import { CacheImportDialog } from './components/CacheImportDialog'
 import { RegLinks, type RegLinkInfo } from './components/RegLinks'
 import { RegImportDialog } from './components/RegImportDialog'
@@ -2256,6 +2257,79 @@ export default function App() {
       )
     },
     [meta, images, layers],
+  )
+
+  const layerFileInput = useRef<HTMLInputElement>(null)
+
+  /** Save layers as a lossless vector JSON (downloads via the browser). */
+  const saveLayersToFile = useCallback(
+    (layerIds: number[]) => {
+      if (!meta) return
+      const chosen = layers.filter((l) => layerIds.includes(l.id))
+      if (!chosen.length) return
+      const { json, skipped } = serializeLayers(chosen, {
+        name: meta.name,
+        shape: [meta.shape[0], meta.shape[1]],
+      })
+      const blob = new Blob([json], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const el = document.createElement('a')
+      el.href = url
+      el.download = `layers_${_safeName(meta.name)}_${new Date()
+        .toISOString()
+        .slice(0, 10)}.json`
+      el.click()
+      URL.revokeObjectURL(url)
+      setToast(
+        `Saved ${chosen.length} layer(s) to file` +
+          (skipped
+            ? ` · ${skipped} cache-bound item(s) skipped (they live in this session's cache)`
+            : ''),
+      )
+    },
+    [meta, layers],
+  )
+
+  /** Load layers from a JSON file onto the CURRENT image (same grid only —
+      the file records the grid it was saved from and is refused otherwise). */
+  const importLayersFile = useCallback(
+    async (file: File) => {
+      if (!meta) return
+      try {
+        const payload = parseLayersJson(await file.text())
+        if (
+          payload.shape &&
+          (payload.shape[0] !== meta.shape[0] || payload.shape[1] !== meta.shape[1])
+        ) {
+          throw new Error(
+            `Loading failed, the imported file has [${payload.shape[0]},${payload.shape[1]}], ` +
+              `but the canvas is [${meta.shape[0]},${meta.shape[1]}]`)
+        }
+        const fresh: LayerObj[] = payload.layers.map((l) => {
+          layerSeq.current += 1
+          return {
+            ...l,
+            id: layerSeq.current,
+            atoms: l.atoms.map((a) => {
+              atomSeq.current += 1
+              return { ...a, id: atomSeq.current }
+            }),
+          }
+        })
+        setLayers((ls) => [...ls, ...fresh])
+        const nAtoms = fresh.reduce((n, l) => n + l.atoms.length, 0)
+        setToast(
+          `Loaded ${fresh.length} layer(s) · ${nAtoms} atoms` +
+            (payload.imageName && payload.imageName !== meta.name
+              ? ` (saved from "${payload.imageName}")`
+              : '') +
+            (payload.skipped ? ` · ${payload.skipped} unsupported item(s) skipped` : ''),
+        )
+      } catch (e) {
+        setToast((e as Error).message)
+      }
+    },
+    [meta],
   )
 
   const combineAtomsMany = useCallback(
@@ -4682,6 +4756,8 @@ export default function App() {
               onExportLayers={(ids) => setExportState({ kind: 'layers', ids })}
               onExportRoiCubes={(ids) => setExportState({ kind: 'roicubes', layerIds: ids })}
               onExportPixels={(ids) => setExportState({ kind: 'pixels', layerIds: ids })}
+              onSaveToFile={saveLayersToFile}
+              onLoadFromFile={() => layerFileInput.current?.click()}
               onCopyToImage={
                 meta && images.some(
                   (i) => i.id !== meta.image.id &&
@@ -4797,7 +4873,8 @@ export default function App() {
       openMaskEditWithAtom, openBlobClean, openIsolate, handleRenameNode,
       handleExportNode, handleApplyMask, handleCachePeak, handleCacheArea,
       handleCacheRatio, handleCacheRgb, handleCacheDelete, handleCacheDisplay,
-      addStep, removeStep, revertToNode, submitJob, noteMenuEntries])
+      addStep, removeStep, revertToNode, submitJob, noteMenuEntries,
+      saveLayersToFile])
 
   const menuItems: MenuEntry[] = useMemo(() => {
     if (!menu) return []
@@ -6094,6 +6171,17 @@ export default function App() {
           onClose={() => setCacheImportOpen(false)}
         />
       )}
+      <input
+        ref={layerFileInput}
+        type="file"
+        accept=".json,application/json"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0]
+          if (f) void importLayersFile(f)
+          e.target.value = ''
+        }}
+      />
       {maskImport && (
         <MaskImportDialog
           info={maskImport}

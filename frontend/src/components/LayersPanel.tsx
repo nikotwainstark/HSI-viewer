@@ -87,6 +87,10 @@ interface Props {
   onExportPixels: (ids: number[]) => void
   /** copy layers to a SAME-GRID image (null: no candidates loaded) */
   onCopyToImage: ((ids: number[], x: number, y: number) => void) | null
+  /** save layers as lossless vector JSON */
+  onSaveToFile: (ids: number[]) => void
+  /** load layers from a JSON file onto this image */
+  onLoadFromFile: () => void
   /** crop the selected image in place to a ROI atom's bbox (replaces it) */
   onCropToAtom: (layerId: number, atomId: number) => void
   /** boolean-edit a cached mask with this atom's region */
@@ -111,6 +115,7 @@ export function LayersPanel({
   onRenameAtom, onToggleRoiSpectrum, roiSpectrumKeys,
   onSetVisibleMany, onDeleteMany, onCombine, onSelectionChange,
   canCoregister, onCoregister, onExportLayers, onExportRoiCubes, onExportPixels, onCopyToImage,
+  onSaveToFile, onLoadFromFile,
   onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks, noteEntries,
 }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; target: MenuTarget } | null>(null)
@@ -332,6 +337,11 @@ export function LayersPanel({
               onClick: () => onCopyToImage(group, menu?.x ?? 200, menu?.y ?? 200),
             }]
           : []),
+        {
+          label: 'Save layers to file…',
+          hint: 'vector JSON · lossless round-trip',
+          onClick: () => onSaveToFile(group),
+        },
         { divider: true } as MenuEntry,
         { label: `Delete ${group.length} layers`, onClick: () => onDeleteMany(group) },
       ]
@@ -368,6 +378,11 @@ export function LayersPanel({
             onClick: () => onCopyToImage([layer.id], menu?.x ?? 200, menu?.y ?? 200),
           }]
         : []),
+      {
+        label: 'Save layer to file…',
+        hint: 'vector JSON · lossless round-trip',
+        onClick: () => onSaveToFile([layer.id]),
+      },
       ...(nLandmarks > 0 && canCoregister
         ? [
             {
@@ -537,6 +552,16 @@ export function LayersPanel({
         >
           <span className="text-[15px] leading-none text-slate-400">＋</span>
           <span className="text-[12px] text-slate-300">create layer from mask…</span>
+        </button>
+        <button
+          className="flex w-full items-center justify-center gap-2 rounded-lg border-2
+                     border-dashed border-white/20 px-3 py-2 opacity-50 transition-all
+                     hover:border-sky-400/50 hover:opacity-90"
+          title="layers saved with 'Save layer to file…' — same grid only"
+          onClick={onLoadFromFile}
+        >
+          <span className="text-[15px] leading-none text-slate-400">⇡</span>
+          <span className="text-[12px] text-slate-300">load layers from file…</span>
         </button>
       </div>
 
