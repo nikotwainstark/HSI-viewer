@@ -229,7 +229,8 @@ class DatasetManager:
         threading.Thread(target=work, daemon=True).start()
 
     def export_roi_cubes_async(self, folder: str, fmt: str, rois: list[dict],
-                               label_layers: list[dict] | None = None) -> None:
+                               label_layers: list[dict] | None = None,
+                               orient: dict | None = None) -> None:
         """One HSI cube per ROI atom, written into `folder` (job)."""
         ds = self.require()
         with self._lock:
@@ -247,7 +248,7 @@ class DatasetManager:
 
             try:
                 res = ds.export_roi_cubes(folder, fmt, rois, progress=on_progress,
-                                          label_layers=label_layers)
+                                          label_layers=label_layers, orient=orient)
                 with self._lock:
                     self.pipe_state = "idle"
                     self.pipe_progress = 1.0
@@ -262,7 +263,8 @@ class DatasetManager:
         threading.Thread(target=work, daemon=True).start()
 
     def export_pixels_async(self, path: str, fmt: str, region_specs: list[dict],
-                            label_layers: list[dict]) -> None:
+                            label_layers: list[dict],
+                            orient: dict | None = None) -> None:
         """Pixel dataset (spectra + coords + labels) written to `path` (job)."""
         ds = self.require()
         with self._lock:
@@ -280,7 +282,7 @@ class DatasetManager:
 
             try:
                 res = ds.export_pixels(path, fmt, region_specs, label_layers,
-                                       progress=on_progress)
+                                       progress=on_progress, orient=orient)
                 with self._lock:
                     self.pipe_state = "idle"
                     self.pipe_progress = 1.0
@@ -326,6 +328,7 @@ class DatasetManager:
         threading.Thread(target=work, daemon=True).start()
 
     def export_data_async(self, path: str, fmt: str, node: str,
+                          orient: dict | None = None,
                           created: str | None = None) -> None:
         ds = self.require()
         with self._lock:
@@ -342,7 +345,8 @@ class DatasetManager:
                 self.pipe_message = msg
 
             try:
-                ds.export_data(path, fmt, node, progress=on_progress, created=created)
+                ds.export_data(path, fmt, node, progress=on_progress, created=created,
+                               orient=orient)
                 with self._lock:
                     self.pipe_state = "idle"
                     self.pipe_progress = 1.0
@@ -886,6 +890,9 @@ class ExportLayersRequest(BaseModel):
     path: str
     format: str  # zarr | npz (label map) | png | tiff (exact colours)
     layers: list[dict]  # ordered: label numbers follow this order
+    #: lossless display orientation {rot90, flip_x, flip_y}
+    orient: dict | None = None
+
 
 
 @app.post("/api/layers/export")
@@ -895,7 +902,7 @@ def layers_export(req: ExportLayersRequest) -> dict:
         raise HTTPException(status_code=400, detail="export needs at least one layer")
     ds = manager.require()
     try:
-        return ds.export_layers(req.path, req.format, req.layers)
+        return ds.export_layers(req.path, req.format, req.layers, orient=req.orient)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
@@ -925,6 +932,9 @@ class ExportRoiCubesRequest(BaseModel):
     #: label layers attached to every cube: [{name, atoms: [{label, parts? |
     #: mask_cache_ids?}], cache_ids?, path?}]
     label_layers: list[dict] | None = None
+    #: lossless display orientation {rot90, flip_x, flip_y}
+    orient: dict | None = None
+
 
 
 class ExportPixelsRequest(BaseModel):
@@ -933,6 +943,9 @@ class ExportPixelsRequest(BaseModel):
     #: region = union of these specs (same shape as combine specs)
     regions: list[dict]
     label_layers: list[dict] = []
+    #: lossless display orientation {rot90, flip_x, flip_y}
+    orient: dict | None = None
+
 
 
 @app.post("/api/export/pixels")
@@ -940,7 +953,8 @@ def export_pixels_ep(req: ExportPixelsRequest) -> dict:
     """Pixel dataset export: spectra + coords + per-layer labels (job)."""
     if not req.regions:
         raise HTTPException(status_code=400, detail="export needs a region")
-    manager.export_pixels_async(req.path, req.format, req.regions, req.label_layers)
+    manager.export_pixels_async(req.path, req.format, req.regions, req.label_layers,
+                                req.orient)
     return manager.pipeline_status()
 
 
@@ -955,7 +969,8 @@ def layers_export_cubes(req: ExportRoiCubesRequest) -> dict:
                        if (r.get("cache_ids") or r.get("path")) else None)}
         for r in req.rois
     ]
-    manager.export_roi_cubes_async(req.folder, req.format, rois, req.label_layers)
+    manager.export_roi_cubes_async(req.folder, req.format, rois, req.label_layers,
+                                   req.orient)
     return manager.pipeline_status()
 
 
@@ -1001,6 +1016,9 @@ class ExportCanvasRequest(BaseModel):
     cmap: str | None = None
     points: list[dict] = []
     layers: list[dict] = []  # rendered exports only; numeric data stays clean
+    #: lossless display orientation {rot90, flip_x, flip_y}
+    orient: dict | None = None
+
 
 
 class ExportSpectraRequest(BaseModel):
@@ -1019,7 +1037,8 @@ def export_canvas(req: ExportCanvasRequest) -> dict:
     try:
         spec = _live_spec(req.kind, req.band, req.i0, req.i1, req.obj)
         return ds.export_canvas(req.path, req.format, spec, req.plo, req.phi,
-                                req.cmap, req.points, req.layers)
+                                req.cmap, req.points, req.layers,
+                                orient=req.orient)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
@@ -1122,13 +1141,17 @@ class ExportDataRequest(BaseModel):
     format: str
     node: str = "data"
     created: str | None = None
+    #: lossless display orientation {rot90, flip_x, flip_y}
+    orient: dict | None = None
+
 
 
 @app.post("/api/export/data")
 def export_data_endpoint(req: ExportDataRequest) -> dict:
     if req.format not in ("zarr", "npz"):
         raise HTTPException(status_code=400, detail="data export supports zarr or npz")
-    manager.export_data_async(req.path, req.format, req.node, req.created)
+    manager.export_data_async(req.path, req.format, req.node, req.created,
+                              orient=req.orient)
     return manager.pipeline_status()
 
 

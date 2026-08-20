@@ -142,6 +142,48 @@ def get_lut(name: str | None) -> np.ndarray | None:
     return lut
 
 
+#: Display-orientation for exports: the LOSSLESS part of an image's display
+#: transform (mirrors + quarter turns) is applied to exported arrays so files
+#: match what the screen shows; arbitrary rotation/scale never resamples here
+#: (that is Bake's job). {"rot90": k CCW-on-screen quarter turns applied
+#: AFTER flips, "flip_x": bool, "flip_y": bool}.
+def orient_ops(orient: dict | None) -> tuple[int, bool, bool]:
+    if not orient:
+        return 0, False, False
+    return (int(orient.get("rot90", 0)) % 4,
+            bool(orient.get("flip_x")), bool(orient.get("flip_y")))
+
+
+def orient_array(arr: "np.ndarray", orient: dict | None,
+                 axes: tuple[int, int] = (0, 1)) -> "np.ndarray":
+    """Apply flips then quarter turns to the spatial axes (rows, cols)."""
+    k, fx, fy = orient_ops(orient)
+    if fx:
+        arr = np.flip(arr, axis=axes[1])
+    if fy:
+        arr = np.flip(arr, axis=axes[0])
+    if k:
+        arr = np.rot90(arr, k, axes=(axes[0], axes[1]))
+    return np.ascontiguousarray(arr)
+
+
+def orient_coords(rows: "np.ndarray", cols: "np.ndarray", h: int, w: int,
+                  orient: dict | None) -> tuple["np.ndarray", "np.ndarray", int, int]:
+    """Map native (row, col) indices into the oriented frame (same op as
+    orient_array, so coords stay aligned with oriented rasters)."""
+    k, fx, fy = orient_ops(orient)
+    r, c = rows.copy(), cols.copy()
+    if fx:
+        c = w - 1 - c
+    if fy:
+        r = h - 1 - r
+    for _ in range(k):
+        # np.rot90 k=1: out[i, j] = in[j, W-1-i]  =>  (r, c) -> (W-1-c, r)
+        r, c = w - 1 - c, r
+        h, w = w, h
+    return r, c, h, w
+
+
 #: Overlays (masks, ROI fills) are mostly one flat colour, so zlib pays for
 #: itself many times over — level 1 keeps a native-resolution overlay at a few
 #: hundred KB instead of ~90 MB, for ~50 ms.
@@ -1556,7 +1598,8 @@ class HSIDataset:
         return self._cache_append(
             "mask", label or f"mask {sign} ROI", "edit", out.astype(np.float32))
 
-    def export_layers(self, path: str, fmt: str, layer_specs: list[dict]) -> dict:
+    def export_layers(self, path: str, fmt: str, layer_specs: list[dict],
+                      orient: dict | None = None) -> dict:
         """Export layer regions at native resolution. zarr/npz: one integer
         LABEL MAP (0 = background, 1..N in the given order, later layers
         overwrite earlier) plus a legend in the metadata. png/tiff: each
@@ -1575,13 +1618,15 @@ class HSIDataset:
                 "name": str(spec.get("name") or f"layer {i + 1}"),
                 "color": str(spec.get("color") or "#ffffff"),
             })
+        labels = orient_array(labels, orient)
         meta = {
             "app": "Hyperspectral Cube Viewer",
             "dataset": self.name,
             "source": f"from {self.data_label} · {self.name}",
-            "height": self.height,
-            "width": self.width,
+            "height": int(labels.shape[0]),
+            "width": int(labels.shape[1]),
             "legend": legend,
+            "orientation": orient or "native",
         }
         p = self._prepare_export_path(path, fmt)
         if fmt == "zarr":
@@ -1592,7 +1637,7 @@ class HSIDataset:
         elif fmt == "npz":
             np.savez_compressed(p, labels=labels, metadata=json.dumps(meta))
         else:
-            rgb = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            rgb = np.zeros((labels.shape[0], labels.shape[1], 3), dtype=np.uint8)
             for entry in legend[1:]:
                 n = int(entry["color"].lstrip("#"), 16)
                 rgb[labels == entry["label"]] = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
@@ -1778,11 +1823,13 @@ class HSIDataset:
 
     def export_canvas(self, path: str, fmt: str, spec: dict, plo: float, phi: float,
                       cmap: str | None, points: list[dict],
-                      layers: list[dict] | None = None) -> dict:
+                      layers: list[dict] | None = None,
+                      orient: dict | None = None) -> dict:
         """Export the live canvas: raw full-res data (zarr/npz, always clean —
         canvas overlays never touch the numeric layer) or the rendered
         WYSIWYG view with layer overlays and point markers baked in
-        (png/tiff, native resolution)."""
+        (png/tiff, native resolution). `orient` applies the display's
+        lossless orientation (mirrors / quarter turns) to the output."""
         img = self.live_image_full(**spec)
         pts = [{"row": int(pt["row"]), "col": int(pt["col"]),
                 "color": str(pt.get("color", "#38bdf8"))} for pt in points]
@@ -1798,17 +1845,24 @@ class HSIDataset:
             "width": int(img.shape[-1]),
             "stretch": f"{plo:g}-{phi:g} percentile",
             "cmap": "rgb" if img.ndim == 3 else (cmap or "grey"),
+            "orientation": orient or "native",
         }
+        # numeric path: orient the array itself (spatial axes are the LAST
+        # two for a (3, H, W) rgb map, the only two otherwise)
+        sp_axes = (img.ndim - 2, img.ndim - 1)
+        img_out = orient_array(np.asarray(img), orient, axes=sp_axes)
+        meta["height"] = int(img_out.shape[-2])
+        meta["width"] = int(img_out.shape[-1])
         p = self._prepare_export_path(path, fmt)
         if fmt == "zarr":
             g = zarr.open_group(str(p), mode="w")
-            a = g.create_array("image", shape=img.shape, dtype="float32")
-            a[:] = np.asarray(img, dtype=np.float32)
+            a = g.create_array("image", shape=img_out.shape, dtype="float32")
+            a[:] = np.asarray(img_out, dtype=np.float32)
             g.attrs.update(meta)
         elif fmt == "npz":
             np.savez_compressed(
                 p,
-                image=np.asarray(img, dtype=np.float32),
+                image=np.asarray(img_out, dtype=np.float32),
                 metadata=json.dumps(meta),
             )
         else:
@@ -1828,6 +1882,9 @@ class HSIDataset:
                 x, y = q["col"], q["row"]
                 draw.ellipse([x - r, y - r, x + r, y + r], outline=q["color"],
                              width=max(2, r // 4))
+            # rendered path: overlays are drawn in native coords, then the
+            # WHOLE composite is oriented — stays WYSIWYG
+            pil = Image.fromarray(orient_array(np.asarray(pil), orient))
             self._save_image_with_meta(pil, p, fmt, meta)
         logger.info("canvas exported -> %s", p)
         return {"path": str(p)}
@@ -1945,7 +2002,8 @@ class HSIDataset:
         return {"path": str(p)}
 
     def export_data(self, path: str, fmt: str, node_name: str,
-                    progress: ProgressFn, created: str | None = None) -> dict:
+                    progress: ProgressFn, created: str | None = None,
+                    orient: dict | None = None) -> dict:
         """Export the live data object (hypercube + wavenumber axis) at full
         resolution. The zarr layout round-trips: the exported group can be
         re-opened in the viewer directly."""
@@ -1970,17 +2028,35 @@ class HSIDataset:
         }
         p = self._prepare_export_path(path, fmt)
         progress(0.05, "preparing data export")
+        # orientation as memory-cheap VIEWS per band (flips / rot90 never
+        # copy); only the written blocks materialize
+        k, fx, fy = orient_ops(orient)
+
+        def _ov(a2d: np.ndarray) -> np.ndarray:
+            if fx:
+                a2d = a2d[:, ::-1]
+            if fy:
+                a2d = a2d[::-1, :]
+            for _ in range(k):
+                a2d = np.rot90(a2d)
+            return a2d
+
+        out_h, out_w = (self.height, self.width) if k % 2 == 0 else (self.width, self.height)
+        meta["shape"] = [out_h, out_w, self.bands]
+        meta["orientation"] = orient or "native"
+        assert self.full_valid is not None
+        band_views = [_ov(self.full[b]) for b in range(self.bands)]
         if fmt == "zarr":
             g = zarr.open_group(str(p), mode="w")
             cube = g.create_array("hypercube",
-                                  shape=(self.height, self.width, self.bands),
+                                  shape=(out_h, out_w, self.bands),
                                   dtype="float32",
                                   chunks=(300, 300, self.bands))
             rows = 300
-            n = (self.height + rows - 1) // rows
-            for i, r0 in enumerate(range(0, self.height, rows)):
-                r1 = min(r0 + rows, self.height)
-                cube[r0:r1] = self.full[:, r0:r1, :].transpose(1, 2, 0)
+            n = (out_h + rows - 1) // rows
+            for i, r0 in enumerate(range(0, out_h, rows)):
+                r1 = min(r0 + rows, out_h)
+                cube[r0:r1] = np.stack([bv[r0:r1] for bv in band_views], axis=-1)
                 progress(0.05 + 0.85 * (i + 1) / n, "writing hypercube")
             # axis array named by modality so a re-import recovers the kind
             axis_name = {"wavenumber": "wavenumber", "mz": "mass"}.get(self.axis_kind, "axis")
@@ -1989,18 +2065,16 @@ class HSIDataset:
             wv[:] = np.asarray(self.wavenumbers, dtype=np.float64)
             # the valid-pixel mask travels with the data (1 = valid); the
             # array itself is re-importable as a Binary-mask step source
-            assert self.full_valid is not None
-            vm = g.create_array("valid_mask", shape=(self.height, self.width),
+            vm = g.create_array("valid_mask", shape=(out_h, out_w),
                                 dtype="uint8")
-            vm[:] = self.full_valid.astype(np.uint8)
+            vm[:] = _ov(self.full_valid).astype(np.uint8)
             g.attrs.update(meta)
         else:
             # uncompressed on purpose: zlib over ~11 GB would take minutes
             progress(0.2, "writing npz")
-            assert self.full_valid is not None
             axis_name = {"wavenumber": "wavenumber", "mz": "mass"}.get(self.axis_kind, "axis")
-            np.savez(p, hypercube=self.full.transpose(1, 2, 0),
-                     valid_mask=self.full_valid.astype(np.uint8),
+            np.savez(p, hypercube=np.stack(band_views, axis=-1),
+                     valid_mask=_ov(self.full_valid).astype(np.uint8),
                      metadata=json.dumps(meta),
                      **{axis_name: np.asarray(self.wavenumbers, dtype=np.float64)})
         progress(1.0, f"exported to {p}")
@@ -2069,7 +2143,8 @@ class HSIDataset:
 
     def export_roi_cubes(self, folder: str, fmt: str, rois: list[dict],
                          progress: ProgressFn,
-                         label_layers: list[dict] | None = None) -> dict:
+                         label_layers: list[dict] | None = None,
+                         orient: dict | None = None) -> dict:
         """Export ONE HSI cube per ROI atom into `folder` (created if needed),
         named after each atom. Each cube is the atom's bounding box with
         everything outside the region / layer mask / valid set zero-filled —
@@ -2108,6 +2183,7 @@ class HSIDataset:
             if maps is not None:
                 x0, y0, x1, y1 = self._parts_bbox(roi["parts"])
                 cube_labels = maps[:, y0:y1, x0:x1]
+            # dominant labels vote in NATIVE coords (before orientation)
             meta = {
                 "app": "Hyperspectral Cube Viewer",
                 "dataset": self.name,
@@ -2118,6 +2194,7 @@ class HSIDataset:
                 "shape": list(arr.shape),
                 "axis": self.axis_label,
                 "n_valid": int(valid.sum()),
+                "orientation": orient or "native",
                 "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             if cube_labels is not None:
@@ -2131,6 +2208,13 @@ class HSIDataset:
                 meta["legends"] = legends
                 meta["dominant_labels"] = self._dominant_labels(
                     maps, legends, region_full)
+            # match the screen: mirrors / quarter turns applied to the cube,
+            # its valid mask and its label planes identically
+            arr = orient_array(arr, orient)
+            valid = orient_array(valid, orient)
+            if cube_labels is not None:
+                cube_labels = orient_array(cube_labels, orient, axes=(1, 2))
+            meta["shape"] = list(arr.shape)
             axis_name = {"wavenumber": "wavenumber", "mz": "mass"}.get(self.axis_kind, "axis")
             wn = np.asarray(self.wavenumbers, dtype=np.float64)
             if fmt == "zarr":
@@ -2167,7 +2251,8 @@ class HSIDataset:
         return {"path": str(root), "files": out, "count": len(out)}
 
     def export_pixels(self, path: str, fmt: str, region_specs: list[dict],
-                      label_layers: list[dict], progress: ProgressFn) -> dict:
+                      label_layers: list[dict], progress: ProgressFn,
+                      orient: dict | None = None) -> dict:
         """Export a PIXEL dataset: one row per (region ∩ valid) pixel.
 
         spectra (N, B) float32 · coords (N, 2) int32 native (row, col) ·
@@ -2202,7 +2287,11 @@ class HSIDataset:
             maps, legends = self.label_maps(label_layers)
 
         rows, cols = np.nonzero(picked)
-        coords = np.stack([rows, cols], axis=1).astype(np.int32)
+        # coords are reported in the ORIENTED frame, consistent with any
+        # oriented raster export of the same image
+        o_rows, o_cols, o_h, o_w = orient_coords(
+            rows, cols, self.height, self.width, orient)
+        coords = np.stack([o_rows, o_cols], axis=1).astype(np.int32)
         spectra = np.empty((n, self.bands), dtype=np.float32)
         step = max(1, self.bands // 20)
         for b in range(self.bands):
@@ -2220,7 +2309,8 @@ class HSIDataset:
             "steps": list(self.applied_steps),
             "n_pixels": n,
             "n_invalid_excluded": n_region - n,
-            "image_shape": [self.height, self.width],
+            "image_shape": [o_h, o_w],
+            "orientation": orient or "native",
             "axis": self.axis_label,
             "label_layers": [e["layer"] for e in legends],
             "legends": legends,

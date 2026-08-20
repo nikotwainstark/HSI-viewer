@@ -318,8 +318,17 @@ export async function exportRoiCubes(body: {
     path?: string
   }[]
   label_layers?: LabelLayerSpec[]
+  orient?: ExportOrient
 }): Promise<PipelineStatus> {
   return postJson('/api/layers/export_cubes', body)
+}
+
+/** Lossless display orientation applied to exported arrays: flips first,
+    then rot90 quarter turns (CCW on screen). */
+export interface ExportOrient {
+  rot90: number
+  flip_x: boolean
+  flip_y: boolean
 }
 
 /** One label layer for dataset exports: atoms keyed by NAME (same-name atoms
@@ -336,6 +345,7 @@ export async function exportPixels(body: {
   format: ExportFormat
   regions: { atoms?: RoiPart[]; mask_atoms?: number[][]; cache_ids?: number[]; path?: string }[]
   label_layers: LabelLayerSpec[]
+  orient?: ExportOrient
 }): Promise<PipelineStatus> {
   return postJson('/api/export/pixels', body)
 }
@@ -724,6 +734,7 @@ export async function exportData(opts: {
   format: 'zarr' | 'npz'
   node: string
   created?: string
+  orient?: ExportOrient
 }): Promise<PipelineStatus> {
   return postJson('/api/export/data', opts)
 }
@@ -815,6 +826,7 @@ export async function exportLayers(body: {
   path: string
   format: ExportFormat
   layers: ExportLayerSpec[]
+  orient?: ExportOrient
 }): Promise<{ path: string }> {
   return postJson('/api/layers/export', body)
 }
@@ -828,6 +840,7 @@ export async function exportCanvas(
     cmap: string
     points: ExportPoint[]
     layers?: ExportLayerSpec[]
+    orient?: ExportOrient
   },
 ): Promise<{ path: string }> {
   return postJson('/api/export/canvas', {
@@ -839,6 +852,7 @@ export async function exportCanvas(
     cmap: opts.cmap,
     layers: opts.layers ?? [],
     points: opts.points,
+    orient: opts.orient,
   })
 }
 

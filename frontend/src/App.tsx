@@ -80,6 +80,7 @@ import {
   type Atom,
   type NodeInfo,
   type PipeItem,
+  type ExportOrient,
   type LabelLayerSpec,
   type NoteAtom,
   type RoiAtom,
@@ -4152,10 +4153,35 @@ export default function App() {
     [roiSpectra, layers],
   )
 
+  /** The LOSSLESS part of the selected image's display transform (mirrors +
+      quarter turns) for exports; null when the view is native or when the
+      transform has a non-orthogonal part (arbitrary rotation — that needs
+      Bake, exports then stay native and say so). */
+  const exportOrient = useCallback((): {
+    orient?: ExportOrient
+    note: string | null
+  } => {
+    const l = selLayout
+    const q = Math.round(l.rot / (Math.PI / 2))
+    if (Math.abs(l.rot - q * (Math.PI / 2)) > 1e-6) {
+      return {
+        note: 'display rotation is not a multiple of 90° — exported in native orientation (Bake to resample)',
+      }
+    }
+    const k = ((-q % 4) + 4) % 4
+    const fx = l.sx < 0
+    const fy = l.sy < 0
+    if (k === 0 && !fx && !fy) return { note: null }
+    return { orient: { rot90: k, flip_x: fx, flip_y: fy }, note: null }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selLayout.rot, selLayout.sx, selLayout.sy])
+
   const doExport = useCallback(
     async (path: string, format: ExportFormat, includeLayers?: boolean,
            labelIds?: number[], productId?: string) => {
       if (!exportState) return
+      const { orient, note: orientNote } = exportOrient()
+      if (orientNote) setToast(orientNote)
       setExportState(null)
       // data-object export is a long job (11.5 GB): run it with the
       // blocking-overlay machinery and report the final message
@@ -4163,7 +4189,7 @@ export default function App() {
         if (format !== 'zarr' && format !== 'npz') return
         await runPipelineJob(
           () =>
-            exportData({ path, format, node: exportState.name, created: exportState.created }),
+            exportData({ path, format, node: exportState.name, created: exportState.created, orient }),
           async (st) => setToast(st.message || 'Export done'),
         )
         return
@@ -4211,7 +4237,7 @@ export default function App() {
             .filter((l) => labelIdsAll.includes(l.id))
             .map(labelLayerSpec)
           await runPipelineJob(
-            () => exportPixels({ path, format, regions, label_layers }),
+            () => exportPixels({ path, format, regions, label_layers, orient }),
             async (st) => setToast(st.message || 'Pixel dataset exported'),
           )
           return
@@ -4239,7 +4265,7 @@ export default function App() {
             .map(labelLayerSpec)
           await runPipelineJob(
             () => exportRoiCubes({
-              folder: path.replace(/\/$/, ''), format, rois,
+              folder: path.replace(/\/$/, ''), format, rois, orient,
               ...(label_layers.length ? { label_layers } : {}),
             }),
             async (st) => setToast(st.message || 'ROI cubes exported'),
@@ -4265,7 +4291,7 @@ export default function App() {
           }
         })
         try {
-          const res = await exportLayers({ path, format, layers: specs })
+          const res = await exportLayers({ path, format, layers: specs, orient })
           setToast(`Exported to ${res.path}`)
         } catch (e) {
           setToast((e as Error).message)
@@ -4314,6 +4340,7 @@ export default function App() {
           exportState.kind === 'canvas'
             ? await exportCanvas(display, {
                 path, format, stretch, cmap, points: pts, layers: layersPayload,
+                orient,
               })
             : await exportSpectra({
                 path,
@@ -4331,7 +4358,7 @@ export default function App() {
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [exportState, display, stretch, cmap, picks, spectrumMode, runPipelineJob,
-     roiSpectra, layers, meta],
+     roiSpectra, layers, meta, exportOrient],
   )
 
   const createCleanedMask = useCallback(async () => {
