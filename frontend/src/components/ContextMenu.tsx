@@ -46,13 +46,15 @@ export function ContextMenu({ x, y, items, header, onClose }: Props) {
 
   return createPortal(
     <>
+      {/* Close on a fresh PRESS only. The contextmenu event itself must
+          never close: Windows fires it after pointerup, i.e. AFTER a menu
+          opened from pointerup has mounted — closing there killed the
+          spectrum panel's menu the instant it appeared (Linux fires it at
+          pointerdown, which is why only Windows showed the bug). */}
       <div
         className="fixed inset-0 z-[99]"
-        onClick={onClose}
-        onContextMenu={(e) => {
-          e.preventDefault()
-          onClose()
-        }}
+        onPointerDown={onClose}
+        onContextMenu={(e) => e.preventDefault()}
       />
       <div
         className="fixed z-[100] min-w-52 rounded-xl border border-white/10 bg-slate-900/80
