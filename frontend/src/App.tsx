@@ -267,6 +267,19 @@ function _safeName(n: string): string {
     one screen pixel and tracing thousands of steps buys nothing. */
 const NIB_EXACT_PX = 128
 
+/** Quantize a brush landing point so the nib's pixel footprint is SYMMETRIC
+    and constant: odd widths centre on the pixel under the cursor (3 px = a
+    true 3x3), even widths snap to the pixel corner (2 px = a true 2x2). The
+    footprint then never changes shape with sub-pixel cursor position — it
+    steps whole pixels. Applied to the cursor preview AND the captured stroke
+    alike, so what the outline promises is exactly what lands. */
+function snapNib(x: number, y: number, width: number): [number, number] {
+  const w = Math.max(1, Math.round(width))
+  return w % 2 === 1
+    ? [Math.floor(x) + 0.5, Math.floor(y) + 0.5]
+    : [Math.round(x), Math.round(y)]
+}
+
 function nibOutline(
   x: number, y: number, size: number, w: number, h: number,
 ): [number, number][][] {
@@ -3418,7 +3431,9 @@ export default function App() {
         const rgbN = hexToRgb(erasingNow
           ? '#fca5a5'
           : layers.find((l) => l.id === activeLayerId)?.color ?? LAYER_PALETTE[0])
-        const paths = nibOutline(nx, ny, erasingNow ? eraserSize : brushSize, iw, ih)
+        const nibW = erasingNow ? eraserSize : brushSize
+        const [sx, sy] = snapNib(nx, ny, nibW)
+        const paths = nibOutline(sx, sy, nibW, iw, ih)
         if (paths.length) {
           out.push(
             new PathLayer({
@@ -4724,9 +4739,11 @@ export default function App() {
       const rect = containerRef.current!.getBoundingClientRect()
       const buf = paintBuf.current
       paintBuf.current = []
-      const local = buf.map(({ x, y }) =>
-        selToLocal(...unproject(x - rect.left, y - rect.top, viewState, size)),
-      )
+      const nibW = tool === 'erase' ? eraserSize : brushSize
+      const local = buf.map(({ x, y }) => {
+        const [px, py] = selToLocal(...unproject(x - rect.left, y - rect.top, viewState, size))
+        return snapNib(px, py, nibW)
+      })
       setMouseWorld(local[local.length - 1])
       setBrushStroke((cur) => {
         const out = cur ? [...cur] : []
@@ -5410,7 +5427,8 @@ export default function App() {
           const rect = containerRef.current!.getBoundingClientRect()
           const [wx, wy] = unproject(e.clientX - rect.left, e.clientY - rect.top,
                                      viewState, size)
-          const [lx, ly] = selToLocal(wx, wy)
+          const [rawX, rawY] = selToLocal(wx, wy)
+          const [lx, ly] = snapNib(rawX, rawY, tool === 'erase' ? eraserSize : brushSize)
           painting.current = true
           setBrushStroke([[lx, ly]])
           setMouseWorld([lx, ly])
