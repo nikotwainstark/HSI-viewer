@@ -445,6 +445,19 @@ function hasErase(atom: RoiAtom): boolean {
   return atom.parts.some((p) => p.op === 'erase')
 }
 
+/** True when an atom's outline needs the backend silhouette: brush strokes
+    have no polygon form (atomPolygons skips them), erases punch holes,
+    multi-part unions merge, and a bound mask clips — in every one of those
+    cases the vector fallback would draw nothing or a lie. */
+function needsSilhouette(atom: RoiAtom, bound: boolean): boolean {
+  return (
+    bound ||
+    atom.parts.length > 1 ||
+    hasErase(atom) ||
+    atom.parts.some((p) => p.shape === 'brush')
+  )
+}
+
 /** Bounding box of a multi-part ROI (native coords). */
 function partsBbox(parts: RoiPart[]): [number, number, number, number] {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
@@ -2024,10 +2037,7 @@ export default function App() {
       const bound = !!layer.maskSource
       for (const atom of layer.atoms) {
         if (atom.kind !== 'roi' || atom.visible === false) continue
-        // silhouettes serve combined/erased atoms everywhere, and EVERY roi
-        // atom of a mask-bound layer: there the halo must show parts ∩ mask,
-        // never the raw vector extent
-        if (!bound && atom.parts.length < 2 && !hasErase(atom)) continue
+        if (!needsSilhouette(atom, bound)) continue
         const key = partsKey(meta.image.id, layer, atom)
         if (partsOutlines.has(key) || outlinePendingParts.current.has(key)) continue
         outlinePendingParts.current.add(key)
@@ -2991,12 +3001,12 @@ export default function App() {
         if (!layerSelected && !selAtomIds.includes(a.id)) continue
         if (a.kind === 'roi') {
           const bound = !!layer.maskSource
-          const sil = bound || a.parts.length > 1 || hasErase(a)
+          const sil = needsSilhouette(a, bound)
             ? partsOutlines.get(partsKey(meta.image.id, layer, a))
             : undefined
           if (sil) {
             for (const c of sil) haloPaths.push({ path: c, color: rgbC })
-          } else if (!bound) {
+          } else if (!bound && !needsSilhouette(a, bound)) {
             // raw vector fallback ONLY on plain layers — on a mask-bound
             // layer the unclipped extent would be a lie; wait for the
             // clipped silhouette instead
