@@ -679,6 +679,9 @@ def cache_isolate(req: IsolateComponentsRequest) -> dict:
 
 class PartsOutlineRequest(BaseModel):
     parts: list[dict]
+    #: layer's bound mask: silhouette = parts ∩ mask
+    cache_ids: list[int] | None = None
+    path: str | None = None
 
 
 @app.post("/api/layers/parts_outline")
@@ -686,7 +689,9 @@ def layers_parts_outline(req: PartsOutlineRequest) -> dict:
     """Outer silhouette of a multi-part ROI (union of its parts)."""
     ds = manager.require()
     try:
-        return {"contours": ds.parts_outline(req.parts)}
+        mask_step = ({"cache_ids": req.cache_ids, "path": req.path}
+                     if (req.cache_ids or req.path) else None)
+        return {"contours": ds.parts_outline(req.parts, mask_step)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

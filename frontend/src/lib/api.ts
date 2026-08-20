@@ -221,6 +221,8 @@ export async function isolateMaskComponents(body: {
 /** Outer silhouette of a multi-part ROI (union of its parts, native res). */
 export async function fetchPartsOutline(body: {
   parts: RoiPart[]
+  cache_ids?: number[]
+  path?: string
 }): Promise<[number, number][][]> {
   const res = await postJson<{ contours: [number, number][][] }>(
     '/api/layers/parts_outline', body,

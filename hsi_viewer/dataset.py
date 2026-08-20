@@ -147,6 +147,81 @@ def get_lut(name: str | None) -> np.ndarray | None:
 #: match what the screen shows; arbitrary rotation/scale never resamples here
 #: (that is Bake's job). {"rot90": k CCW-on-screen quarter turns applied
 #: AFTER flips, "flip_x": bool, "flip_y": bool}.
+def trace_pixel_edges(m: "np.ndarray", ox: float = 0.0, oy: float = 0.0,
+                      scale: float = 1.0) -> list[list[list[float]]]:
+    """Closed boundary loops of a binary mask, running along PIXEL EDGES.
+
+    Marching squares (find_contours) cuts diagonals through half-pixels, so
+    its lines can never sit on the pixel blocks a region actually covers.
+    This tracer walks the lattice instead: every segment lies on the edge
+    between a covered and an uncovered pixel, interior kept on the left,
+    collinear runs merged. What it draws IS the membership — at any zoom the
+    outline hugs the same blocks the fill paints. With `scale` > 1 (pooled
+    display masks) the loops run on the scale-px grid, still in native
+    coordinates via ox/oy.
+    """
+    h, w = m.shape
+    grid = np.zeros((h + 2, w + 2), dtype=bool)
+    grid[1:-1, 1:-1] = m
+    # directed edges, interior on the LEFT (y down). Keys are lattice points.
+    out_edges: dict[tuple[int, int], list[tuple[int, int]]] = {}
+
+    def add(a: tuple[int, int], b: tuple[int, int]) -> None:
+        out_edges.setdefault(a, []).append(b)
+
+    hdiff = grid[1:, 1:-1] != grid[:-1, 1:-1]      # (h+1, w) at y = r
+    below = grid[1:, 1:-1]
+    for r, c in zip(*np.nonzero(hdiff)):
+        if below[r, c]:
+            add((c + 1, r), (c, r))                 # interior below → walk -x
+        else:
+            add((c, r), (c + 1, r))                 # interior above → walk +x
+    vdiff = grid[1:-1, 1:] != grid[1:-1, :-1]      # (h, w+1) at x = c
+    right = grid[1:-1, 1:]
+    for r, c in zip(*np.nonzero(vdiff)):
+        if right[r, c]:
+            add((c, r), (c, r + 1))                 # interior right → walk +y
+        else:
+            add((c, r + 1), (c, r))                 # interior left → walk -y
+
+    # left-turn preference resolves checkerboard junctions without crossing
+    TURN = {(1, 0): [(0, -1), (1, 0), (0, 1)], (-1, 0): [(0, 1), (-1, 0), (0, -1)],
+            (0, 1): [(1, 0), (0, 1), (-1, 0)], (0, -1): [(-1, 0), (0, -1), (1, 0)]}
+    loops: list[list[list[float]]] = []
+    for start in list(out_edges.keys()):
+        while out_edges.get(start):
+            nxt = out_edges[start].pop()
+            loop_pts: list[tuple[int, int]] = [start]
+            prev_dir = (nxt[0] - start[0], nxt[1] - start[1])
+            cur = nxt
+            while cur != start:
+                cands = out_edges.get(cur) or []
+                chosen = None
+                if len(cands) > 1:
+                    for want in TURN[prev_dir]:
+                        for cc in cands:
+                            if (cc[0] - cur[0], cc[1] - cur[1]) == want:
+                                chosen = cc
+                                break
+                        if chosen is not None:
+                            break
+                if chosen is None:
+                    if not cands:
+                        break  # defensive: open chain (should not happen)
+                    chosen = cands[0]
+                cands.remove(chosen)
+                d = (chosen[0] - cur[0], chosen[1] - cur[1])
+                if d != prev_dir:
+                    loop_pts.append(cur)             # emit only on turns
+                    prev_dir = d
+                cur = chosen
+            loop_pts.append(start)                   # close the loop
+            loops.append([[float(x) * scale + ox, float(y) * scale + oy]
+                          for x, y in loop_pts])
+    loops.sort(key=len, reverse=True)
+    return loops
+
+
 def orient_ops(orient: dict | None) -> tuple[int, bool, bool]:
     if not orient:
         return 0, False, False
@@ -1278,18 +1353,21 @@ class HSIDataset:
         logger.info("isolated %d component(s) from mask %s", len(out), obj["name"])
         return {"components": out, "mask": obj["name"]}
 
-    def parts_outline(self, parts: list[dict]) -> list[list[list[float]]]:
+    def parts_outline(self, parts: list[dict],
+                      mask_step: dict | None = None) -> list[list[list[float]]]:
         """Outer boundary polylines of a multi-part ROI's UNION region, traced
-        at NATIVE resolution — one contour per connected component."""
-        from skimage import measure
-
+        at NATIVE resolution — one contour per connected component. With
+        `mask_step` the region is ∩ the layer's bound mask first, so the
+        silhouette shows the pixels the atom ACTUALLY covers on a mask-bound
+        layer, never the raw vector extent."""
         m, drawn = self._rasterize_parts(parts, self.height, self.width)
         if drawn == 0:
             return []
-        out = [[[float(col), float(row)] for row, col in c]
-               for c in measure.find_contours(m.astype(float), 0.5) if len(c) >= 4]
-        out.sort(key=len, reverse=True)
-        return out
+        if mask_step is not None:
+            m &= self._resolve_step_mask(mask_step)
+            if not m.any():
+                return []
+        return trace_pixel_edges(m)
 
     def mask_outline(self, mask_step: dict,
                      window: list[float] | None = None,
@@ -1306,8 +1384,6 @@ class HSIDataset:
         native and exact. The MASK ITSELF is never touched: spectra, crops
         and exports always use the full native mask — this is display only.
         Coordinates are returned in native px regardless of pooling."""
-        from skimage import measure
-
         m = self._resolve_step_mask(mask_step)
         ox = oy = 0
         if window is not None:
@@ -1322,12 +1398,10 @@ class HSIDataset:
         factor = max(1, int(np.floor(detail_px)))
         if factor > 1:
             m = pool_by(m.astype(np.float32), factor) > 0.5
-        contours = measure.find_contours(m.astype(float), 0.5)
-        out = [[[float(col) * factor + ox, float(row) * factor + oy]
-                for row, col in c]
-               for c in contours if len(c) >= 4]
-        out.sort(key=len, reverse=True)
-        return out
+        # pixel-edge loops: zoomed in they hug the native pixel blocks the
+        # fill paints; pooled they run on the factor-px grid — square steps,
+        # never marching-squares diagonals
+        return trace_pixel_edges(m, ox=ox, oy=oy, scale=factor)
 
     def _spec_region(self, spec: dict) -> np.ndarray | None:
         """One layer spec's region at native resolution: (union of vector-atom

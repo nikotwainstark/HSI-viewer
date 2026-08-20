@@ -2009,19 +2009,35 @@ export default function App() {
     new Map(),
   )
   const outlinePendingParts = useRef(new Set<string>())
-  const partsKey = (imgId: number, atom: RoiAtom) =>
-    `${imgId}:${JSON.stringify(atom.parts)}`
+  const maskSuffix = (layer: LayerObj) =>
+    layer.maskSource
+      ? layer.maskSource.kind === 'cache'
+        ? `∩c${layer.maskSource.ids.join(',')}`
+        : `∩p${layer.maskSource.path}`
+      : ''
+  const partsKey = (imgId: number, layer: LayerObj, atom: RoiAtom) =>
+    `${imgId}:${JSON.stringify(atom.parts)}${maskSuffix(layer)}`
 
   useEffect(() => {
     if (!meta) return
     for (const layer of layers) {
+      const bound = !!layer.maskSource
       for (const atom of layer.atoms) {
         if (atom.kind !== 'roi' || atom.visible === false) continue
-        if (atom.parts.length < 2 && !hasErase(atom)) continue
-        const key = partsKey(meta.image.id, atom)
+        // silhouettes serve combined/erased atoms everywhere, and EVERY roi
+        // atom of a mask-bound layer: there the halo must show parts ∩ mask,
+        // never the raw vector extent
+        if (!bound && atom.parts.length < 2 && !hasErase(atom)) continue
+        const key = partsKey(meta.image.id, layer, atom)
         if (partsOutlines.has(key) || outlinePendingParts.current.has(key)) continue
         outlinePendingParts.current.add(key)
-        fetchPartsOutline({ parts: atom.parts })
+        fetchPartsOutline({
+          parts: atom.parts,
+          ...(layer.maskSource?.kind === 'cache'
+            ? { cache_ids: layer.maskSource.ids } : {}),
+          ...(layer.maskSource?.kind === 'local'
+            ? { path: layer.maskSource.path } : {}),
+        })
           .then((cs) => setPartsOutlines((m) => new Map(m).set(key, cs)))
           .catch(() => {/* fall back to per-part borders */})
           .finally(() => outlinePendingParts.current.delete(key))
@@ -2974,12 +2990,16 @@ export default function App() {
       for (const a of visAtoms) {
         if (!layerSelected && !selAtomIds.includes(a.id)) continue
         if (a.kind === 'roi') {
-          const sil = a.parts.length > 1 || hasErase(a)
-            ? partsOutlines.get(partsKey(meta.image.id, a))
+          const bound = !!layer.maskSource
+          const sil = bound || a.parts.length > 1 || hasErase(a)
+            ? partsOutlines.get(partsKey(meta.image.id, layer, a))
             : undefined
           if (sil) {
             for (const c of sil) haloPaths.push({ path: c, color: rgbC })
-          } else {
+          } else if (!bound) {
+            // raw vector fallback ONLY on plain layers — on a mask-bound
+            // layer the unclipped extent would be a lie; wait for the
+            // clipped silhouette instead
             for (const poly of atomPolygons(a)) {
               haloPaths.push({ path: [...poly, poly[0]] as [number, number][], color: rgbC })
             }
