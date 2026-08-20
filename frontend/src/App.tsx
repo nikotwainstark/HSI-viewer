@@ -1812,15 +1812,17 @@ export default function App() {
     }
   }
 
-  /** A layer as a LABEL layer for dataset exports: every visible region atom
-      keyed by its display name (same-name atoms share one label). */
+  /** A layer as a LABEL layer for dataset exports. Label identity is the
+      atom's NAME; an unnamed atom falls back to its LAYER's name — the layer
+      IS the class ("stroma" strokes need no individual names), while
+      id-style layers (CoreID) name each atom explicitly and override. */
   const labelLayerSpec = useCallback(
     (l: LayerObj): LabelLayerSpec => ({
       name: l.name,
       atoms: l.atoms
         .filter((a) => a.visible !== false && (a.kind === 'roi' || a.kind === 'mask'))
         .map((a) => ({
-          label: (a.name ?? atomLabel(a)).trim(),
+          label: (a.name ?? '').trim() || l.name,
           ...(a.kind === 'roi' ? { parts: a.parts } : {}),
           ...(a.kind === 'mask' ? { mask_cache_ids: a.cacheIds } : {}),
         })),
@@ -1841,15 +1843,15 @@ export default function App() {
             (a) => a.visible !== false && (a.kind === 'roi' || a.kind === 'mask'),
           )
           const named = new Set(
-            regionAtomsOf.map((a) => (a.name ?? atomLabel(a)).trim()),
+            regionAtomsOf.map((a) => (a.name ?? '').trim() || l.name),
           )
-          const unnamed = regionAtomsOf.filter((a) => !a.name).length
+          const unnamed = regionAtomsOf.filter((a) => !(a.name ?? '').trim()).length
           return {
             id: l.id,
             name: l.name,
             summary: `${regionAtomsOf.length} atoms · ${named.size} labels`,
             ...(unnamed
-              ? { warn: `"${l.name}": ${unnamed} unnamed atom(s) enter the legend with geometric names` }
+              ? { warn: `"${l.name}": ${unnamed} unnamed atom(s) label as the layer name` }
               : {}),
           }
         })
