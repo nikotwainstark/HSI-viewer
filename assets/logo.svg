@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 430 84" role="img" aria-label="Hyperspectral Cube Viewer">
+  <rect width="430" height="84" rx="14" fill="#0b1220"/>
+  <g transform="translate(14, 10)">
+    <polygon points="30,29 58,15 58,49 30,63" fill="#f8fafc"/>
+    <polygon points="30,30.2 58,16.2 58,20.4 30,34.4" fill="#2f6bf0"/>
+    <polygon points="30,35.9 58,21.9 58,26.1 30,40.1" fill="#1fb8c9"/>
+    <polygon points="30,41.5 58,27.5 58,31.8 30,45.8" fill="#59c72c"/>
+    <polygon points="30,47.2 58,33.2 58,37.4 30,51.4" fill="#f5c211"/>
+    <polygon points="30,52.9 58,38.9 58,43.1 30,57.1" fill="#e8302a"/>
+    <polygon points="30,58.5 58,44.5 58,48.8 30,62.8" fill="#7b2ff0"/>
+    <polygon points="30,1 58,15 30,29 2,15" fill="#141b2a" stroke="#f8fafc" stroke-width="1.5" stroke-linejoin="round"/>
+    <polygon points="2,15 30,29 30,63 2,49" fill="#141b2a" stroke="#f8fafc" stroke-width="1.5" stroke-linejoin="round"/>
+  </g>
+  <text x="92" y="40" font-family="Georgia, 'Times New Roman', serif" font-size="27" fill="#f1f5f9">
+    Hyperspectral <tspan fill="#38bdf8">Cube</tspan> Viewer
+  </text>
+  <text x="93" y="64" font-family="ui-monospace, 'Cascadia Code', monospace" font-size="12.5" fill="#64748b" letter-spacing="1.5">
+    annotate &#183; coregister &#183; export ML datasets
+  </text>
+</svg>
