@@ -28,26 +28,54 @@ interface Props {
   /** optional label-layer checklist for dataset exports: each selected layer
       contributes one label plane/column keyed by atom NAME */
   labelChoices?: { id: number; name: string; summary: string; warn?: string }[]
+  /** optional PRODUCT selector (what to export); formats / folder mode /
+      label applicability follow the chosen product */
+  products?: {
+    id: string
+    label: string
+    hint: string
+    formats: ExportFormat[]
+    folderMode?: boolean
+    labelsApply?: boolean
+    /** reason string renders the product greyed out */
+    disabled?: string | null
+  }[]
+  /** initial product id (falls back to the remembered / first enabled one) */
+  defaultProduct?: string
   onSave: (path: string, format: ExportFormat, toggleOn?: boolean,
-           labelIds?: number[]) => void
+           labelIds?: number[], productId?: string) => void
   onClose: () => void
 }
 
 export function ExportDialog({ title, defaultName, storageKey, formats, toggle, info,
-                              folderMode, labelChoices, onSave, onClose }: Props) {
+                              folderMode, labelChoices, products, defaultProduct,
+                              onSave, onClose }: Props) {
   const [labelIds, setLabelIds] = useState<number[]>(
     () => (labelChoices ?? []).map((c) => c.id),
   )
-  const FORMATS = formats ?? ALL_FORMATS
   const memDir = `hsiviewer.export.${storageKey}.dir`
   const memFmt = `hsiviewer.export.${storageKey}.format`
   const memTgl = `hsiviewer.export.${storageKey}.toggle`
+  const memPrd = `hsiviewer.export.${storageKey}.product`
+
+  const [productId, setProductId] = useState<string | null>(() => {
+    if (!products?.length) return null
+    const wanted = defaultProduct ?? localStorage.getItem(memPrd) ?? undefined
+    const hit = products.find((pr) => pr.id === wanted && !pr.disabled)
+    return (hit ?? products.find((pr) => !pr.disabled) ?? products[0]).id
+  })
+  const product = products?.find((pr) => pr.id === productId) ?? null
+  const FORMATS = product?.formats ?? formats ?? ALL_FORMATS
+  const effFolderMode = product ? !!product.folderMode : !!folderMode
+  const labelsOn = labelChoices && (!products || product?.labelsApply)
 
   const [format, setFormat] = useState<ExportFormat>(() => {
     const f = localStorage.getItem(memFmt) as ExportFormat | null
     if (f && FORMATS.includes(f)) return f
     return FORMATS.includes('png') ? 'png' : FORMATS[0]
   })
+  // a product switch can invalidate the current format
+  if (!FORMATS.includes(format)) setFormat(FORMATS[0])
   const [name, setName] = useState(defaultName)
   const [toggleOn, setToggleOn] = useState(() => localStorage.getItem(memTgl) !== '0')
   const [listing, setListing] = useState<FsListing | null>(null)
@@ -89,7 +117,7 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
 
   // folder mode targets a DIRECTORY (files are named after the objects)
   const targetPath = listing
-    ? `${listing.path}/${name.trim()}${folderMode ? '/' : `.${format}`}`
+    ? `${listing.path}/${name.trim()}${effFolderMode ? '/' : `.${format}`}`
     : ''
   const ready = !!listing && name.trim().length > 0
 
@@ -98,9 +126,10 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
     localStorage.setItem(memDir, listing!.path)
     rememberDir(listing!.path)
     localStorage.setItem(memFmt, format)
+    if (productId) localStorage.setItem(memPrd, productId)
     if (toggle) localStorage.setItem(memTgl, toggleOn ? '1' : '0')
     onSave(targetPath, format, toggle ? toggleOn : undefined,
-           labelChoices ? labelIds : undefined)
+           labelsOn ? labelIds : undefined, productId ?? undefined)
   }
 
   return (
@@ -121,6 +150,34 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
         </header>
 
         <div className="px-5 pt-3">
+          {products && products.length > 0 && (
+            <div className="mb-2 space-y-1">
+              {products.map((pr) => (
+                <button
+                  key={pr.id}
+                  disabled={!!pr.disabled}
+                  title={pr.disabled ?? undefined}
+                  className={`flex w-full items-baseline gap-2.5 rounded-lg border px-3 py-1.5
+                              text-left transition-colors ${
+                                pr.disabled
+                                  ? 'cursor-not-allowed border-white/5 opacity-40'
+                                  : productId === pr.id
+                                    ? 'border-sky-400/50 bg-sky-400/15 text-sky-100'
+                                    : 'border-white/10 text-slate-300 hover:bg-white/5'
+                              }`}
+                  onClick={() => !pr.disabled && setProductId(pr.id)}
+                >
+                  <span className={`h-2 w-2 shrink-0 translate-y-[-1px] rounded-full ${
+                    productId === pr.id ? 'bg-sky-400' : 'bg-white/20'
+                  }`} />
+                  <span className="text-[12px] font-medium">{pr.label}</span>
+                  <span className="ml-auto shrink-0 text-[10px] text-slate-500">
+                    {pr.disabled ?? pr.hint}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
           <div className="mb-1.5 flex rounded-lg border border-white/10 bg-white/5 p-0.5">
             {FORMATS.map((f) => (
               <button
@@ -141,7 +198,7 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
               {info}
             </div>
           )}
-          {labelChoices && labelChoices.length > 0 && (
+          {labelsOn && labelChoices.length > 0 && (
             <div className="mb-1.5 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
               <p className="mb-1.5 text-[10px] tracking-wider text-slate-400 uppercase">
                 attach labels from layers
@@ -309,7 +366,7 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
               spellCheck={false}
             />
             <span className="shrink-0 font-mono text-[12px] text-slate-500">
-              {folderMode ? '/ (folder)' : `.${format}`}
+              {effFolderMode ? '/ (folder)' : `.${format}`}
             </span>
           </div>
           <p className="mt-1.5 truncate font-mono text-[10px] text-slate-600" title={targetPath}>

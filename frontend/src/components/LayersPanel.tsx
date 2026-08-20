@@ -80,11 +80,8 @@ interface Props {
   /** landmark layers can start a coregistration when other images exist */
   canCoregister: boolean
   onCoregister: (layerId: number, x: number, y: number) => void
-  /** export layer regions (label map / exact-colour render) */
-  onExportLayers: (ids: number[]) => void
-  /** export one HSI cube per ROI atom of these layers into a folder */
-  onExportRoiCubes: (ids: number[]) => void
-  onExportPixels: (ids: number[]) => void
+  /** unified export dialog: pixel collection / HSI cubes / label map / figure */
+  onExport: (ids: number[]) => void
   /** copy layers to a SAME-GRID image (null: no candidates loaded) */
   onCopyToImage: ((ids: number[], x: number, y: number) => void) | null
   /** save layers as lossless vector JSON */
@@ -114,7 +111,7 @@ export function LayersPanel({
   onToggleAtomVisible, onSetAtomsVisibleMany, onDeleteAtomsMany, onCombineAtoms,
   onRenameAtom, onToggleRoiSpectrum, roiSpectrumKeys,
   onSetVisibleMany, onDeleteMany, onCombine, onSelectionChange,
-  canCoregister, onCoregister, onExportLayers, onExportRoiCubes, onExportPixels, onCopyToImage,
+  canCoregister, onCoregister, onExport, onCopyToImage,
   onSaveToFile, onLoadFromFile,
   onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks, noteEntries,
 }: Props) {
@@ -314,22 +311,10 @@ export function LayersPanel({
           onClick: () => onCombine(group),
         },
         {
-          label: 'Export all as…',
-          hint: `${group.length} layers · label map / colours`,
-          onClick: () => onExportLayers(group),
+          label: `Export ${group.length} layers…`,
+          hint: 'pixels / cubes / label map / figure',
+          onClick: () => onExport(group),
         },
-        ...(isHsi
-          ? [{
-              label: 'Export HSI data by ROI…',
-              hint: 'one cube per ROI → folder',
-              onClick: () => onExportRoiCubes(group),
-            },
-            {
-              label: 'Export pixel dataset…',
-              hint: 'spectra + coords + labels',
-              onClick: () => onExportPixels(group),
-            }]
-          : []),
         ...(onCopyToImage
           ? [{
               label: 'Copy layers to image…',
@@ -353,24 +338,10 @@ export function LayersPanel({
       { label: layer.visible ? 'Hide layer' : 'Show layer', onClick: () => onToggleVisible(layer.id) },
       { divider: true, label: 'compute' } as MenuEntry,
       {
-        label: 'Export as…',
-        hint: 'mask / label map / colours',
-        onClick: () => onExportLayers([layer.id]),
+        label: 'Export…',
+        hint: 'pixels / cubes / label map / figure',
+        onClick: () => onExport([layer.id]),
       },
-      ...(isHsi && layer.atoms.some((a) => a.kind === 'roi')
-        ? [{
-            label: 'Export HSI data by ROI…',
-            hint: 'one cube per ROI → folder',
-            onClick: () => onExportRoiCubes([layer.id]),
-          }]
-        : []),
-      ...(isHsi && layer.atoms.some((a) => a.kind === 'roi' || a.kind === 'mask')
-        ? [{
-            label: 'Export pixel dataset…',
-            hint: 'spectra + coords + labels',
-            onClick: () => onExportPixels([layer.id]),
-          }]
-        : []),
       ...(onCopyToImage
         ? [{
             label: 'Copy layer to image…',

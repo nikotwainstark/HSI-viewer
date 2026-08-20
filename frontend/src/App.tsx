@@ -763,9 +763,7 @@ export default function App() {
     | { kind: 'canvas' }
     | { kind: 'spectra'; lo: number; hi: number }
     | { kind: 'data'; name: string; created?: string }
-    | { kind: 'layers'; ids: number[] }
-    | { kind: 'roicubes'; layerIds: number[] }
-    | { kind: 'pixels'; layerIds: number[]; atomId?: number }
+    | { kind: 'layerexport'; layerIds: number[]; atomId?: number; preset?: string }
     | { kind: 'cache'; ids: number[] }
     | null
   >(null)
@@ -4154,7 +4152,7 @@ export default function App() {
 
   const doExport = useCallback(
     async (path: string, format: ExportFormat, includeLayers?: boolean,
-           labelIds?: number[]) => {
+           labelIds?: number[], productId?: string) => {
       if (!exportState) return
       setExportState(null)
       // data-object export is a long job (11.5 GB): run it with the
@@ -4177,83 +4175,20 @@ export default function App() {
         )
         return
       }
-      if (exportState.kind === 'pixels') {
-        if (format !== 'zarr' && format !== 'npz') return
+      // unified layer export: ONE dialog, four products (pixel collection /
+      // HSI cubes / label map / figure); source = the selected layers, labels
+      // = the dialog's checklist
+      if (exportState.kind === 'layerexport') {
         const src = layers.filter((l) => exportState.layerIds.includes(l.id))
-        const regions = src.map((l) => {
-          const vis = l.atoms.filter(
-            (a) => a.visible !== false &&
-              (exportState.atomId == null || a.id === exportState.atomId),
-          )
-          const rasters = vis.filter((a) => a.kind === 'mask')
-          return {
-            atoms: vis
-              .filter((a): a is RoiAtom => a.kind === 'roi')
-              .flatMap((a) => a.parts),
-            ...(rasters.length
-              ? { mask_atoms: rasters.map((a) => (a as Extract<Atom, { kind: 'mask' }>).cacheIds) }
-              : {}),
-            ...(l.maskSource?.kind === 'cache' ? { cache_ids: l.maskSource.ids } : {}),
-            ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
-          }
-        })
-        // the source layer(s) always label their own pixels; extra layers by
-        // the dialog's checklist
-        const labelIdsAll = [
-          ...exportState.layerIds,
-          ...(labelIds ?? []).filter((i) => !exportState.layerIds.includes(i)),
-        ]
-        const label_layers = layers
-          .filter((l) => labelIdsAll.includes(l.id))
-          .map(labelLayerSpec)
-        await runPipelineJob(
-          () => exportPixels({ path, format, regions, label_layers }),
-          async (st) => setToast(st.message || 'Pixel dataset exported'),
-        )
-        return
-      }
-      if (exportState.kind === 'roicubes') {
-        if (format !== 'zarr' && format !== 'npz') return
-        const rois = layers
-          .filter((l) => exportState.layerIds.includes(l.id))
-          .flatMap((l) =>
-            l.atoms
-              .filter((a): a is RoiAtom => a.kind === 'roi' && a.visible !== false)
-              .map((a) => ({
-                label: atomDisplayName(l, a).replace(/^.*? · /, ''),
-                layer: l.name,
-                parts: a.parts,
-                ...(l.maskSource?.kind === 'cache' ? { cache_ids: l.maskSource.ids } : {}),
-                ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
-              })),
-          )
-        if (!rois.length) {
-          setToast('No visible ROI atoms to export')
-          return
-        }
-        const label_layers = layers
-          .filter((l) => (labelIds ?? []).includes(l.id))
-          .map(labelLayerSpec)
-        await runPipelineJob(
-          () => exportRoiCubes({
-            folder: path.replace(/\/$/, ''), format, rois,
-            ...(label_layers.length ? { label_layers } : {}),
-          }),
-          async (st) => setToast(st.message || 'ROI cubes exported'),
-        )
-        return
-      }
-      // layer-region export: label map (data) / exact colours (render), in
-      // the Layers-tab order of the chosen layers
-      if (exportState.kind === 'layers') {
-        const specs = layers
-          .filter((l) => exportState.ids.includes(l.id))
-          .map((l) => {
-            const vis = l.atoms.filter((a) => a.visible !== false)
+        if (productId === 'pixels') {
+          if (format !== 'zarr' && format !== 'npz') return
+          const regions = src.map((l) => {
+            const vis = l.atoms.filter(
+              (a) => a.visible !== false &&
+                (exportState.atomId == null || a.id === exportState.atomId),
+            )
             const rasters = vis.filter((a) => a.kind === 'mask')
             return {
-              name: l.name,
-              color: l.color,
               atoms: vis
                 .filter((a): a is RoiAtom => a.kind === 'roi')
                 .flatMap((a) => a.parts),
@@ -4264,6 +4199,69 @@ export default function App() {
               ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
             }
           })
+          // source layers always label their own pixels (epi/stro come from
+          // the annotation layers themselves); extras from the checklist
+          const labelIdsAll = [
+            ...exportState.layerIds,
+            ...(labelIds ?? []).filter((i) => !exportState.layerIds.includes(i)),
+          ]
+          const label_layers = layers
+            .filter((l) => labelIdsAll.includes(l.id))
+            .map(labelLayerSpec)
+          await runPipelineJob(
+            () => exportPixels({ path, format, regions, label_layers }),
+            async (st) => setToast(st.message || 'Pixel dataset exported'),
+          )
+          return
+        }
+        if (productId === 'cubes') {
+          if (format !== 'zarr' && format !== 'npz') return
+          const rois = src.flatMap((l) =>
+            l.atoms
+              .filter((a): a is RoiAtom => a.kind === 'roi' && a.visible !== false)
+              .map((a) => ({
+                label: atomDisplayName(l, a).replace(/^.*? · /, ''),
+                layer: l.name,
+                parts: a.parts,
+                ...(l.maskSource?.kind === 'cache' ? { cache_ids: l.maskSource.ids } : {}),
+                ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
+              })),
+          )
+          if (!rois.length) {
+            setToast('No visible ROI atoms to export')
+            return
+          }
+          const label_layers = layers
+            .filter((l) => (labelIds ?? []).includes(l.id) &&
+              !exportState.layerIds.includes(l.id))
+            .map(labelLayerSpec)
+          await runPipelineJob(
+            () => exportRoiCubes({
+              folder: path.replace(/\/$/, ''), format, rois,
+              ...(label_layers.length ? { label_layers } : {}),
+            }),
+            async (st) => setToast(st.message || 'ROI cubes exported'),
+          )
+          return
+        }
+        // label map (data) or exact-colour figure — same backend, format
+        // decides; layer order defines the label ints
+        const specs = src.map((l) => {
+          const vis = l.atoms.filter((a) => a.visible !== false)
+          const rasters = vis.filter((a) => a.kind === 'mask')
+          return {
+            name: l.name,
+            color: l.color,
+            atoms: vis
+              .filter((a): a is RoiAtom => a.kind === 'roi')
+              .flatMap((a) => a.parts),
+            ...(rasters.length
+              ? { mask_atoms: rasters.map((a) => (a as Extract<Atom, { kind: 'mask' }>).cacheIds) }
+              : {}),
+            ...(l.maskSource?.kind === 'cache' ? { cache_ids: l.maskSource.ids } : {}),
+            ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
+          }
+        })
         try {
           const res = await exportLayers({ path, format, layers: specs })
           setToast(`Exported to ${res.path}`)
@@ -4780,9 +4778,7 @@ export default function App() {
               roiSpectrumKeys={roiSpectra.map((r) => `${r.layerId}:${r.atomId}`)}
               canCoregister={images.length > 1}
               onCoregister={(layerId, x, y) => setCoregPick({ movingLayerId: layerId, x, y })}
-              onExportLayers={(ids) => setExportState({ kind: 'layers', ids })}
-              onExportRoiCubes={(ids) => setExportState({ kind: 'roicubes', layerIds: ids })}
-              onExportPixels={(ids) => setExportState({ kind: 'pixels', layerIds: ids })}
+              onExport={(ids) => setExportState({ kind: 'layerexport', layerIds: ids })}
               onSaveToFile={saveLayersToFile}
               onLoadFromFile={() => layerFileInput.current?.click()}
               onCopyToImage={
@@ -4957,7 +4953,10 @@ export default function App() {
             label: 'Export pixel dataset…',
             hint: 'this atom · spectra + coords + labels',
             onClick: () =>
-              setExportState({ kind: 'pixels', layerIds: [layer.id], atomId: atom.id }),
+              setExportState({
+                kind: 'layerexport', layerIds: [layer.id],
+                atomId: atom.id, preset: 'pixels',
+              }),
           })
           if (cacheObjects.some((o) => o.kind === 'mask')) {
             out.push({
@@ -6295,33 +6294,11 @@ export default function App() {
             ? `${base}_${what}`
             : exportState.kind === 'spectra'
               ? `${base}_spectra_${spectrumMode}`
-              : exportState.kind === 'layers'
+              : exportState.kind === 'layerexport'
                 ? `${base}_layers`
-                : exportState.kind === 'roicubes'
-                  ? `${base}_roi_cubes`
-                  : exportState.kind === 'pixels'
-                    ? `${base}_pixels`
-                    : exportState.kind === 'cache'
-                      ? `${base}_cache`
-                      : `${base}_${clean(exportState.name)}`
-        const layerLegend =
-          exportState.kind === 'layers'
-            ? layers.filter((l) => exportState.ids.includes(l.id))
-            : []
-        const roiCubeList =
-          exportState.kind === 'roicubes'
-            ? layers
-                .filter((l) => exportState.layerIds.includes(l.id))
-                .flatMap((l) =>
-                  l.atoms
-                    .filter((a): a is RoiAtom => a.kind === 'roi' && a.visible !== false)
-                    .map((a) => ({
-                      key: `${l.id}:${a.id}`,
-                      name: atomDisplayName(l, a).replace(/^.*? · /, ''),
-                      color: l.color,
-                    })),
-                )
-            : []
+                : exportState.kind === 'cache'
+                  ? `${base}_cache`
+                  : `${base}_${clean(exportState.name)}`
         return (
           <ExportDialog
             title={
@@ -6329,31 +6306,67 @@ export default function App() {
                 ? 'Export canvas as…'
                 : exportState.kind === 'spectra'
                   ? 'Export spectra as…'
-                  : exportState.kind === 'layers'
-                    ? `Export ${layerLegend.length} layer${layerLegend.length > 1 ? 's' : ''} as…`
-                    : exportState.kind === 'roicubes'
-                      ? 'Export HSI data by ROI…'
-                      : exportState.kind === 'pixels'
-                        ? 'Export pixel dataset…'
-                        : exportState.kind === 'cache'
-                          ? `Save ${exportState.ids.length} cache object(s) to file…`
-                          : `Export "${exportState.name}" as…`
+                  : exportState.kind === 'layerexport'
+                    ? `Export ${exportState.layerIds.length} layer${
+                        exportState.layerIds.length > 1 ? 's' : ''
+                      }${exportState.atomId != null ? ' (one atom)' : ''}…`
+                    : exportState.kind === 'cache'
+                      ? `Save ${exportState.ids.length} cache object(s) to file…`
+                      : `Export "${exportState.name}" as…`
             }
             defaultName={name}
             storageKey={exportState.kind}
             formats={
-              exportState.kind === 'data' || exportState.kind === 'roicubes' ||
-              exportState.kind === 'pixels' || exportState.kind === 'cache'
+              exportState.kind === 'data' || exportState.kind === 'cache'
                 ? ['zarr', 'npz']
                 : undefined
             }
-            folderMode={exportState.kind === 'roicubes'}
+            products={
+              exportState.kind === 'layerexport'
+                ? [
+                    {
+                      id: 'pixels',
+                      label: 'Pixel collection',
+                      hint: 'spectra + coords + labels',
+                      formats: ['zarr', 'npz'],
+                      labelsApply: true,
+                      disabled: isHsi ? null : 'needs an HSI image',
+                    },
+                    {
+                      id: 'cubes',
+                      label: 'HSI cubes (one per ROI)',
+                      hint: 'bbox cubes + label planes → folder',
+                      formats: ['zarr', 'npz'],
+                      folderMode: true,
+                      labelsApply: true,
+                      disabled: isHsi
+                        ? exportState.atomId != null
+                          ? 'atom scope — use pixels'
+                          : null
+                        : 'needs an HSI image',
+                    },
+                    {
+                      id: 'labelmap',
+                      label: 'Label map (mask)',
+                      hint: 'uint16 map + legend · one int per layer',
+                      formats: ['zarr', 'npz'],
+                    },
+                    {
+                      id: 'figure',
+                      label: 'Figure',
+                      hint: 'exact layer colours on black',
+                      formats: ['png', 'tiff'],
+                    },
+                  ]
+                : undefined
+            }
+            defaultProduct={
+              exportState.kind === 'layerexport' ? exportState.preset : undefined
+            }
             labelChoices={
-              exportState.kind === 'roicubes'
+              exportState.kind === 'layerexport'
                 ? labelChoicesFor(exportState.layerIds)
-                : exportState.kind === 'pixels'
-                  ? labelChoicesFor(exportState.layerIds)
-                  : undefined
+                : undefined
             }
             toggle={
               exportState.kind === 'canvas'
@@ -6364,53 +6377,8 @@ export default function App() {
                   }
                 : undefined
             }
-            info={
-              exportState.kind === 'roicubes' ? (
-                <>
-                  <p className="mb-1 text-[10px] leading-snug text-slate-400">
-                    one cube per visible ROI atom, named after it, inside the folder ·
-                    outside the region is zero-filled (invalid)
-                  </p>
-                  <div className="panel-scroll flex max-h-24 flex-col gap-0.5 overflow-y-auto
-                                  font-mono text-[10px]">
-                    {roiCubeList.map((r) => (
-                      <span key={r.key} className="flex items-center gap-1.5 text-slate-300">
-                        <span
-                          className="inline-block h-2 w-2 shrink-0 rounded-sm"
-                          style={{ backgroundColor: r.color }}
-                        />
-                        <span className="truncate">{r.name}</span>
-                      </span>
-                    ))}
-                    {!roiCubeList.length && (
-                      <span className="text-slate-500">no visible ROI atoms</span>
-                    )}
-                  </div>
-                </>
-              ) : exportState.kind === 'layers' ? (
-                <>
-                  <p className="mb-1 text-[10px] leading-snug text-slate-400">
-                    zarr / npz: integer <span className="text-slate-200">label map</span>{' '}
-                    (later layers overwrite) · png / tiff: exact layer colours on black
-                  </p>
-                  <div className="flex flex-col gap-0.5 font-mono text-[10px]">
-                    <span className="text-slate-500">0 · background</span>
-                    {layerLegend.map((l, i) => (
-                      <span key={l.id} className="flex items-center gap-1.5 text-slate-300">
-                        {i + 1} ·
-                        <span
-                          className="inline-block h-2 w-2 rounded-sm"
-                          style={{ backgroundColor: l.color }}
-                        />
-                        {l.name}
-                      </span>
-                    ))}
-                  </div>
-                </>
-              ) : undefined
-            }
-            onSave={(path, format, toggleOn, labelIds) =>
-              void doExport(path, format, toggleOn, labelIds)}
+            onSave={(path, format, toggleOn, labelIds, productId) =>
+              void doExport(path, format, toggleOn, labelIds, productId)}
             onClose={() => setExportState(null)}
           />
         )
