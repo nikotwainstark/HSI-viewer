@@ -27,7 +27,16 @@ interface Props {
   folderMode?: boolean
   /** optional label-layer checklist for dataset exports: each selected layer
       contributes one label plane/column keyed by atom NAME */
-  labelChoices?: { id: number; name: string; summary: string; warn?: string }[]
+  labelChoices?: {
+    id: number
+    name: string
+    summary: string
+    warn?: string
+    /** small badge, e.g. 'source' for the layers being exported */
+    tag?: string
+    /** pre-checked on open (default true) */
+    defaultOn?: boolean
+  }[]
   /** optional PRODUCT selector (what to export); formats / folder mode /
       label applicability follow the chosen product */
   products?: {
@@ -51,7 +60,7 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
                               folderMode, labelChoices, products, defaultProduct,
                               onSave, onClose }: Props) {
   const [labelIds, setLabelIds] = useState<number[]>(
-    () => (labelChoices ?? []).map((c) => c.id),
+    () => (labelChoices ?? []).filter((c) => c.defaultOn !== false).map((c) => c.id),
   )
   const memDir = `hsiviewer.export.${storageKey}.dir`
   const memFmt = `hsiviewer.export.${storageKey}.format`
@@ -231,6 +240,12 @@ export function ExportDialog({ title, defaultName, storageKey, formats, toggle, 
                         </span>
                       )}
                       <span className="truncate text-[12px] text-slate-200">{c.name}</span>
+                      {c.tag && (
+                        <span className="shrink-0 rounded bg-sky-400/15 px-1 font-mono
+                                         text-[9px] text-sky-300 uppercase">
+                          {c.tag}
+                        </span>
+                      )}
                       <span className="ml-auto shrink-0 text-[10px] text-slate-500">
                         {c.summary}
                       </span>

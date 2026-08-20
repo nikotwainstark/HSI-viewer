@@ -1861,26 +1861,33 @@ export default function App() {
           ),
         )
       }
-      return layers
-        .filter((l) => l.visible && !sourceIds.includes(l.id) && touches(l))
-        .map((l) => {
-          const regionAtomsOf = l.atoms.filter(
-            (a) => a.visible !== false && (a.kind === 'roi' || a.kind === 'mask'),
-          )
-          const named = new Set(
-            regionAtomsOf.map((a) => (a.name ?? '').trim() || l.name),
-          )
-          const unnamed = regionAtomsOf.filter((a) => !(a.name ?? '').trim()).length
-          return {
-            id: l.id,
-            name: l.name,
-            summary: `${regionAtomsOf.length} atoms · ${named.size} labels`,
-            ...(unnamed
-              ? { warn: `"${l.name}": ${unnamed} unnamed atom(s) label as the layer name` }
-              : {}),
-          }
-        })
-        .filter((c) => !c.summary.startsWith('0 '))
+      const rowOf = (l: LayerObj, isSource: boolean) => {
+        const regionAtomsOf = l.atoms.filter(
+          (a) => a.visible !== false && (a.kind === 'roi' || a.kind === 'mask'),
+        )
+        const named = new Set(
+          regionAtomsOf.map((a) => (a.name ?? '').trim() || l.name),
+        )
+        const unnamed = regionAtomsOf.filter((a) => !(a.name ?? '').trim()).length
+        return {
+          id: l.id,
+          name: l.name,
+          summary: `${regionAtomsOf.length} atoms · ${named.size} labels`,
+          ...(isSource ? { tag: 'source', defaultOn: true } : { defaultOn: false }),
+          ...(unnamed
+            ? { warn: `"${l.name}": ${unnamed} unnamed atom(s) label as the layer name` }
+            : {}),
+        }
+      }
+      // the SELECTED layers come first, pre-checked — they label their own
+      // pixels unless the user unticks them; other overlapping layers follow
+      // as unchecked candidates
+      return [
+        ...srcLayers.map((l) => rowOf(l, true)),
+        ...layers
+          .filter((l) => l.visible && !sourceIds.includes(l.id) && touches(l))
+          .map((l) => rowOf(l, false)),
+      ].filter((c) => !c.summary.startsWith('0 '))
     },
     [layers],
   )
@@ -4318,13 +4325,9 @@ export default function App() {
               ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
             }
           })
-          // source layers always label their own pixels (epi/stro come from
-          // the annotation layers themselves); extras from the checklist
-          const labelIdsAll = [
-            ...exportState.layerIds,
-            ...(labelIds ?? []).filter((i) => !exportState.layerIds.includes(i)),
-          ]
-          const label_layers = labelIdsAll
+          // the checklist IS the ordered truth: sources arrive pre-checked
+          // and the user may untick or reorder any column
+          const label_layers = (labelIds ?? [])
             .map((id) => layers.find((l) => l.id === id))
             .filter((l): l is LayerObj => !!l)
             .map(labelLayerSpec)
@@ -4352,7 +4355,6 @@ export default function App() {
             return
           }
           const label_layers = (labelIds ?? [])
-            .filter((id) => !exportState.layerIds.includes(id))
             .map((id) => layers.find((l) => l.id === id))
             .filter((l): l is LayerObj => !!l)
             .map(labelLayerSpec)
