@@ -1710,6 +1710,21 @@ export default function App() {
     return id
   }, [])
 
+  /** Create a layer from a UI entry point and arm Define-Atoms right away:
+      making a layer IS an intent to annotate it. (Internal auto-creation
+      inside the mode does not come through here.) */
+  const createLayerAndDefine = useCallback((maskSource?: LayerMaskSource) => {
+    const id = createLayer(maskSource)
+    if (transformImage != null || coreg) return id // modes that disarm drawing
+    setAtomMode({ type: null })
+    setErasing(false)
+    finishBrushAtom()
+    setTool('drag')
+    setRoiDraft([])
+    setPanelSel({ layers: [], atoms: { layerId: -1, ids: [] } })
+    return id
+  }, [createLayer, finishBrushAtom, transformImage, coreg])
+
   /** Enter Define-Atoms mode (marching ants come on with it, so the mode is
       visible at a glance); leaving disarms every drawing tool. */
   const enterAtomMode = useCallback(() => {
@@ -4684,6 +4699,89 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pipelineVerForRoi])
 
+  // LIVE SEL series: an edit to a displayed atom (new stroke, erase, combine,
+  // mask-source change) refetches its mean spectrum automatically — the plot
+  // must always show the atom as it IS, not as it was when displayed
+  const roiGeomKey = useMemo(
+    () =>
+      roiSpectra
+        .map((r) => {
+          const layer = layers.find((l) => l.id === r.layerId)
+          const atom = layer?.atoms.find((a) => a.id === r.atomId)
+          if (!layer || !atom) return ''
+          const geom =
+            atom.kind === 'roi'
+              ? JSON.stringify(atom.parts)
+              : atom.kind === 'mask'
+                ? atom.cacheIds.join(',')
+                : ''
+          const src = layer.maskSource
+            ? layer.maskSource.kind === 'cache'
+              ? `c${layer.maskSource.ids.join(',')}`
+              : `p${layer.maskSource.path}`
+            : ''
+          return `${r.layerId}:${r.atomId}=${src}|${geom}`
+        })
+        .join('\n'),
+    [roiSpectra, layers],
+  )
+  const roiGeomSeen = useRef(new Map<string, string>())
+  const roiRefetchPending = useRef(new Set<string>())
+  useEffect(() => {
+    if (!meta || meta.image.type !== 'hsi') return
+    const seen = roiGeomSeen.current
+    const liveKeys = new Set<string>()
+    for (const seg of roiGeomKey.split('\n')) {
+      if (!seg) continue
+      const at = seg.indexOf('=')
+      const id = seg.slice(0, at)
+      const geom = seg.slice(at + 1)
+      liveKeys.add(id)
+      const prev = seen.get(id)
+      if (prev === undefined) {
+        seen.set(id, geom) // just displayed — its fetch was fresh
+      } else if (prev !== geom) {
+        seen.set(id, geom)
+        roiRefetchPending.current.add(id)
+      }
+    }
+    for (const k of [...seen.keys()]) if (!liveKeys.has(k)) seen.delete(k)
+    if (!roiRefetchPending.current.size) return
+    // short trailing debounce: a stroke burst collapses into one refetch,
+    // which reads the CURRENT geometry and so covers every step of the burst
+    const timer = window.setTimeout(() => {
+      const ids = [...roiRefetchPending.current]
+      roiRefetchPending.current.clear()
+      for (const id of ids) {
+        const [layerId, atomId] = id.split(':').map(Number)
+        const layer = layers.find((l) => l.id === layerId)
+        const atom = layer?.atoms.find((a) => a.id === atomId)
+        if (!layer || !atom) continue
+        fetchRoiSpectrum(roiRequestArgs(layer, atom))
+          .then((res) => {
+            if (res.n_valid) {
+              setRoiSpectra((rs) =>
+                rs.map((r) =>
+                  r.layerId === layerId && r.atomId === atomId
+                    ? { ...r, values: res.values, n: res.n_valid }
+                    : r,
+                ),
+              )
+            } else {
+              // keeping the old curve would show pixels that no longer exist
+              setRoiSpectra((rs) =>
+                rs.filter((r) => !(r.layerId === layerId && r.atomId === atomId)),
+              )
+              setToast('ROI has no valid pixels any more — removed from SEL')
+            }
+          })
+          .catch(() => {/* transient failure: the next edit retries */})
+      }
+    }, 250)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roiGeomKey, layers, meta])
+
   /** ROI series with live-resolved label / color for the spectrum panel. */
   const roiSeriesResolved = useMemo(
     () =>
@@ -5355,7 +5453,7 @@ export default function App() {
                     .filter(Boolean) as LayerObj[],
                 )
               }
-              onCreate={() => createLayer()}
+              onCreate={() => createLayerAndDefine()}
               onCreateFromCacheMask={() => setLayerMaskPicker(true)}
               onCreateFromLocalMask={() => setLayerMaskFile(true)}
               onRename={(id) => {
@@ -5499,7 +5597,7 @@ export default function App() {
       picks, regions, spectrumMode, avgSpec, roiSpectra, roiSeriesResolved,
       pipeItems, cacheSel, reorderPending, regionAtoms.length,
       doSelectImage, doDeleteImage, beginCoregFor, cropSelectedToBox,
-      handlePanelSelChange, chooseLayerColor, createLayer, deleteAtom,
+      handlePanelSelChange, chooseLayerColor, createLayerAndDefine, deleteAtom,
       deleteAtomsMany, deleteLayersMany, setAtomsVisibleMany,
       setLayersVisibleMany, toggleAtomVisible, toggleRoiSpectrum,
       combineAtomsMany, combineLayersMany, startRenameAtom, cropAtom,
@@ -6820,7 +6918,7 @@ export default function App() {
             const names = ids
               .map((id) => cacheObjects.find((o) => o.id === id)?.name)
               .filter(Boolean)
-            createLayer({
+            createLayerAndDefine({
               kind: 'cache',
               ids,
               label: ids.length === 1 ? `${names[0]}` : `${ids.length} masks (∩)`,
@@ -6886,7 +6984,7 @@ export default function App() {
                     `but the canvas is [${info.expected[0]},${info.expected[1]}]`)
                   return
                 }
-                createLayer({ kind: 'local', path, label: base })
+                createLayerAndDefine({ kind: 'local', path, label: base })
                 setPanelTab('layers')
               })
               .catch((e) => setToast((e as Error).message))
