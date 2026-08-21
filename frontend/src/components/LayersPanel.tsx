@@ -94,6 +94,8 @@ interface Props {
   onEditMaskWithAtom: (layerId: number, atomId: number) => void
   /** note-specific menu entries (text / font / colour), spliced in first */
   noteEntries?: (layerId: number, atomId: number) => MenuEntry[]
+  /** open the export dialog scoped to ONE atom (pixels preset) */
+  onExportAtomPixels?: (layerId: number, atomId: number) => void
   /** true when the cache holds at least one mask object */
   hasMasks: boolean
   /** crop the atom's region into a NEW image entry (copy semantics) */
@@ -113,7 +115,7 @@ export function LayersPanel({
   onSetVisibleMany, onDeleteMany, onCombine, onSelectionChange,
   canCoregister, onCoregister, onExport, onCopyToImage,
   onSaveToFile, onLoadFromFile,
-  onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks, noteEntries,
+  onCropToAtom, onCropAtomToImage, onEditMaskWithAtom, hasMasks, noteEntries, onExportAtomPixels,
 }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; target: MenuTarget } | null>(null)
   const [creerOpen, setCreerOpen] = useState<{ x: number; y: number } | null>(null)
@@ -268,6 +270,13 @@ export function LayersPanel({
           hint: 'append to IMAGE tab',
           onClick: () => onCropAtomToImage(layer.id, atom.id),
         })
+        if (onExportAtomPixels) {
+          out.push({
+            label: 'Export pixel dataset…',
+            hint: 'this atom · spectra + coords + labels',
+            onClick: () => onExportAtomPixels(layer.id, atom.id),
+          })
+        }
         if (hasMasks) {
           out.push({
             label: 'Edit mask with this ROI…',

@@ -67,7 +67,14 @@ function SizePopover({ value, onChange, onClose }: {
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) onClose()
     }
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      // the popover owns this Esc: without stopping the event the window
+      // listeners fire too and exit the whole atom mode
+      e.stopPropagation()
+      e.stopImmediatePropagation()
+      onClose()
+    }
     window.addEventListener('mousedown', onDown)
     window.addEventListener('keydown', onKey, true)
     return () => {

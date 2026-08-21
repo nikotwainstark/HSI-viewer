@@ -693,7 +693,10 @@ export default function App() {
   // multi-image canvas arrangement
   const [layouts, setLayouts] = useState<Record<number, ImgLayout>>({})
   const [zOrder, setZOrder] = useState<number[]>([]) // bottom → top
-  const [dragImage, setDragImage] = useState<{ id: number; ax: number; ay: number } | null>(null)
+  const [dragImage, setDragImage] = useState<
+    // orig = the placement when the drag armed, so Esc can really cancel
+    { id: number; ax: number; ay: number; orig: { dx: number; dy: number } } | null
+  >(null)
   const [opacityFor, setOpacityFor] = useState<number | null>(null)
   const [display, setDisplay] = useState<Display>({ kind: 'sum' })
   const [band, setBand] = useState<number>(0)
@@ -748,6 +751,25 @@ export default function App() {
   const [spectrumMode, setSpectrumMode] = useState<SpectrumMode>('avg')
   const [avgSpec, setAvgSpec] = useState<AvgSpectrum | null>(null)
   const [picks, setPicks] = useState<PickedPixel[]>([])
+
+  // a context menu anchored to something that vanished (atom removed by an
+  // async empty-check, pick or image deleted) closes instead of silently
+  // morphing into a different menu under the pointer
+  useEffect(() => {
+    if (!menu) return
+    if (menu.atomHit) {
+      const l = layers.find((x) => x.id === menu.atomHit?.layerId)
+      if (!l || !l.atoms.some((a) => a.id === menu.atomHit?.atomId)) setMenu(null)
+      return
+    }
+    if (menu.pick && !picks.some((p) => p.id === menu.pick?.id)) {
+      setMenu(null)
+      return
+    }
+    if (menu.imageHit != null && !images.some((im) => im.id === menu.imageHit)) {
+      setMenu(null)
+    }
+  }, [menu, layers, picks, images])
   const [regions, setRegions] = useState<SpecRegion[]>([])
   const regionSeq = useRef(0)
   const pickSeq = useRef(0)
@@ -770,6 +792,11 @@ export default function App() {
   const [panelTab, setPanelTab] = useState<PanelTab>('image')
   const [cacheObjects, setCacheObjects] = useState<CacheObject[]>([])
   const [cacheSel, setCacheSel] = useState<number[]>([]) // ids in click order
+  // live cache ids, for callbacks that must not capture the objects list
+  const cacheIdsRef = useRef<Set<number>>(new Set())
+  useEffect(() => {
+    cacheIdsRef.current = new Set(cacheObjects.map((o) => o.id))
+  }, [cacheObjects])
 
   // mask threshold editor + blob cleaner + live hover value
   const [threshold, setThreshold] = useState<ThresholdState | null>(null)
@@ -961,8 +988,38 @@ export default function App() {
     [layers, activeLayerId, picksForHistory, regions, selLayout],
   )
   const applyHistoryDoc = useCallback((d: typeof historyDoc) => {
-    setLayers(d.layers)
-    setActiveLayerId(d.activeLayerId)
+    // a snapshot can reference cache objects deleted after it was taken
+    // (delete atom → delete cache object → undo): restoring those would
+    // resurrect dead references, so they are dropped — a whole layer when
+    // its mask SOURCE is gone, since unclipping it would silently change
+    // which pixels the layer means
+    const live = cacheIdsRef.current
+    let droppedAtoms = 0
+    let droppedLayers = 0
+    const layers = d.layers.flatMap((l) => {
+      if (l.maskSource?.kind === 'cache' && !l.maskSource.ids.every((i) => live.has(i))) {
+        droppedLayers += 1
+        return []
+      }
+      const atoms = l.atoms.filter(
+        (a) => a.kind !== 'mask' || a.cacheIds.every((i) => live.has(i)),
+      )
+      droppedAtoms += l.atoms.length - atoms.length
+      return [{ ...l, atoms }]
+    })
+    if (droppedAtoms || droppedLayers) {
+      const what = [
+        droppedLayers ? `${droppedLayers} mask-bound layer${droppedLayers > 1 ? 's' : ''}` : '',
+        droppedAtoms ? `${droppedAtoms} mask atom${droppedAtoms > 1 ? 's' : ''}` : '',
+      ].filter(Boolean).join(' and ')
+      setToast(`Restored state referenced deleted cache objects — ${what} dropped`)
+    }
+    setLayers(layers)
+    setActiveLayerId(
+      layers.some((l) => l.id === d.activeLayerId)
+        ? d.activeLayerId
+        : (layers[0]?.id ?? null),
+    )
     setRegions(d.regions)
     setPicks(d.picks)
     // a pick restored from history carries the spectrum of the data state it
@@ -1268,6 +1325,36 @@ export default function App() {
       },
     ])
     restoreHidden(coreg.savedHidden)
+    // the target's own display transform was suspended for the session;
+    // give it back and RE-SEAT the moving overlay on top (compose with the
+    // restored transform), so Confirm keeps the alignment without silently
+    // discarding how the user had arranged the target
+    if (tIm) {
+      const wt = tIm.shape[1]
+      const ht = tIm.shape[0]
+      const ts = linearParts(coreg.savedTarget, wt, ht)
+      const mp = linearParts(ml, meta.shape[1], meta.shape[0])
+      // moving-local -> restored-target world: Ls·(M(m) − f) + os, where f is
+      // the frozen target's translation-only placement
+      const L: RegistrationRecord['matrix'] = [
+        ts.L[0] * mp.L[0] + ts.L[1] * mp.L[2],
+        ts.L[0] * mp.L[1] + ts.L[1] * mp.L[3],
+        ts.L[0] * (mp.ox - tl.dx) + ts.L[1] * (mp.oy - tl.dy) + ts.ox,
+        ts.L[2] * mp.L[0] + ts.L[3] * mp.L[2],
+        ts.L[2] * mp.L[1] + ts.L[3] * mp.L[3],
+        ts.L[2] * (mp.ox - tl.dx) + ts.L[3] * (mp.oy - tl.dy) + ts.oy,
+      ]
+      const d = decomposeMatrix(L)
+      if (!d.shear) {
+        const cand: ImgLayout = { ...ml, rot: d.rot, sx: d.sx, sy: d.sy, dx: 0, dy: 0 }
+        const org = linearParts(cand, meta.shape[1], meta.shape[0])
+        setLayouts((cur) => ({
+          ...cur,
+          [coreg.movingId]: { ...cand, dx: L[2] - org.ox, dy: L[5] - org.oy },
+          [coreg.targetId]: coreg.savedTarget,
+        }))
+      }
+    }
     setCoreg(null)
     setTransformImage(null)
     setToast(`Registration recorded: "${mIm?.name}" → "${tIm?.name}"`)
@@ -1286,13 +1373,15 @@ export default function App() {
     setTransformImage(null)
   }, [coreg, restoreHidden])
 
-  // Esc during coreg cancels the whole session (overrides transform-mode Esc)
+  // Esc during coreg cancels the whole session — but only as the OUTERMOST
+  // mode: while an image drag or atom mode is live, Esc belongs to those
+  // (first Esc exits the inner mode, the next one reaches coreg)
   useEffect(() => {
-    if (!coreg) return
+    if (!coreg || dragImage || atomMode) return
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && cancelCoreg()
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [coreg, cancelCoreg])
+  }, [coreg, cancelCoreg, dragImage, atomMode])
 
   /** Re-apply a recorded registration as the display overlay. */
   const applyRegistration = useCallback(
@@ -1319,14 +1408,14 @@ export default function App() {
     [images, layouts],
   )
 
-  // Esc leaves transform mode (coreg mode owns Esc while active); the mode
-  // also ends if its image disappears
+  // Esc leaves transform mode (coreg mode owns Esc while active, an image
+  // drag is inner still); the mode also ends if its image disappears
   useEffect(() => {
-    if (transformImage == null || coreg) return
+    if (transformImage == null || coreg || dragImage) return
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setTransformImage(null)
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [transformImage, coreg])
+  }, [transformImage, coreg, dragImage])
 
   // protective lock: transform mode disarms drawing tools (clicks inside the
   // image would be captured as move-drags anyway)
@@ -1400,10 +1489,19 @@ export default function App() {
     })
   }, [images])
 
-  // Esc cancels image dragging
+  // Esc cancels image dragging AND puts the image back where it started —
+  // "cancel" that keeps the moved position would be a drop, not a cancel
   useEffect(() => {
     if (!dragImage) return
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setDragImage(null)
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      const { id, orig } = dragImage
+      setLayouts((cur) => ({
+        ...cur,
+        [id]: { ...(cur[id] ?? DEFAULT_LAYOUT), dx: orig.dx, dy: orig.dy },
+      }))
+      setDragImage(null)
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [dragImage])
@@ -1783,7 +1881,24 @@ export default function App() {
         return { ...a, parts: [...a.parts, stroke] }
       })
       if (!touched.length) return
-      setLayers((ls) => ls.map((l) => (l.id === layer.id ? { ...l, atoms: nextAtoms } : l)))
+      // append by id inside the updater — replacing the whole atoms array
+      // with a snapshot-derived copy would resurrect atoms an in-flight
+      // empty-check deleted in the same frame
+      const touchedIds = new Set(touched)
+      setLayers((ls) =>
+        ls.map((l) =>
+          l.id === layer.id
+            ? {
+                ...l,
+                atoms: l.atoms.map((a) =>
+                  a.kind === 'roi' && touchedIds.has(a.id)
+                    ? { ...a, parts: [...a.parts, stroke] }
+                    : a,
+                ),
+              }
+            : l,
+        ),
+      )
       // an atom whose region became empty is removed (checked server-side,
       // which owns the exact rasterization)
       for (const id of touched) {
@@ -2056,6 +2171,27 @@ export default function App() {
         .catch(() => {/* display only: a failed texture just draws nothing */})
         .finally(() => rasterPending.current.delete(key))
     }
+    // FROZEN images render their overlays from the SAME rasterizer: the
+    // faded snapshot must sit on the very pixels its ROIs cover (and brush
+    // atoms have no vector form at all). Bundles only change at switch-away,
+    // so these keys are stable until then.
+    for (const im of images) {
+      if (im.id === meta.image.id) continue
+      const bundle = imageBundles.current.get(im.id)
+      for (const layer of bundle?.layers ?? []) {
+        if (!layer.visible || layerNeedsBackendRaster(layer)) continue
+        const key = layerRasterKey(layer, im.id)
+        live.add(key)
+        if (layerRasters.has(key) || rasterPending.current.has(key)) continue
+        rasterPending.current.add(key)
+        renderLayerRaster(layer, im.shape[1], im.shape[0], String(im.id))
+          .then((r) => {
+            if (r) setLayerRasters((m) => new Map(m).set(key, r))
+          })
+          .catch(() => {/* display only */})
+          .finally(() => rasterPending.current.delete(key))
+      }
+    }
     // drop textures nobody references any more (they hold GPU memory)
     if (layerRasters.size > live.size + 8) {
       setLayerRasters((m) => {
@@ -2067,7 +2203,7 @@ export default function App() {
         return next
       })
     }
-  }, [layers, meta, layerRasters, layerRasterFactorFor])
+  }, [layers, meta, images, layerRasters, layerRasterFactorFor])
 
   /** Outer silhouettes of MULTI-PART ROI atoms, so a combined ROI draws as
       one shape instead of stacked part borders. Keyed by image + geometry,
@@ -2578,8 +2714,9 @@ export default function App() {
   // Esc while in Define-Atoms mode: clear an in-progress shape first, then
   // leave the mode entirely. Owned by the MODE (not by the armed tool), so
   // it also works on the type-picker screen where nothing is armed yet.
+  // A live image drag is inner still — its Esc must not exit this mode.
   useEffect(() => {
-    if (!atomMode) return
+    if (!atomMode || dragImage) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Enter') {
         // close the ROI the brush is building; the next stroke starts a new one
@@ -2593,11 +2730,11 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [atomMode, exitAtomMode, finishBrushAtom])
+  }, [atomMode, dragImage, exitAtomMode, finishBrushAtom])
 
   // Esc for the standalone tools (crop draw mode etc.) outside the mode
   useEffect(() => {
-    if (atomMode) return
+    if (atomMode || dragImage) return
     if (tool !== 'roi' && tool !== 'landmark' && tool !== 'crop' &&
         tool !== 'brush' && tool !== 'erase' && tool !== 'note') return
     const onKey = (e: KeyboardEvent) => {
@@ -2609,7 +2746,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [tool, atomMode])
+  }, [tool, atomMode, dragImage])
 
   const doOffloadAll = useCallback(async () => {
     try {
@@ -2909,20 +3046,56 @@ export default function App() {
           const rgbF = hexToRgb(layer.color)
           const vec = visAtoms.filter((a): a is RoiAtom => a.kind === 'roi')
           if (vec.length) {
-            result.push(
-              new PolygonLayer({
-                id: `frozen-roi-${id}-${layer.id}`,
-                data: vec.flatMap((a) => atomPolygons(a).map((polygon) => ({ polygon }))),
-                getPolygon: (d: { polygon: number[][] }) => d.polygon,
-                filled: !layer.maskSource,
-                stroked: true,
-                getFillColor: [...rgbF, Math.round(70 * FADE)] as [number, number, number, number],
-                getLineColor: [...rgbF, Math.round(230 * FADE)] as [number, number, number, number],
-                getLineWidth: 1.2,
-                lineWidthUnits: 'pixels',
-                modelMatrix: mm,
-              }),
-            )
+            if (!layerNeedsBackendRaster(layer)) {
+              // same analytic rasterization as the live image: the faded
+              // snapshot sits on the exact pixels its ROIs cover, and brush
+              // atoms (no vector form) show up too
+              const raster = layerRasters.get(layerRasterKey(layer, id))
+              if (raster?.bitmap) {
+                result.push(
+                  new BitmapLayer({
+                    id: `frozen-roi-${id}-${layer.id}`,
+                    image: raster.bitmap,
+                    bounds: raster.bounds,
+                    opacity: FADE,
+                    modelMatrix: mm,
+                    textureParameters: PIXEL_TEXTURE,
+                  }),
+                )
+              }
+              if (raster?.edges?.length) {
+                result.push(
+                  new PathLayer({
+                    id: `frozen-roi-edges-${id}-${layer.id}`,
+                    data: raster.edges,
+                    getPath: (d: [number, number][]) => d,
+                    getColor: [...rgbF, Math.round(230 * FADE)] as [number, number, number, number],
+                    getWidth: 1.2,
+                    widthUnits: 'pixels',
+                    widthMinPixels: 1,
+                    jointRounded: false,
+                    capRounded: false,
+                    modelMatrix: mm,
+                  }),
+                )
+              }
+            } else {
+              // mask-bound layer: the exact clipped raster lives on the
+              // backend; a frozen image keeps the unclipped outline only
+              result.push(
+                new PolygonLayer({
+                  id: `frozen-roi-${id}-${layer.id}`,
+                  data: vec.flatMap((a) => atomPolygons(a).map((polygon) => ({ polygon }))),
+                  getPolygon: (d: { polygon: number[][] }) => d.polygon,
+                  filled: false,
+                  stroked: true,
+                  getLineColor: [...rgbF, Math.round(230 * FADE)] as [number, number, number, number],
+                  getLineWidth: 1.2,
+                  lineWidthUnits: 'pixels',
+                  modelMatrix: mm,
+                }),
+              )
+            }
           }
           const lms = visAtoms.filter((a) => a.kind === 'landmark')
           if (lms.length) {
@@ -3671,15 +3844,34 @@ export default function App() {
 
   const handleCacheDelete = useCallback(
     async (ids: number[]) => {
+      // a cache object the document still references must not be deletable:
+      // the layer would dangle and every mask-bound computation would 404
+      const inUse: string[] = []
+      for (const l of layers) {
+        if (l.maskSource?.kind === 'cache' && l.maskSource.ids.some((i) => ids.includes(i))) {
+          inUse.push(`layer "${l.name}" (mask source)`)
+        }
+        for (const a of l.atoms) {
+          if (a.kind === 'mask' && a.cacheIds.some((i) => ids.includes(i))) {
+            inUse.push(`mask atom "${a.name ?? a.label}" in layer "${l.name}"`)
+          }
+        }
+      }
+      if (inUse.length) {
+        const more = inUse.length > 1 ? ` and ${inUse.length - 1} more` : ''
+        setToast(`Cannot delete: still used by ${inUse[0]}${more} — remove those first`)
+        return
+      }
       try {
         for (const id of ids) await deleteCacheObject(id)
       } catch (e) {
         setToast((e as Error).message)
       }
       await refreshCache()
+      setCacheSel((s) => s.filter((i) => !ids.includes(i)))
       setDisplay((d) => (d.kind === 'cached' && ids.includes(d.id) ? { kind: 'sum' } : d))
     },
-    [refreshCache],
+    [layers, refreshCache],
   )
 
   const handleCacheDisplay = useCallback((obj: CacheObject) => {
@@ -3866,11 +4058,14 @@ export default function App() {
   >(null)
 
   /** Every ROI/mask atom that can serve as an edit region, newest first. */
+  // atoms that DEFINE a pixel region — a landmark is a point and a note is a
+  // text anchor: neither covers pixels, and offering one as a mask-edit
+  // region would intersect the mask with an empty set and wipe it
   const regionAtoms = useMemo(
     () =>
       layers.flatMap((l) =>
         l.atoms
-          .filter((a) => a.kind !== 'landmark' && a.visible !== false)
+          .filter((a) => a.kind !== 'landmark' && a.kind !== 'note' && a.visible !== false)
           .map((a) => ({ layer: l, atom: a })),
       ),
     [layers],
@@ -3880,7 +4075,7 @@ export default function App() {
     layer: LayerObj, atom: Atom, maskId: number | null = null,
   ) => {
     const args = roiRequestArgs(layer, atom)
-    if (atom.kind === 'landmark') return
+    if (atom.kind === 'landmark' || atom.kind === 'note') return
     setMaskEdit({
       maskId,
       label: atomLabel(atom),
@@ -4530,8 +4725,17 @@ export default function App() {
                 ...(l.maskSource?.kind === 'local' ? { path: l.maskSource.path } : {}),
               })),
           )
+          // a mask atom has no vector outline to cut a cube from — skipping
+          // it must be SAID, not silent, or the export looks complete
+          const skippedMasks = src.reduce(
+            (n, l) =>
+              n + l.atoms.filter((a) => a.kind === 'mask' && a.visible !== false).length,
+            0,
+          )
           if (!rois.length) {
-            setToast('No visible ROI atoms to export')
+            setToast(skippedMasks
+              ? 'No cubes exported: mask atoms have no ROI outline — use a pixel collection'
+              : 'No visible ROI atoms to export')
             return
           }
           const label_layers = (labelIds ?? [])
@@ -4543,7 +4747,13 @@ export default function App() {
               folder: path.replace(/\/$/, ''), format, rois, orient,
               ...(label_layers.length ? { label_layers } : {}),
             }),
-            async (st) => setToast(st.message || 'ROI cubes exported'),
+            async (st) => setToast(
+              `${st.message || 'ROI cubes exported'}${
+                skippedMasks
+                  ? ` · ${skippedMasks} mask atom${skippedMasks > 1 ? 's' : ''} skipped (no ROI outline)`
+                  : ''
+              }`,
+            ),
           )
           return
         }
@@ -5001,6 +5211,17 @@ export default function App() {
     [tool, stretch, cmap, display, enterAtomMode, transformImage, coreg],
   )
 
+  // stable identity across unrelated layout changes (drag updates layouts
+  // per frame; the side panel must not re-render for those)
+  const hiddenImageKey = images
+    .filter((i) => layouts[i.id]?.hidden)
+    .map((i) => i.id)
+    .join(',')
+  const hiddenImageIds = useMemo(
+    () => (hiddenImageKey ? hiddenImageKey.split(',').map(Number) : []),
+    [hiddenImageKey],
+  )
+
   const propertyPanelEl = useMemo(() => {
     if (!meta) return null
     return (
@@ -5025,6 +5246,8 @@ export default function App() {
               onInfo={setInfoImage}
               onLoad={() => setBrowserOpen(true)}
               onCoregister={images.length > 1 ? beginCoregFor : null}
+              hiddenIds={hiddenImageIds}
+              onToggleHidden={toggleImageHidden}
               onCrop={() => {
                 setRoiDraft([])
                 setTool('crop')
@@ -5045,6 +5268,11 @@ export default function App() {
               layers={layers}
               activeId={activeLayerId}
               isHsi={isHsi}
+              onExportAtomPixels={(layerId, atomId) =>
+                setExportState({
+                  kind: 'layerexport', layerIds: [layerId], atomId, preset: 'pixels',
+                })
+              }
               onActivate={setActiveLayerId}
               onReorder={(ids) =>
                 setLayers((ls) =>
@@ -5204,7 +5432,7 @@ export default function App() {
       handleExportNode, handleApplyMask, handleCachePeak, handleCacheArea,
       handleCacheRatio, handleCacheRgb, handleCacheDelete, handleCacheDisplay,
       addStep, removeStep, revertToNode, submitJob, noteMenuEntries,
-      saveLayersToFile])
+      saveLayersToFile, hiddenImageIds, toggleImageHidden])
 
   const menuItems: MenuEntry[] = useMemo(() => {
     if (!menu) return []
@@ -5309,7 +5537,9 @@ export default function App() {
           {
             label: `Drag "${im.name}"`,
             hint: 'click to drop · Esc',
-            onClick: () => setDragImage({ id: im.id, ax: wx - l.dx, ay: wy - l.dy }),
+            onClick: () =>
+              setDragImage({ id: im.id, ax: wx - l.dx, ay: wy - l.dy,
+                             orig: { dx: l.dx, dy: l.dy } }),
           },
           { label: 'Send forward', onClick: () => bumpZ(im.id, 1) },
           { label: 'Send backward', onClick: () => bumpZ(im.id, -1) },
@@ -5334,6 +5564,13 @@ export default function App() {
             onClick: () => toggleImageHidden(im.id),
           },
           ...registrationEntries(im.id),
+          { divider: true } as MenuEntry,
+          { label: 'Properties…', hint: 'dataset info', onClick: () => setInfoImage(im) },
+          {
+            label: 'Delete image',
+            hint: formatBytes(im.size_bytes),
+            onClick: () => doDeleteImage(im.id),
+          },
         ]
       }
     }
@@ -5354,7 +5591,9 @@ export default function App() {
       items.push({
         label: `Drag "${meta.name}"`,
         hint: 'click to drop · Esc',
-        onClick: () => setDragImage({ id: meta.image.id, ax: wx - l.dx, ay: wy - l.dy }),
+        onClick: () =>
+          setDragImage({ id: meta.image.id, ax: wx - l.dx, ay: wy - l.dy,
+                         orig: { dx: l.dx, dy: l.dy } }),
       })
       items.push({ label: 'Send forward', onClick: () => bumpZ(meta.image.id, 1) })
       items.push({ label: 'Send backward', onClick: () => bumpZ(meta.image.id, -1) })
@@ -5386,6 +5625,30 @@ export default function App() {
         onClick: () => toggleImageHidden(meta.image.id),
       })
       items.push(...registrationEntries(meta.image.id))
+      if (isHsi) {
+        items.push({
+          label: 'Crop…',
+          hint: 'in place · draw a window on canvas',
+          onClick: () => {
+            setRoiDraft([])
+            setTool('crop')
+            setToast('Crop mode: click two corners of the window · Esc cancels')
+          },
+        })
+      }
+      const selfInfo = images.find((i) => i.id === meta.image.id)
+      if (selfInfo) {
+        items.push({ divider: true })
+        items.push({
+          label: 'Properties…', hint: 'dataset info',
+          onClick: () => setInfoImage(selfInfo),
+        })
+        items.push({
+          label: 'Delete image',
+          hint: formatBytes(selfInfo.size_bytes),
+          onClick: () => doDeleteImage(selfInfo.id),
+        })
+      }
     }
     // the canvas inherits the displayed cache object's own operations
     // ("display on canvas" is omitted — it already is)
@@ -5412,6 +5675,11 @@ export default function App() {
             })
           }
         }
+        items.push({
+          label: 'Save to file…',
+          hint: 'zarr / npz bundle',
+          onClick: () => setExportState({ kind: 'cache', ids: [obj.id] }),
+        })
         items.push({
           label: 'Delete from cache',
           hint: obj.name,
@@ -5445,7 +5713,7 @@ export default function App() {
   }, [menu, fitView, picks.length, removePick, clearPicks, display, openThreshold,
       cacheObjects, openBlobClean, openIsolate, handleCacheDelete, isHsi,
       images, layouts, meta, selToLocal, bumpZ, doSelectImage, registrationEntries,
-      layers, cropAtom, deleteAtom, cropSelectedToBox,
+      layers, cropAtom, deleteAtom, cropSelectedToBox, doDeleteImage,
       beginCoregFor, regionAtoms.length, openMaskEditWithAtom, toggleRoiSpectrum,
       toggleImageHidden, toggleAtomVisible, startRenameAtom, roiSpectra,
       noteMenuEntries])

@@ -20,9 +20,12 @@ interface Props {
   onCrop: () => void
   /** start coregistration with this image as MOVING (null: single image) */
   onCoregister: ((id: number, x: number, y: number) => void) | null
+  /** ids currently hidden on the canvas */
+  hiddenIds: number[]
+  onToggleHidden: (id: number) => void
 }
 
-export function ImagePanel({ images, selectedId, onSelect, onDelete, onInfo, onLoad, onCrop, onCoregister }: Props) {
+export function ImagePanel({ images, selectedId, onSelect, onDelete, onInfo, onLoad, onCrop, onCoregister, hiddenIds, onToggleHidden }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; img: ImageEntryInfo } | null>(null)
 
   const openMenu = (img: ImageEntryInfo) => (e: ReactMouseEvent) => {
@@ -53,6 +56,11 @@ export function ImagePanel({ images, selectedId, onSelect, onDelete, onInfo, onL
               onClick: () => onCoregister(menu.img.id, menu.x, menu.y),
             }]
           : []),
+        {
+          label: hiddenIds.includes(menu.img.id) ? 'Show on canvas' : 'Hide on canvas',
+          hint: hiddenIds.includes(menu.img.id) ? undefined : 'dashed outline stays visible',
+          onClick: () => onToggleHidden(menu.img.id),
+        },
         { divider: true },
         { label: 'Delete image', hint: formatBytes(menu.img.size_bytes), onClick: () => onDelete(menu.img.id) },
       ]
