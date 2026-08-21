@@ -150,6 +150,57 @@ def _flat_entry(entry_id: int, name: str, path: str, itype: str,
     return ImageEntry(entry_id, name, path, itype, array=arr, dtype_label=dtype_label)
 
 
+def checkpoint_array(arr: np.ndarray, tag: str) -> "zarr.Array":
+    """Persist an in-memory cube as a DISK checkpoint and return the on-disk
+    zarr array. `zarr.array()`'s default memory store would keep a full
+    compressed copy of the cube alive for the entry's lifetime (revert reads
+    it back), permanently doubling resident memory for crops/bakes/TIFFs."""
+    import shutil
+    from uuid import uuid4
+
+    from .dataset import CACHE_DIR
+
+    root = CACHE_DIR / "checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    p = root / f"{tag}_{uuid4().hex[:10]}.zarr"
+    z = zarr.open(str(p), mode="w", shape=arr.shape, dtype=str(arr.dtype),
+                  chunks=(min(300, arr.shape[0]), min(300, arr.shape[1]),
+                          arr.shape[2]))
+    z[:] = arr
+    return z
+
+
+def dispose_entry(entry: "ImageEntry") -> None:
+    """Delete an entry's disk checkpoint (if it has one). Called whenever an
+    entry is removed or replaced so checkpoints never pile up."""
+    import shutil
+
+    from .dataset import CACHE_DIR
+
+    ds = entry.dataset
+    root = getattr(getattr(ds, "cube", None), "store", None)
+    root = getattr(root, "root", None)
+    try:
+        if root is not None and (CACHE_DIR / "checkpoints") in Path(root).parents:
+            shutil.rmtree(root, ignore_errors=True)
+            logger.info("checkpoint disposed: %s", root)
+    except Exception:  # cleanup must never break the operation itself
+        logger.exception("checkpoint cleanup failed")
+
+
+def sweep_checkpoints() -> None:
+    """Remove ALL checkpoints at server start — they belong to dead sessions
+    (in-memory entries never survive a restart, so neither should these)."""
+    import shutil
+
+    from .dataset import CACHE_DIR
+
+    root = CACHE_DIR / "checkpoints"
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+        logger.info("stale checkpoints swept: %s", root)
+
+
 def _dataset_from_cube(cube_arr: np.ndarray, path: str) -> HSIDataset:
     """(H, W, B) array -> ready HSIDataset with a plain band-index axis."""
     cube = zarr.array(cube_arr,
@@ -166,9 +217,8 @@ def entry_from_array(entry_id: int, name: str, path: str, arr: np.ndarray,
                      progress: ProgressFn, axis_kind: str = "generic") -> ImageEntry:
     """Register an in-memory (H, W, B) float32 array (e.g. an ROI crop) as a
     fresh HSI image entry with the given spectral axis."""
-    cube = zarr.array(np.ascontiguousarray(arr, dtype=np.float32),
-                      chunks=(min(300, arr.shape[0]), min(300, arr.shape[1]),
-                              arr.shape[2]))
+    cube = checkpoint_array(np.ascontiguousarray(arr, dtype=np.float32),
+                            f"entry{entry_id}")
     ds = HSIDataset(cube=cube, wavenumbers=wavenumbers, mask=None, key_path=path,
                     axis_kind=axis_kind)
     ds.ensure_ready(progress)
@@ -179,9 +229,7 @@ def _wrap_hsi_array(entry_id: int, p: Path, arr: np.ndarray,
                     progress: ProgressFn) -> ImageEntry:
     """Wrap an in-memory (H, W, C) array as an HSI entry. The original dtype
     is kept in the backing store; conversion to float32 happens on read."""
-    cube = zarr.array(np.ascontiguousarray(arr),
-                      chunks=(min(300, arr.shape[0]), min(300, arr.shape[1]),
-                              arr.shape[2]))
+    cube = checkpoint_array(np.ascontiguousarray(arr), f"wrap{entry_id}")
     ds = HSIDataset(cube=cube, wavenumbers=None, mask=None, key_path=str(p))
     ds.ensure_ready(lambda f, m: progress(0.15 + 0.85 * f, m))
     return ImageEntry(entry_id, p.name, str(p), "hsi", dataset=ds)

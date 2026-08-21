@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
@@ -507,6 +508,7 @@ class HSIDataset:
 
         # user-cached derived objects (peak / area / ratio / rgb / mask)
         self.cache_objects: list[dict] = []
+        self._mask_lru: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._cache_seq = 0
 
         self._live_full_cache: tuple[str, np.ndarray] | None = None
@@ -632,6 +634,8 @@ class HSIDataset:
                 full_sum += block
                 progress((out_i + 1) / len(idxs))
             full_sum /= max(len(idxs), 1)
+            # contract: invalid pixels are all-zero (see hwc branch)
+            full[:, ~full_valid] = 0.0
         else:
             ch, cw = self.cube.chunks[0], self.cube.chunks[1]
             jobs = [(r, c) for r in range(0, self.height, ch)
@@ -643,9 +647,13 @@ class HSIDataset:
                 if self._band_keep is not None:
                     block = block[:, :, self._band_keep]
                 h, w = block.shape[:2]
+                vblock = np.any(np.isfinite(block) & (block != 0), axis=2)
+                # enforce the documented contract AT THE SOURCE: invalid
+                # pixels are all-zero (raw stores may carry NaN/inf there),
+                # which is what lets statistics run as plain reductions
+                block[~vblock] = 0.0
                 full[:, r : r + h, c : c + w] = block.transpose(2, 0, 1)
-                full_valid[r : r + h, c : c + w] = \
-                    np.any(np.isfinite(block) & (block != 0), axis=2)
+                full_valid[r : r + h, c : c + w] = vblock
                 full_sum[r : r + h, c : c + w] = np.mean(block, axis=2)
 
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -659,15 +667,22 @@ class HSIDataset:
                     time.perf_counter() - t0, full.nbytes / 1e9)
 
     def _compute_full_stats(self) -> None:
-        """Mean spectrum over valid pixels, from the full-resolution data."""
+        """Mean spectrum over valid pixels, from the full-resolution data.
+
+        Invalid pixels are all-zero by contract, so per band the valid-pixel
+        nanmean reduces to nansum(band) / (n_valid − NaNs in the band):
+        plain sequential reductions instead of a fancy-index gather that
+        copied ~n_valid elements per band (tens of GB of allocation traffic
+        on a large cube)."""
         assert self.full is not None and self.full_valid is not None
         valid = self.full_valid
         self.n_valid = int(valid.sum())
         avg = np.zeros(self.bands, dtype=np.float64)
         if self.n_valid:
-            flat_idx = np.flatnonzero(valid.ravel())
             for b in range(self.bands):
-                avg[b] = float(np.nanmean(self.full[b].ravel()[flat_idx]))
+                band = self.full[b]
+                denom = self.n_valid - int(np.isnan(band).sum())
+                avg[b] = float(np.nansum(band, dtype=np.float64)) / max(denom, 1)
         self.avg_spectrum = avg
         logger.info("valid pixels: %d/%d", self.n_valid, valid.size)
 
@@ -955,6 +970,10 @@ class HSIDataset:
     def cache_delete(self, obj_id: int) -> None:
         self._cache_get(obj_id)  # raises KeyError for unknown ids
         self.cache_objects = [o for o in self.cache_objects if o["id"] != obj_id]
+        # resolved-mask cache entries built from this object are now lies
+        self._mask_lru = OrderedDict(
+            (k, v) for k, v in self._mask_lru.items()
+            if not (k[0] and obj_id in k[0]))
 
     def render_cache(self, obj_id: int, plo: float = 2.0, phi: float = 98.0,
                      cmap: str | None = None, factor: int = PREVIEW_FACTOR) -> bytes:
@@ -1146,7 +1165,35 @@ class HSIDataset:
             progress((i + 1) / n_chunks, "vector normalising")
         self.full_valid = new_valid
 
+    #: small LRU for resolved step masks — ants refresh per viewport change
+    #: and every clip render re-resolved the same mask from scratch (path
+    #: sources even re-read the file). Keys carry cache ids / path+mtime and
+    #: the grid; entries are READ-ONLY views so a caller can never corrupt
+    #: the cache in place.
+    _MASK_LRU_CAP = 8
+
     def _resolve_step_mask(self, step: dict) -> np.ndarray:
+        ids = tuple(step.get("cache_ids") or ()) or None
+        path = step.get("path")
+        mtime = None
+        if path:
+            try:
+                mtime = Path(path).expanduser().stat().st_mtime
+            except OSError:
+                mtime = None
+        key = (ids, path, mtime, self.height, self.width)
+        cached = self._mask_lru.get(key)
+        if cached is not None:
+            self._mask_lru.move_to_end(key)
+            return cached
+        m = self._resolve_step_mask_uncached(step)
+        m.setflags(write=False)
+        self._mask_lru[key] = m
+        while len(self._mask_lru) > self._MASK_LRU_CAP:
+            self._mask_lru.popitem(last=False)
+        return m
+
+    def _resolve_step_mask_uncached(self, step: dict) -> np.ndarray:
         if step.get("cache_ids"):
             masks = [self._cache_get(i) for i in step["cache_ids"]]
             if any(m["kind"] != "mask" for m in masks):

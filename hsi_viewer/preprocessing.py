@@ -33,7 +33,14 @@ def clean_mask_blobs(mask: np.ndarray, min_blob_size: int = 500, expansion: int 
     result is intersected with the original mask to undo the dilation.
     """
     original = mask.astype(bool)
-    work = ndimage.binary_dilation(original, iterations=expansion) if expansion > 0 else original
+    # k iterated cross dilations == taxicab distance <= k; one distance
+    # transform replaces the O(k) serial dilation loop (a 50-step expansion
+    # on a native-resolution mask took seconds per slider move)
+    if expansion > 0:
+        work = ndimage.distance_transform_cdt(
+            ~original, metric="taxicab") <= expansion
+    else:
+        work = original
     labels, n = ndimage.label(work)
     if n == 0:
         return np.zeros_like(original, dtype=np.float32)

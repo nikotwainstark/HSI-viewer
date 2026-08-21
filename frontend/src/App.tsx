@@ -517,6 +517,8 @@ export default function App() {
       laggier, so points are baked into `stable` in batches and only the live
       tail is rasterized per frame (the tail is drawn minus the baked coverage
       so the two never double-blend). */
+  /** last frame's live-tail bitmap, closed on the next frame / stroke end */
+  const tailBitmap = useRef<ImageBitmap | null>(null)
   const strokeCache = useRef<{
     baked: number
     stable: import('./lib/pixelRegion').PixelRegion | null
@@ -530,9 +532,13 @@ export default function App() {
 
   // the stroke preview cache dies with its stroke
   useEffect(() => {
-    if (brushStroke == null && strokeCache.current) {
-      strokeCache.current.bitmap?.close?.()
-      strokeCache.current = null
+    if (brushStroke == null) {
+      if (strokeCache.current) {
+        strokeCache.current.bitmap?.close?.()
+        strokeCache.current = null
+      }
+      tailBitmap.current?.close?.()
+      tailBitmap.current = null
     }
   }, [brushStroke])
 
@@ -770,7 +776,6 @@ export default function App() {
   const [blobClean, setBlobClean] = useState<BlobCleanState | null>(null)
   const [isolate, setIsolate] = useState<IsolateState | null>(null)
   const [hoverValue, setHoverValue] = useState<number | null>(null)
-  const hoverBusy = useRef(false)
 
   // preprocessing pipeline editor: interleaved data-object checkpoints and
   // steps. The last data node is always the live state; steps after it are
@@ -1015,7 +1020,11 @@ export default function App() {
     start: ImgLayout
   } | null>(null)
   // rotate-handle offset: ~28 screen px expressed in world units
-  const rotOffsetWorld = 28 / Math.pow(2, viewState?.zoom ?? 0)
+  // nonzero ONLY while the transform handles are up: this value tracks zoom
+  // per frame, and as a deckLayers dependency it forced a full scene rebuild
+  // on every zoom frame even with no handles on screen
+  const rotOffsetWorld =
+    transformImage != null ? 28 / Math.pow(2, viewState?.zoom ?? 0) : 0
 
   /** Begin a handle drag if the pointer lands on a transform handle (or
       inside the transformed image = move). Returns true when captured. */
@@ -1958,28 +1967,48 @@ export default function App() {
 
   useEffect(() => {
     if (!meta) return
-    for (const layer of layers) {
-      if (!layer.visible || !layerNeedsBackendRaster(layer)) continue
-      const vis = layer.atoms.filter((a) => a.visible !== false)
-      const atomParts = vis.flatMap((a) => (a.kind === 'roi' ? [a.parts] : []))
-      const maskAtoms = vis.flatMap((a) => (a.kind === 'mask' ? [a.cacheIds] : []))
-      if (!atomParts.length && !maskAtoms.length && !layer.maskSource) continue
-      const key = layerClipKey(layer, meta.image.id, layerRasterFactorFor())
-      if (clipBitmaps.has(key) || clipPending.current.has(key)) continue
-      clipPending.current.add(key)
-      fetchRoiClip({
-        atoms: atomParts,
-        ...(maskAtoms.length ? { mask_atoms: maskAtoms } : {}),
-        ...(layer.maskSource?.kind === 'cache' ? { cache_ids: layer.maskSource.ids } : {}),
-        ...(layer.maskSource?.kind === 'local' ? { path: layer.maskSource.path } : {}),
-        color: layer.color,
-        pf: layerRasterFactorFor(),
+    // debounced: painting on a mask-bound layer changes the geometry key on
+    // EVERY stroke, and each key used to fire an immediate full-frame
+    // native-resolution render — coalesce a burst of edits into one fetch
+    const timer = window.setTimeout(() => {
+      const live = new Set<string>()
+      for (const layer of layers) {
+        if (!layer.visible || !layerNeedsBackendRaster(layer)) continue
+        const vis = layer.atoms.filter((a) => a.visible !== false)
+        const atomParts = vis.flatMap((a) => (a.kind === 'roi' ? [a.parts] : []))
+        const maskAtoms = vis.flatMap((a) => (a.kind === 'mask' ? [a.cacheIds] : []))
+        if (!atomParts.length && !maskAtoms.length && !layer.maskSource) continue
+        const key = layerClipKey(layer, meta.image.id, layerRasterFactorFor())
+        live.add(key)
+        if (clipBitmaps.has(key) || clipPending.current.has(key)) continue
+        clipPending.current.add(key)
+        fetchRoiClip({
+          atoms: atomParts,
+          ...(maskAtoms.length ? { mask_atoms: maskAtoms } : {}),
+          ...(layer.maskSource?.kind === 'cache' ? { cache_ids: layer.maskSource.ids } : {}),
+          ...(layer.maskSource?.kind === 'local' ? { path: layer.maskSource.path } : {}),
+          color: layer.color,
+          pf: layerRasterFactorFor(),
+        })
+          .then((blob) => createImageBitmap(blob))
+          .then((bm) => setClipBitmaps((m) => new Map(m).set(key, bm)))
+          .catch((e) => setToast(`Layer "${layer.name}" failed to render: ${(e as Error).message}`))
+          .finally(() => clipPending.current.delete(key))
+      }
+      // evict superseded frames and CLOSE their bitmaps (a native-res frame
+      // is ~17 MB of GPU-backed memory; the map used to grow per stroke,
+      // forever) — keep only what current geometry can still display
+      setClipBitmaps((m) => {
+        if (m.size <= live.size) return m
+        const next = new Map<string, ImageBitmap>()
+        for (const [k, v] of m) {
+          if (live.has(k)) next.set(k, v)
+          else v.close?.()
+        }
+        return next
       })
-        .then((blob) => createImageBitmap(blob))
-        .then((bm) => setClipBitmaps((m) => new Map(m).set(key, bm)))
-        .catch((e) => setToast(`Layer "${layer.name}" failed to render: ${(e as Error).message}`))
-        .finally(() => clipPending.current.delete(key))
-    }
+    }, 120)
+    return () => window.clearTimeout(timer)
   }, [layers, meta, layerRasterFactorFor, clipBitmaps, layerClipKey])
 
   // native outline contours for mask atoms: needed for highlight rendering
@@ -2020,7 +2049,7 @@ export default function App() {
       live.add(key)
       if (layerRasters.has(key) || rasterPending.current.has(key)) continue
       rasterPending.current.add(key)
-      renderLayerRaster(layer, meta.shape[1], meta.shape[0])
+      renderLayerRaster(layer, meta.shape[1], meta.shape[0], String(meta.image.id))
         .then((r) => {
           if (r) setLayerRasters((m) => new Map(m).set(key, r))
         })
@@ -2043,9 +2072,9 @@ export default function App() {
   /** Outer silhouettes of MULTI-PART ROI atoms, so a combined ROI draws as
       one shape instead of stacked part borders. Keyed by image + geometry,
       so edits and undo invalidate it naturally. */
-  const [partsOutlines, setPartsOutlines] = useState<Map<string, [number, number][][]>>(
-    new Map(),
-  )
+  const [partsOutlines, setPartsOutlines] = useState<
+    Map<string, { geom: string; contours: [number, number][][] }>
+  >(new Map())
   const outlinePendingParts = useRef(new Set<string>())
   const maskSuffix = (layer: LayerObj) =>
     layer.maskSource
@@ -2058,14 +2087,26 @@ export default function App() {
 
   useEffect(() => {
     if (!meta) return
+    // LAZY: silhouettes exist for the selection halo, so only SELECTED
+    // atoms fetch — the old eager prefetch re-sent an atom's ENTIRE
+    // accumulated geometry after every stroke (O(N²) traffic per painting
+    // session) for outlines that were never shown. Keyed by atom identity:
+    // a re-trace replaces its predecessor instead of piling up.
+    const live = new Set<string>()
     for (const layer of layers) {
       const bound = !!layer.maskSource
+      const layerSelected = panelSel.layers.includes(layer.id)
+      const selIds = panelSel.atoms.layerId === layer.id ? panelSel.atoms.ids : []
       for (const atom of layer.atoms) {
         if (atom.kind !== 'roi' || atom.visible === false) continue
+        const idKey = `${meta.image.id}:${layer.id}:${atom.id}`
+        live.add(idKey)
+        if (!layerSelected && !selIds.includes(atom.id)) continue
         if (!needsSilhouette(atom, bound)) continue
-        const key = partsKey(meta.image.id, layer, atom)
-        if (partsOutlines.has(key) || outlinePendingParts.current.has(key)) continue
-        outlinePendingParts.current.add(key)
+        const geom = partsKey(meta.image.id, layer, atom)
+        const have = partsOutlines.get(idKey)
+        if (have?.geom === geom || outlinePendingParts.current.has(idKey)) continue
+        outlinePendingParts.current.add(idKey)
         fetchPartsOutline({
           parts: atom.parts,
           ...(layer.maskSource?.kind === 'cache'
@@ -2073,12 +2114,20 @@ export default function App() {
           ...(layer.maskSource?.kind === 'local'
             ? { path: layer.maskSource.path } : {}),
         })
-          .then((cs) => setPartsOutlines((m) => new Map(m).set(key, cs)))
+          .then((cs) =>
+            setPartsOutlines((m) => new Map(m).set(idKey, { geom, contours: cs })))
           .catch(() => {/* fall back to per-part borders */})
-          .finally(() => outlinePendingParts.current.delete(key))
+          .finally(() => outlinePendingParts.current.delete(idKey))
       }
     }
-  }, [layers, meta, partsOutlines])
+    // entries for atoms that no longer exist
+    if ([...partsOutlines.keys()].some((k) => !live.has(k))) {
+      setPartsOutlines((m) => {
+        const next = new Map([...m].filter(([k]) => live.has(k)))
+        return next.size === m.size ? m : next
+      })
+    }
+  }, [layers, meta, partsOutlines, panelSel])
 
   // canvas highlight follows the Layers tab: leaving it clears the selection
   useEffect(() => {
@@ -2115,6 +2164,7 @@ export default function App() {
   // lands, so the ants never blink out mid-navigation.
   const [antsPaths, setAntsPaths] = useState<[number, number][][] | null>(null)
   const antsReq = useRef(0)
+  const antsKey = useRef('')
   useEffect(() => {
     const layer = layers.find((l) => l.id === activeLayerId)
     if (!meta || !layer || !layer.visible || !atomMode) {
@@ -2123,7 +2173,13 @@ export default function App() {
     }
     if (!layer.maskSource) {
       const [h, w] = meta.shape
-      setAntsPaths([[[0, 0], [w, 0], [w, h], [0, h], [0, 0]]])
+      // identity-stable: this effect re-runs per view settle, and a fresh
+      // array every time would re-render the whole app for an unchanged rect
+      const key = `rect:${w}x${h}`
+      if (antsKey.current !== key) {
+        antsKey.current = key
+        setAntsPaths([[[0, 0], [w, 0], [w, h], [0, h], [0, 0]]])
+      }
       return
     }
     if (!viewState) return
@@ -2150,6 +2206,12 @@ export default function App() {
         Math.hypot(a1[0] - a0[0], a1[1] - a0[1]),
         Math.hypot(a2[0] - a0[0], a2[1] - a0[1]),
       )
+      const src = layer.maskSource!.kind === 'cache'
+        ? `c${layer.maskSource!.ids.join(',')}`
+        : `p${layer.maskSource!.path}`
+      const reqKey = `${src}|${wx0.toFixed(0)},${wy0.toFixed(0)},${wx1.toFixed(0)},${wy1.toFixed(0)}|${detail.toFixed(3)}`
+      if (antsKey.current === reqKey) return // same trace already on screen
+      antsKey.current = reqKey
       fetchMaskOutline({
         ...(layer.maskSource!.kind === 'cache'
           ? { cache_ids: layer.maskSource!.ids }
@@ -2160,7 +2222,9 @@ export default function App() {
         .then(({ contours }) => {
           if (antsReq.current === seq) setAntsPaths(contours)
         })
-        .catch(() => {/* display only — keep the previous trace */})
+        .catch(() => {
+          antsKey.current = '' // failed trace must not block the retry
+        })
     }, 180)
     return () => window.clearTimeout(timer)
   }, [activeLayerId, layers, meta, atomMode, viewState, size, selToLocal])
@@ -2568,12 +2632,21 @@ export default function App() {
     }
   }, [history])
 
+  // Dragging the stretch slider fires per pointer-move; rendering a full
+  // native frame for every intermediate percentile flooded the request
+  // queue. The slider UI stays live; the RENDER value trails by 150 ms.
+  const [stretchSettled, setStretchSettled] = useState(stretch)
+  useEffect(() => {
+    const t = window.setTimeout(() => setStretchSettled(stretch), 150)
+    return () => window.clearTimeout(t)
+  }, [stretch])
+
   const imageUrl = meta
     ? threshold
       ? thresholdUrl(meta, display, threshold.value, threshold.reverse, pipelineVersion, viewFactor)
       : blobClean
         ? maskCleanUrl(meta, blobClean.maskId, blobClean)
-        : previewUrl(meta, display, stretch, cmap, pipelineVersion, viewFactor)
+        : previewUrl(meta, display, stretchSettled, cmap, pipelineVersion, viewFactor)
     : null
   const { bitmap, loadedUrl } = usePreviewImage(imageUrl, setToast)
   // whose image the decoded bitmap belongs to: band/stretch changes keep the
@@ -2585,7 +2658,10 @@ export default function App() {
     meta != null &&
     new URLSearchParams(loadedUrl.split('?')[1] ?? '').get('ds') === meta.id
 
-  // live value under the cursor (throttled: one request in flight at a time)
+  // live value under the cursor: debounced with a TRAILING fetch, so a fast
+  // sweep sends nothing until the cursor settles and the value shown always
+  // belongs to the pixel it rests on (the old one-in-flight throttle both
+  // chained requests and displayed a mid-sweep stale value)
   useEffect(() => {
     if (
       !meta || !cursorPos || display.kind === 'flat' ||
@@ -2594,14 +2670,12 @@ export default function App() {
       setHoverValue(null)
       return
     }
-    if (hoverBusy.current) return
-    hoverBusy.current = true
-    fetchLiveValue(display, cursorPos[1], cursorPos[0])
-      .then((v) => setHoverValue(v))
-      .catch(() => setHoverValue(null))
-      .finally(() => {
-        hoverBusy.current = false
-      })
+    const t = window.setTimeout(() => {
+      fetchLiveValue(display, cursorPos[1], cursorPos[0])
+        .then((v) => setHoverValue(v))
+        .catch(() => setHoverValue(null))
+    }, 90)
+    return () => window.clearTimeout(t)
   }, [meta, cursorPos, display])
 
   useEffect(() => {
@@ -3026,9 +3100,13 @@ export default function App() {
         if (!layerSelected && !selAtomIds.includes(a.id)) continue
         if (a.kind === 'roi') {
           const bound = !!layer.maskSource
-          const sil = needsSilhouette(a, bound)
-            ? partsOutlines.get(partsKey(meta.image.id, layer, a))
+          const entry = needsSilhouette(a, bound)
+            ? partsOutlines.get(`${meta.image.id}:${layer.id}:${a.id}`)
             : undefined
+          const sil =
+            entry && entry.geom === partsKey(meta.image.id, layer, a)
+              ? entry.contours
+              : undefined
           if (sil) {
             for (const c of sil) haloPaths.push({ path: c, color: rgbC })
           } else if (!bound && !needsSilhouette(a, bound)) {
@@ -3414,9 +3492,14 @@ export default function App() {
            points: brushStroke.slice(Math.max(0, cache.baked - 1)) }],
         meta.shape[1], meta.shape[0], 1,
       )
+      // last frame's tail bitmap dies now — at 60 fps an unclosed bitmap per
+      // pointer frame is a steady leak
+      tailBitmap.current?.close?.()
+      tailBitmap.current = null
       if (tail) {
         subtractRegion(tail, cache.stable)
         const bm = regionBitmap(tail, rgbD, alpha)
+        if (bm) tailBitmap.current = bm
         if (bm) {
           out.push(
             new BitmapLayer({

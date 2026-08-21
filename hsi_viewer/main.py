@@ -183,6 +183,7 @@ class DatasetManager:
         if img_id not in self.images:
             raise HTTPException(status_code=404, detail=f"no image with id {img_id}")
         self._guard_no_jobs()
+        images_mod.dispose_entry(self.images[img_id])
         del self.images[img_id]
         if self.selected == img_id:
             self.selected = max(self.images) if self.images else None
@@ -191,6 +192,8 @@ class DatasetManager:
         """Off-load everything: drop every image entry and free the memory.
         On-disk data is untouched — anything can be re-loaded."""
         self._guard_no_jobs()
+        for entry in self.images.values():
+            images_mod.dispose_entry(entry)
         self.images.clear()
         self.selected = None
         import gc
@@ -510,6 +513,7 @@ class DatasetManager:
                             entry.id, name, f"{entry.path}::baked{entry.id}",
                             entry.itype, array=out, dtype_label=entry.dtype_label)
                     with self._lock:
+                        images_mod.dispose_entry(entry)
                         self.images[entry.id] = new_entry
                         self.pipe_state = "idle"
                         self.pipe_progress = 1.0
@@ -555,6 +559,7 @@ class DatasetManager:
                         lambda f, m: on_progress(0.1 + 0.9 * f, m),
                         axis_kind=ds.axis_kind)
                     with self._lock:
+                        images_mod.dispose_entry(entry)
                         self.images[entry.id] = new_entry
                         self.pipe_state = "idle"
                         self.pipe_progress = 1.0
@@ -626,6 +631,7 @@ class DatasetManager:
         return self.dataset_by(None)
 
 
+images_mod.sweep_checkpoints()  # entries never survive a restart; nor should these
 manager = DatasetManager()
 
 

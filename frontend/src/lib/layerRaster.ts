@@ -16,8 +16,10 @@
  * is display only.
  */
 
-import type { LayerObj, RoiAtom } from './api'
-import { partsBounds, rasterizeParts, regionEdges, type PixelRegion } from './pixelRegion'
+import type { LayerObj, RoiAtom, RoiPart } from './api'
+import {
+  extendRegion, partsBounds, rasterizeParts, regionEdges, type PixelRegion,
+} from './pixelRegion'
 
 const FILL_ALPHA = 0.28
 /** Texture budget per layer: 32 Mpx ≈ 128 MB of RGBA. Only a region larger
@@ -57,6 +59,64 @@ function hexToRgb(hex: string): [number, number, number] {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
 }
 
+/** Per-atom raster cache, so painting the Nth stroke costs O(that stroke).
+ *
+ * Stroke accumulation appends to an atom's part list (`[...parts, part]`),
+ * which keeps the existing part OBJECTS identical — so "the old list is a
+ * prefix of the new one" is a plain reference check, and the cached region
+ * only needs the suffix painted on top (erase suffixes clear correctly since
+ * parts apply in order). Undo/redo/import build fresh part objects, fail the
+ * prefix check and fall back to a full rasterization — never wrong, only
+ * slower. Entries are display-factor-specific: a bbox grown past the texture
+ * budget changes the factor and invalidates naturally.
+ */
+interface AtomRasterEntry {
+  parts: RoiPart[]
+  region: PixelRegion
+  edges: [number, number][][]
+}
+const atomRasterCache = new Map<string, AtomRasterEntry>()
+const ATOM_CACHE_ENTRIES = 128
+const ATOM_CACHE_BYTES = 96_000_000
+let atomCacheBytes = 0
+
+function rasterizeAtomCached(
+  key: string, parts: RoiPart[], w: number, h: number, s: number,
+): { region: PixelRegion; edges: [number, number][][] } | null {
+  const hit = atomRasterCache.get(key)
+  let region: PixelRegion | null = null
+  if (hit && hit.region.factor === s && hit.parts.length <= parts.length) {
+    let prefix = true
+    for (let i = 0; i < hit.parts.length; i++) {
+      if (hit.parts[i] !== parts[i]) { prefix = false; break }
+    }
+    if (prefix) {
+      if (hit.parts.length === parts.length) {
+        atomRasterCache.delete(key)
+        atomRasterCache.set(key, hit) // refresh recency
+        return { region: hit.region, edges: hit.edges }
+      }
+      region = extendRegion(hit.region, parts.slice(hit.parts.length), w, h, s)
+    }
+  }
+  if (!region) region = rasterizeParts(parts, w, h, s)
+  if (hit) {
+    atomRasterCache.delete(key)
+    atomCacheBytes -= hit.region.data.length
+  }
+  if (!region) return null
+  const edges = regionEdges(region)
+  atomRasterCache.set(key, { parts, region, edges })
+  atomCacheBytes += region.data.length
+  for (const [k, v] of atomRasterCache) {
+    if (atomRasterCache.size <= ATOM_CACHE_ENTRIES && atomCacheBytes <= ATOM_CACHE_BYTES) break
+    if (k === key) continue
+    atomRasterCache.delete(k)
+    atomCacheBytes -= v.region.data.length
+  }
+  return { region, edges }
+}
+
 /**
  * Paint every visible ROI atom of a layer into one RGBA texture and trace the
  * borders, from a single rasterization pass so the two can never disagree.
@@ -64,7 +124,7 @@ function hexToRgb(hex: string): [number, number, number] {
  * @param w,h native image size
  */
 export async function renderLayerRaster(
-  layer: LayerObj, w: number, h: number,
+  layer: LayerObj, w: number, h: number, cacheScope = '',
 ): Promise<LayerRaster | null> {
   const atoms = layer.atoms.filter(
     (a): a is RoiAtom => a.kind === 'roi' && a.visible !== false && a.parts.length > 0,
@@ -91,10 +151,13 @@ export async function renderLayerRaster(
   let tx0 = Infinity, ty0 = Infinity, tx1 = -Infinity, ty1 = -Infinity
   const edges: [number, number][][] = []
   for (const atom of atoms) {
-    const region = rasterizeParts(atom.parts, w, h, s)
-    if (!region) continue
+    const cached = rasterizeAtomCached(
+      `${cacheScope}:${layer.id}:${atom.id}`, atom.parts, w, h, s,
+    )
+    if (!cached) continue
+    const { region } = cached
     regions.push(region)
-    edges.push(...regionEdges(region))
+    edges.push(...cached.edges)
     tx0 = Math.min(tx0, region.x0); ty0 = Math.min(ty0, region.y0)
     tx1 = Math.max(tx1, region.x0 + region.w); ty1 = Math.max(ty1, region.y0 + region.h)
   }

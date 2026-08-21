@@ -155,27 +155,13 @@ function partRows(part: RoiPart): [number, number] | null {
   return [y0, y1]
 }
 
-/** Covered pixels of one atom, in its own bounding box. */
-export function rasterizeParts(
+/** Paint `parts` (in order, erase clears) onto a region grid in place. */
+function paintParts(
+  region: { data: Uint8Array; x0: number; y0: number; w: number; h: number },
   parts: RoiPart[],
-  imgW: number,
-  imgH: number,
-  factor: number,
-): PixelRegion | null {
-  const box = partsBounds(parts)
-  if (!box) return null
-  const s = Math.max(1, factor)
-  const pw = Math.max(1, Math.floor(imgW / s))
-  const ph = Math.max(1, Math.floor(imgH / s))
-  const [cx0, cx1] = spanToCols(box.x0, box.x1, s)
-  const [cy0, cy1] = spanToCols(box.y0, box.y1, s)
-  const bx = Math.max(0, cx0)
-  const by = Math.max(0, cy0)
-  const bw = Math.min(pw - 1, cx1) - bx + 1
-  const bh = Math.min(ph - 1, cy1) - by + 1
-  if (bw <= 0 || bh <= 0) return null
-
-  const data = new Uint8Array(bw * bh)
+  s: number,
+): void {
+  const { data, x0: bx, y0: by, w: bw, h: bh } = region
   for (const part of parts) {
     const rows = partRows(part)
     if (!rows) continue
@@ -194,7 +180,74 @@ export function rasterizeParts(
       }
     }
   }
-  return data.some((v) => v) ? { data, x0: bx, y0: by, w: bw, h: bh, factor: s } : null
+}
+
+/** Texture-grid bbox for a part list, clamped to the image. */
+function gridBox(
+  parts: RoiPart[], imgW: number, imgH: number, s: number,
+): { bx: number; by: number; bw: number; bh: number } | null {
+  const box = partsBounds(parts)
+  if (!box) return null
+  const pw = Math.max(1, Math.floor(imgW / s))
+  const ph = Math.max(1, Math.floor(imgH / s))
+  const [cx0, cx1] = spanToCols(box.x0, box.x1, s)
+  const [cy0, cy1] = spanToCols(box.y0, box.y1, s)
+  const bx = Math.max(0, cx0)
+  const by = Math.max(0, cy0)
+  const bw = Math.min(pw - 1, cx1) - bx + 1
+  const bh = Math.min(ph - 1, cy1) - by + 1
+  return bw > 0 && bh > 0 ? { bx, by, bw, bh } : null
+}
+
+/** Covered pixels of one atom, in its own bounding box. */
+export function rasterizeParts(
+  parts: RoiPart[],
+  imgW: number,
+  imgH: number,
+  factor: number,
+): PixelRegion | null {
+  const s = Math.max(1, factor)
+  const g = gridBox(parts, imgW, imgH, s)
+  if (!g) return null
+  const region = { data: new Uint8Array(g.bw * g.bh), x0: g.bx, y0: g.by, w: g.bw, h: g.bh }
+  paintParts(region, parts, s)
+  return region.data.some((v) => v)
+    ? { ...region, factor: s }
+    : null
+}
+
+/**
+ * Extend an already-rasterized region with APPENDED parts only — the
+ * incremental path for stroke accumulation: painting the Nth stroke costs
+ * O(new stroke), not O(all N strokes). The base is copied into a grid grown
+ * to cover the new parts; erase suffixes clear correctly since parts still
+ * apply in order on top of the committed state.
+ */
+export function extendRegion(
+  base: PixelRegion,
+  newParts: RoiPart[],
+  imgW: number,
+  imgH: number,
+  factor: number,
+): PixelRegion | null {
+  const s = Math.max(1, factor)
+  if (!newParts.length) return base
+  // erases never grow the bbox (they only clear inside), so a null gridBox
+  // still needs the paint pass — just on the base's own grid
+  const g = gridBox(newParts, imgW, imgH, s)
+  const bx = g ? Math.min(base.x0, g.bx) : base.x0
+  const by = g ? Math.min(base.y0, g.by) : base.y0
+  const bw = (g ? Math.max(base.x0 + base.w, g.bx + g.bw) : base.x0 + base.w) - bx
+  const bh = (g ? Math.max(base.y0 + base.h, g.by + g.bh) : base.y0 + base.h) - by
+  const data = new Uint8Array(bw * bh)
+  for (let y = 0; y < base.h; y++) {
+    const src = y * base.w
+    const dst = (base.y0 - by + y) * bw + (base.x0 - bx)
+    data.set(base.data.subarray(src, src + base.w), dst)
+  }
+  const region = { data, x0: bx, y0: by, w: bw, h: bh }
+  paintParts(region, newParts, s)
+  return region.data.some((v) => v) ? { ...region, factor: s } : null
 }
 
 /** Union of two regions on the same grid (used to grow a stroke's baked

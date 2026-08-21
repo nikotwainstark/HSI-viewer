@@ -17,11 +17,18 @@ export function usePreviewImage(
 
   useEffect(() => {
     if (!url) {
-      setState({ bitmap: null, loadedUrl: null })
+      setState((prev) => {
+        prev.bitmap?.close?.()
+        return { bitmap: null, loadedUrl: null }
+      })
       return
     }
+    // superseded requests ABORT (scrubbing used to let dozens of obsolete
+    // full-frame downloads run to completion) and a replaced bitmap is
+    // closed the moment the new one lands — GPU/GC pressure stays flat
+    const ctl = new AbortController()
     let cancelled = false
-    fetch(url)
+    fetch(url, { signal: ctl.signal })
       .then(async (res) => {
         if (!res.ok) {
           let detail = `${res.status}`
@@ -36,14 +43,23 @@ export function usePreviewImage(
       })
       .then((blob) => createImageBitmap(blob))
       .then((bm) => {
-        if (!cancelled) setState({ bitmap: bm, loadedUrl: url })
+        if (cancelled) {
+          bm.close?.()
+          return
+        }
+        setState((prev) => {
+          prev.bitmap?.close?.()
+          return { bitmap: bm, loadedUrl: url }
+        })
       })
       .catch((err) => {
+        if ((err as Error).name === 'AbortError') return
         console.error(err)
         if (!cancelled) onError?.((err as Error).message)
       })
     return () => {
       cancelled = true
+      ctl.abort()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url])
