@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useEscClose } from '../hooks/useEscClose'
 
 interface Props {
   title: string
@@ -9,6 +10,7 @@ interface Props {
 
 /** Small rename dialog for data objects. */
 export function NameDialog({ title, initial, onSave, onClose }: Props) {
+  useEscClose(onClose)
   const [name, setName] = useState(initial)
   const ok = name.trim().length > 0
 

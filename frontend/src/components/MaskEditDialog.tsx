@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { CacheObject } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 export type MaskOp = 'subtract' | 'intersect' | 'union'
 
@@ -31,6 +32,7 @@ interface Props {
 export function MaskEditDialog({
   masks, initialMaskId, regionLabel, onConfirm, onClose,
 }: Props) {
+  useEscClose(onClose)
   const [maskId, setMaskId] = useState<number | null>(
     initialMaskId ?? (masks.length === 1 ? masks[0].id : null),
   )

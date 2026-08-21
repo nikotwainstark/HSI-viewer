@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import type { ImageEntryInfo } from '../lib/api'
 import { parseRegistrationJson, type ParsedRegistration } from '../lib/registration'
+import { useEscClose } from '../hooks/useEscClose'
 
 interface Props {
   image: ImageEntryInfo
@@ -14,6 +15,7 @@ interface Props {
     "ignore translation" keeps the image centred and applies only the linear
     part (pure orientation correction). */
 export function AffineApplyDialog({ image, onConfirm, onClose }: Props) {
+  useEscClose(onClose)
   const [text, setText] = useState('')
   const [ignoreT, setIgnoreT] = useState(false)
   const [error, setError] = useState<string | null>(null)

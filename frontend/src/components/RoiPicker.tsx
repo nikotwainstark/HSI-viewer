@@ -1,3 +1,5 @@
+import { useEscClose } from '../hooks/useEscClose'
+
 interface Region {
   layerId: number
   atomId: number
@@ -15,6 +17,7 @@ interface Props {
 /** Modal for choosing ONE region atom, for operations that take a mask and a
     ROI from opposite ends (e.g. editing a mask from the mask's own menu). */
 export function RoiPicker({ regions, onConfirm, onClose }: Props) {
+  useEscClose(onClose)
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6 backdrop-blur-sm"

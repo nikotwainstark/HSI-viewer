@@ -1,3 +1,5 @@
+import { useEscClose } from '../hooks/useEscClose'
+
 interface Props {
   name: string
   value: number // 0..1
@@ -8,6 +10,7 @@ interface Props {
 /** Floating opacity editor for one canvas image layer; the canvas updates
     live while sliding. Click outside to close. */
 export function OpacityPanel({ name, value, onChange, onClose }: Props) {
+  useEscClose(onClose)
   return (
     <>
       <div className="fixed inset-0 z-40" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose() }} />

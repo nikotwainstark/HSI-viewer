@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import type { ImageEntryInfo } from '../lib/api'
 import { parseRegistrationJson, type ParsedRegistration } from '../lib/registration'
+import { useEscClose } from '../hooks/useEscClose'
 
 interface Props {
   /** the image the transform will be attached to as MOVING */
@@ -16,6 +17,7 @@ interface Props {
     a registration is an edge, and an edge needs both ends. Shapes recorded
     in the JSON are validated against both images before anything is created. */
 export function RegImportDialog({ moving, candidates, onConfirm, onClose }: Props) {
+  useEscClose(onClose)
   const [text, setText] = useState('')
   const [targetId, setTargetId] = useState<number | null>(
     candidates.length === 1 ? candidates[0].id : null,

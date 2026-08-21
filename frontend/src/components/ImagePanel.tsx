@@ -1,6 +1,7 @@
 import { useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { formatBytes, type ImageEntryInfo, type ImageType } from '../lib/api'
 import { ContextMenu, type MenuEntry } from './ContextMenu'
+import { useEscClose } from '../hooks/useEscClose'
 
 const TYPE_BADGE: Record<ImageType, string> = {
   hsi: 'bg-sky-400/15 text-sky-300',
@@ -147,6 +148,7 @@ export function ImagePanel({ images, selectedId, onSelect, onDelete, onInfo, onL
 /** Read-only properties sheet for an image object (the old Dataset section
     now lives here, per image). */
 export function ImageInfoDialog({ img, onClose }: { img: ImageEntryInfo; onClose: () => void }) {
+  useEscClose(onClose)
   const rows: [string, string][] = [
     ['Type', img.type.toUpperCase()],
     ['Dimensions', img.shape.join(' × ')],

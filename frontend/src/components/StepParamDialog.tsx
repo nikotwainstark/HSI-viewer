@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { fmtAxisValue, type PipeStep, type SpectralAxis, type StepType } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 interface FieldSpec {
   key: string
@@ -49,6 +50,7 @@ interface Props {
 }
 
 export function StepParamDialog({ step, wnMin, wnMax, axis, onSave, onClose }: Props) {
+  useEscClose(onClose)
   const fields = buildFields(axis, wnMin, wnMax)[step.type] ?? []
   const [values, setValues] = useState<Record<string, number>>(() => {
     const v: Record<string, number> = {}

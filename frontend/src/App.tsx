@@ -503,6 +503,15 @@ export default function App() {
   const [activeLayerId, setActiveLayerId] = useState<number | null>(null)
   const layerSeq = useRef(0)
   const atomSeq = useRef(0)
+  /** Invariant: fresh ids never collide with ids arriving from restored
+      snapshots, bundles or files — lift the counters above whatever a
+      restore brings in. */
+  const liftSeqsAbove = useCallback((ls: LayerObj[]) => {
+    for (const l of ls) {
+      layerSeq.current = Math.max(layerSeq.current, l.id)
+      for (const a of l.atoms) atomSeq.current = Math.max(atomSeq.current, a.id)
+    }
+  }, [])
   const [roiShape, setRoiShape] = useState<RoiShape>('rect')
   const [brushSize, setBrushSize] = useState(8)
   const [eraserSize, setEraserSize] = useState(12)
@@ -907,6 +916,46 @@ export default function App() {
   const [coreg, setCoreg] = useState<CoregState | null>(null)
   const [registrations, setRegistrations] = useState<RegistrationRecord[]>([])
 
+  // registrations survive a reload: image ids are session-scoped, so saved
+  // records re-bind by (name, shape) once the image list arrives; records
+  // whose endpoints are gone (or reshaped by a crop/bake) are dropped —
+  // resurrecting a matrix for a different grid would corrupt data
+  const regsRestored = useRef(false)
+  useEffect(() => {
+    if (regsRestored.current || !images.length) return
+    regsRestored.current = true
+    try {
+      const raw = localStorage.getItem('hsiviewer.registrations')
+      if (!raw) return
+      const saved = JSON.parse(raw) as RegistrationRecord[]
+      if (!Array.isArray(saved) || !saved.length) return
+      const bind = (name: string, shape: [number, number]) =>
+        images.find(
+          (i) => i.name === name && i.shape[0] === shape[0] && i.shape[1] === shape[1],
+        )
+      const bound: RegistrationRecord[] = []
+      for (const r of saved) {
+        const m = bind(r.movingName, r.movingShape)
+        const t = bind(r.targetName, r.targetShape)
+        if (m && t && m.id !== t.id) bound.push({ ...r, movingId: m.id, targetId: t.id })
+      }
+      if (bound.length) {
+        setRegistrations((rs) => {
+          const have = new Set(rs.map((x) => `${x.movingId}>${x.targetId}`))
+          return [...rs, ...bound.filter((x) => !have.has(`${x.movingId}>${x.targetId}`))]
+        })
+        setToast(`Restored ${bound.length} registration link(s)`)
+      }
+    } catch {/* a corrupted store restores nothing */}
+  }, [images])
+  useEffect(() => {
+    // never write before the restore ran — it would wipe the saved records
+    if (!regsRestored.current) return
+    try {
+      localStorage.setItem('hsiviewer.registrations', JSON.stringify(registrations))
+    } catch {/* storage full: persistence degrades, the session still works */}
+  }, [registrations])
+
   /** Standalone affine (no target): dialog -> ghost preview -> commit. */
   const [affineDialogOpen, setAffineDialogOpen] = useState(false)
   const [affinePreview, setAffinePreview] = useState<
@@ -1014,6 +1063,7 @@ export default function App() {
       ].filter(Boolean).join(' and ')
       setToast(`Restored state referenced deleted cache objects — ${what} dropped`)
     }
+    liftSeqsAbove(layers)
     setLayers(layers)
     setActiveLayerId(
       layers.some((l) => l.id === d.activeLayerId)
@@ -1037,7 +1087,7 @@ export default function App() {
     setRoiDraft([])
     const id = metaRef.current?.image.id
     if (id != null) setLayouts((l) => ({ ...l, [id]: d.layout }))
-  }, [])
+  }, [liftSeqsAbove])
   const history = useHistory(historyDoc, applyHistoryDoc, meta?.image.id ?? null, !!coreg)
 
   useEffect(() => {
@@ -1534,6 +1584,7 @@ export default function App() {
         setRegions(bundle.regions)
         setSpectrumMode(bundle.spectrumMode)
         setPipeItems(bundle.pipeItems)
+        liftSeqsAbove(bundle.layers)
         setLayers(bundle.layers)
         setActiveLayerId(bundle.activeLayerId)
         setRoiSpectra(bundle.roiSpectra)
@@ -1583,7 +1634,7 @@ export default function App() {
         setPanelTab((t) => (t === 'layers' ? t : 'image'))
       }
     },
-    [refreshCache, animateTargetTo, finishBrushAtom],
+    [refreshCache, animateTargetTo, finishBrushAtom, liftSeqsAbove],
   )
 
   const snapshotBundle = useCallback(
@@ -2611,6 +2662,30 @@ export default function App() {
           throw new Error(
             `Loading failed, the imported file has [${payload.shape[0]},${payload.shape[1]}], ` +
               `but the canvas is [${meta.shape[0]},${meta.shape[1]}]`)
+        }
+        if (!payload.shape) {
+          // no grid recorded (foreign / hand-written file): the geometry
+          // itself must fit this canvas — silently accepting out-of-range
+          // coordinates would draw ROIs on pixels that do not exist
+          const [H, W] = meta.shape
+          const oob = payload.layers.some((l) =>
+            l.atoms.some((a) => {
+              if (a.kind === 'roi') {
+                return a.parts.some((pt) =>
+                  pt.points.some(([x, y]) => x < 0 || y < 0 || x > W || y > H))
+              }
+              if (a.kind === 'landmark' || a.kind === 'note') {
+                const [x, y] = a.point
+                return x < 0 || y < 0 || x > W || y > H
+              }
+              return false
+            }),
+          )
+          if (oob) {
+            throw new Error(
+              `Loading failed, the imported file has no canvas shape and its ` +
+                `geometry exceeds the canvas [${H},${W}]`)
+          }
         }
         const fresh: LayerObj[] = payload.layers.map((l) => {
           layerSeq.current += 1
@@ -5892,7 +5967,7 @@ export default function App() {
               },
               {
                 label: 'Redo',
-                hint: history.canRedo ? 'Ctrl+Shift+Z' : 'nothing to redo',
+                hint: history.canRedo ? 'Ctrl+Shift+Z · Ctrl+Y' : 'nothing to redo',
                 onClick: () => setToast(history.redo() ? 'Redo' : 'Nothing to redo'),
               },
               { divider: true, label: 'image' },

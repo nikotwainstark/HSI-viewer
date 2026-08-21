@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { MaskFileInfo } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 interface Props {
   info: MaskFileInfo
@@ -12,6 +13,7 @@ interface Props {
     shape check is shown BEFORE importing — a mask is data, so a mismatch is
     explained rather than resampled away. */
 export function MaskImportDialog({ info, onConfirm, onClose }: Props) {
+  useEscClose(onClose)
   const base = info.path.split('/').pop() ?? info.path
   const isLabelMap = info.n_labels > 1
   const [split, setSplit] = useState(isLabelMap)

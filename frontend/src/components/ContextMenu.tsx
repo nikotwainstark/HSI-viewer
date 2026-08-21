@@ -1,5 +1,6 @@
 import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
+import { useEscClose } from '../hooks/useEscClose'
 
 export interface MenuItem {
   label: string
@@ -41,6 +42,7 @@ interface Props {
  * close-backdrop) inside the panel.
  */
 export function ContextMenu({ x, y, items, header, onClose }: Props) {
+  useEscClose(onClose)
   const left = Math.min(x, window.innerWidth - 240)
   const top = Math.min(y, window.innerHeight - items.length * 34 - 20)
 

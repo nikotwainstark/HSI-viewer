@@ -9,12 +9,16 @@ at full resolution; only canvas rendering is 4x mean-pooled for speed.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import json
 import logging
+import os
 import re
+import shutil
 import time
+from uuid import uuid4
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -397,11 +401,14 @@ def read_mask_array(path: str) -> np.ndarray:
         colours = np.unique(rgb[marked].reshape(-1, 3), axis=0) if marked.any() else []
         if len(colours) > 1:
             raise ValueError(
-                f"image holds {len(colours)} distinct colours — it is a label map, "
-                "not a binary mask; export a single-channel label map instead")
+                f"Loading failed, the image holds {len(colours)} distinct colours — "
+                "it is a label map, not a binary mask; export a single-channel "
+                "label map instead")
         arr = marked
     if arr.ndim != 2:
-        raise ValueError(f"mask must be a 2D array, got shape {tuple(arr.shape)}")
+        raise ValueError(
+            f"Loading failed, the imported mask must be 2D, but the file has "
+            f"shape {tuple(arr.shape)}")
     return arr
 
 
@@ -438,6 +445,29 @@ def load_local_mask(path: str, shape: tuple[int, int]) -> np.ndarray:
 
 
 # ------------------------------------------------------------------- dataset
+
+def _cleans_staged_exports(fn):
+    """Remove any staged (not yet committed) export temp paths when the
+    export method dies, so a failed job never leaves debris on disk."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        self._staged_exports = []
+        try:
+            return fn(self, *args, **kwargs)
+        except BaseException:
+            for tmp in self._staged_exports:
+                try:
+                    if tmp.is_dir():
+                        shutil.rmtree(tmp, ignore_errors=True)
+                    else:
+                        tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        finally:
+            self._staged_exports = []
+    return wrapper
+
 
 class HSIDataset:
     """One open hyperspectral cube.
@@ -509,6 +539,7 @@ class HSIDataset:
         # user-cached derived objects (peak / area / ratio / rgb / mask)
         self.cache_objects: list[dict] = []
         self._mask_lru: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self._staged_exports: list[Path] = []
         self._cache_seq = 0
 
         self._live_full_cache: tuple[str, np.ndarray] | None = None
@@ -623,17 +654,30 @@ class HSIDataset:
         full_valid = np.zeros((self.height, self.width), dtype=bool)
         full_sum = np.zeros((self.height, self.width), dtype=np.float32)
         if self.axes_order == "chw":
-            # channel-first source is already our in-memory layout: read one
-            # channel at a time (matches per-channel chunking of OME stores)
             idxs = (np.flatnonzero(self._band_keep).tolist()
                     if self._band_keep is not None else list(range(self.bands)))
-            for out_i, src_i in enumerate(idxs):
-                block = np.asarray(self.cube[src_i], dtype=np.float32)
-                full[out_i] = block
-                full_valid |= np.isfinite(block) & (block != 0)
-                full_sum += block
-                progress((out_i + 1) / len(idxs))
-            full_sum /= max(len(idxs), 1)
+            # read whole CHANNEL CHUNKS: when a chunk spans several channels a
+            # per-channel read would decompress that chunk once per channel.
+            # The group is memory-capped so a wide-chunk store cannot balloon.
+            cchunk = max(int(self.cube.chunks[0]), 1)
+            cap = max(1, (512 * 1024 * 1024) // (self.height * self.width * 4))
+            group = min(cchunk, cap)
+            total = len(idxs)
+            pos = 0
+            done = 0
+            while pos < total:
+                g0 = (idxs[pos] // group) * group
+                g1 = min(g0 + group, self.cube.shape[0])
+                block = np.asarray(self.cube[g0:g1], dtype=np.float32)
+                while pos < total and idxs[pos] < g1:
+                    ch = block[idxs[pos] - g0]
+                    full[pos] = ch
+                    full_valid |= np.isfinite(ch) & (ch != 0)
+                    full_sum += ch
+                    pos += 1
+                    done += 1
+                    progress(done / total)
+            full_sum /= max(total, 1)
             # contract: invalid pixels are all-zero (see hwc branch)
             full[:, ~full_valid] = 0.0
         else:
@@ -1597,6 +1641,7 @@ class HSIDataset:
         return self._cache_append("mask", name, "imp", out.astype(np.float32),
                                   source=source_label)
 
+    @_cleans_staged_exports
     def export_cache(self, path: str, fmt: str, obj_ids: list[int],
                      progress: ProgressFn) -> dict:
         """Save cache objects into ONE bundle file (zarr group / npz), so a
@@ -1623,7 +1668,7 @@ class HSIDataset:
             ],
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        p_out = self._prepare_export_path(path, fmt)
+        p_final, p_out = self._stage_export(path, fmt)
         n = len(objs)
         if fmt == "zarr":
             g = zarr.open_group(str(p_out), mode="w")
@@ -1639,9 +1684,10 @@ class HSIDataset:
                 p_out, cache_metadata=json.dumps(meta),
                 **{f"obj_{i}": np.asarray(o["image"], dtype=np.float32)
                    for i, o in enumerate(objs)})
+        self._commit_export(p_out, p_final)
         progress(1.0, f"saved {n} cache object(s)")
-        logger.info("cache exported -> %s (%d objects)", p_out, n)
-        return {"path": str(p_out), "count": n}
+        logger.info("cache exported -> %s (%d objects)", p_final, n)
+        return {"path": str(p_final), "count": n}
 
     def import_cache_file(self, path: str) -> list[dict]:
         """Load a cache bundle back into this image's cache. The grid must
@@ -1764,6 +1810,7 @@ class HSIDataset:
         return self._cache_append(
             "mask", label or f"mask {sign} ROI", "edit", out.astype(np.float32))
 
+    @_cleans_staged_exports
     def export_layers(self, path: str, fmt: str, layer_specs: list[dict],
                       orient: dict | None = None) -> dict:
         """Export layer regions at native resolution. zarr/npz: one integer
@@ -1794,7 +1841,7 @@ class HSIDataset:
             "legend": legend,
             "orientation": orient or "native",
         }
-        p = self._prepare_export_path(path, fmt)
+        p_final, p = self._stage_export(path, fmt)
         if fmt == "zarr":
             g = zarr.open_group(str(p), mode="w")
             a = g.create_array("labels", shape=labels.shape, dtype="uint16")
@@ -1809,8 +1856,9 @@ class HSIDataset:
                 rgb[labels == entry["label"]] = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
             pil = Image.fromarray(rgb, mode="RGB")
             self._save_image_with_meta(pil, p, fmt, meta)
-        logger.info("layers exported -> %s", p)
-        return {"path": str(p)}
+        self._commit_export(p, p_final)
+        logger.info("layers exported -> %s", p_final)
+        return {"path": str(p_final)}
 
     def _parts_bbox(self, parts: list[dict]) -> tuple[int, int, int, int]:
         """Pixel bbox of a multi-part ROI, as a half-open [x0, x1) window. The
@@ -1894,6 +1942,20 @@ class HSIDataset:
             raise ValueError(f"target already exists: {p}")
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
+
+    def _stage_export(self, path: str, fmt: str) -> "tuple[Path, Path]":
+        """Validated final target plus the sibling TEMP path all writes go
+        to; _commit_export moves it into place at the end. A failed export
+        must never leave a partial file that looks complete — the temp name
+        keeps the real suffix so format inference still works."""
+        final = self._prepare_export_path(path, fmt)
+        tmp = final.with_name(f".tmp-{uuid4().hex[:8]}-{final.name}")
+        self._staged_exports.append(tmp)
+        return final, tmp
+
+    @staticmethod
+    def _commit_export(tmp: Path, final: Path) -> None:
+        os.replace(tmp, final)
 
     def _display_desc(self, spec: dict) -> str:
         kind = spec["kind"]
@@ -1980,6 +2042,7 @@ class HSIDataset:
             base = Image.alpha_composite(base, layer_img)
         return base
 
+    @_cleans_staged_exports
     def export_canvas(self, path: str, fmt: str, spec: dict, plo: float, phi: float,
                       cmap: str | None, points: list[dict],
                       layers: list[dict] | None = None,
@@ -2012,7 +2075,7 @@ class HSIDataset:
         img_out = orient_array(np.asarray(img), orient, axes=sp_axes)
         meta["height"] = int(img_out.shape[-2])
         meta["width"] = int(img_out.shape[-1])
-        p = self._prepare_export_path(path, fmt)
+        p_final, p = self._stage_export(path, fmt)
         if fmt == "zarr":
             g = zarr.open_group(str(p), mode="w")
             a = g.create_array("image", shape=img_out.shape, dtype="float32")
@@ -2045,9 +2108,11 @@ class HSIDataset:
             # WHOLE composite is oriented — stays WYSIWYG
             pil = Image.fromarray(orient_array(np.asarray(pil), orient))
             self._save_image_with_meta(pil, p, fmt, meta)
-        logger.info("canvas exported -> %s", p)
-        return {"path": str(p)}
+        self._commit_export(p, p_final)
+        logger.info("canvas exported -> %s", p_final)
+        return {"path": str(p_final)}
 
+    @_cleans_staged_exports
     def export_spectra(self, path: str, fmt: str, lo: float, hi: float, mode: str,
                        points: list[dict], rois: list[dict] | None = None) -> dict:
         """Export the spectra currently shown in the display window (visible
@@ -2099,7 +2164,7 @@ class HSIDataset:
             "points": pts if mode == "selected" else [],
         }
         values = np.stack([np.asarray(s["values"], dtype=np.float64) for s in series])
-        p = self._prepare_export_path(path, fmt)
+        p_final, p = self._stage_export(path, fmt)
         if fmt == "zarr":
             g = zarr.open_group(str(p), mode="w")
             a = g.create_array("wavenumbers", shape=wn_vis.shape, dtype="float64")
@@ -2157,9 +2222,11 @@ class HSIDataset:
                             pil_kwargs={"compression": "tiff_deflate",
                                         "tiffinfo": {270: json.dumps(meta)}})
             plt.close(fig)
-        logger.info("spectra exported -> %s", p)
-        return {"path": str(p)}
+        self._commit_export(p, p_final)
+        logger.info("spectra exported -> %s", p_final)
+        return {"path": str(p_final)}
 
+    @_cleans_staged_exports
     def export_data(self, path: str, fmt: str, node_name: str,
                     progress: ProgressFn, created: str | None = None,
                     orient: dict | None = None) -> dict:
@@ -2185,7 +2252,7 @@ class HSIDataset:
             "created": created or "",
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        p = self._prepare_export_path(path, fmt)
+        p_final, p = self._stage_export(path, fmt)
         progress(0.05, "preparing data export")
         # orientation as memory-cheap VIEWS per band (flips / rot90 never
         # copy); only the written blocks materialize
@@ -2236,9 +2303,10 @@ class HSIDataset:
                      valid_mask=_ov(self.full_valid).astype(np.uint8),
                      metadata=json.dumps(meta),
                      **{axis_name: np.asarray(self.wavenumbers, dtype=np.float64)})
-        progress(1.0, f"exported to {p}")
-        logger.info("data object exported -> %s", p)
-        return {"path": str(p)}
+        self._commit_export(p, p_final)
+        progress(1.0, f"exported to {p_final}")
+        logger.info("data object exported -> %s", p_final)
+        return {"path": str(p_final)}
 
     def label_maps(self, label_layers: list[dict]) -> tuple[np.ndarray, list[dict]]:
         """Rasterize label LAYERS into aligned uint16 maps for dataset export.
@@ -2300,6 +2368,7 @@ class HSIDataset:
             out[entry["layer"]] = entry["legend"].get(str(int(counts.argmax())), "")
         return out
 
+    @_cleans_staged_exports
     def export_roi_cubes(self, folder: str, fmt: str, rois: list[dict],
                          progress: ProgressFn,
                          label_layers: list[dict] | None = None,
@@ -2377,9 +2446,11 @@ class HSIDataset:
             axis_name = {"wavenumber": "wavenumber", "mz": "mass"}.get(self.axis_kind, "axis")
             wn = np.asarray(self.wavenumbers, dtype=np.float64)
             if fmt == "zarr":
-                p = root / f"{name}.zarr"
-                if p.exists():
-                    raise ValueError(f"target already exists: {p}")
+                p_final = root / f"{name}.zarr"
+                if p_final.exists():
+                    raise ValueError(f"target already exists: {p_final}")
+                p = p_final.with_name(f".tmp-{uuid4().hex[:8]}-{p_final.name}")
+                self._staged_exports.append(p)
                 g = zarr.open_group(str(p), mode="w")
                 cube = g.create_array("hypercube", shape=arr.shape, dtype="float32",
                                       chunks=(min(300, arr.shape[0]),
@@ -2402,9 +2473,11 @@ class HSIDataset:
                                          "legend": e["legend"], "plane": li})
                 g.attrs.update(meta)
             else:
-                p = root / f"{name}.npz"
-                if p.exists():
-                    raise ValueError(f"target already exists: {p}")
+                p_final = root / f"{name}.npz"
+                if p_final.exists():
+                    raise ValueError(f"target already exists: {p_final}")
+                p = p_final.with_name(f".tmp-{uuid4().hex[:8]}-{p_final.name}")
+                self._staged_exports.append(p)
                 extra: dict = {}
                 if cube_labels is not None:
                     extra["labels"] = cube_labels
@@ -2415,11 +2488,13 @@ class HSIDataset:
                                     valid_mask=valid.astype(np.uint8),
                                     metadata=json.dumps(meta),
                                     **{axis_name: wn}, **extra)
-            out.append(str(p))
-            logger.info("ROI cube exported -> %s %s", p, arr.shape)
+            self._commit_export(p, p_final)
+            out.append(str(p_final))
+            logger.info("ROI cube exported -> %s %s", p_final, arr.shape)
         progress(1.0, f"exported {len(out)} ROI cube(s) to {root}")
         return {"path": str(root), "files": out, "count": len(out)}
 
+    @_cleans_staged_exports
     def export_pixels(self, path: str, fmt: str, region_specs: list[dict],
                       label_layers: list[dict], progress: ProgressFn,
                       orient: dict | None = None) -> dict:
@@ -2489,7 +2564,7 @@ class HSIDataset:
         axis_name = {"wavenumber": "wavenumber", "mz": "mass"}.get(self.axis_kind, "axis")
         wn = np.asarray(self.wavenumbers, dtype=np.float64)
         progress(0.85, f"writing {n} pixels")
-        p_out = self._prepare_export_path(path, fmt)
+        p_final, p_out = self._stage_export(path, fmt)
         # every label layer ALSO lands as its own instance-length array named
         # after the layer, carrying its legend — the column ↔ name mapping is
         # in the file itself, not only in the packed (N, L) block
@@ -2518,10 +2593,11 @@ class HSIDataset:
             np.savez_compressed(p_out, spectra=spectra, coords=coords,
                                 labels=labels, metadata=json.dumps(meta),
                                 **named_cols, **{axis_name: wn})
+        self._commit_export(p_out, p_final)
         progress(1.0, f"exported {n} pixels")
         logger.info("pixel dataset exported -> %s (%d px, %d label layers)",
-                    p_out, n, len(legends))
-        return {"path": str(p_out), "n_pixels": n,
+                    p_final, n, len(legends))
+        return {"path": str(p_final), "n_pixels": n,
                 "n_invalid_excluded": n_region - n}
 
     def reset_to_imported(self, progress: ProgressFn) -> None:

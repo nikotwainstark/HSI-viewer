@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import type { BlobCleanParams } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 export interface BlobCleanState extends BlobCleanParams {
   maskId: number
@@ -32,6 +33,7 @@ function Row({ label, value, children }: { label: string; value: string; childre
 /** Floating blob-clean editor: the canvas live-renders the cleaned mask while
     parameters change; clicking anywhere outside cancels. */
 export function BlobCleanPanel({ state, onChange, onCreate, onCancel }: Props) {
+  useEscClose(onCancel)
   return (
     <>
       <div className="fixed inset-0 z-40" onClick={onCancel} onContextMenu={(e) => { e.preventDefault(); onCancel() }} />

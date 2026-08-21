@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { lastDir, recentDirs, rememberDir } from '../lib/recentDirs'
 import { listDir, makeDir, type ExportFormat, type FsListing } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 const ALL_FORMATS: ExportFormat[] = ['zarr', 'npz', 'png', 'tiff']
 
@@ -59,6 +60,7 @@ interface Props {
 export function ExportDialog({ title, defaultName, storageKey, formats, toggle, info,
                               folderMode, labelChoices, products, defaultProduct,
                               onSave, onClose }: Props) {
+  useEscClose(onClose)
   const [labelIds, setLabelIds] = useState<number[]>(
     () => (labelChoices ?? []).filter((c) => c.defaultOn !== false).map((c) => c.id),
   )

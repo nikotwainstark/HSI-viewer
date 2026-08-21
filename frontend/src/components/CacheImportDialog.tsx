@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { fetchCacheListOf, type CacheObject, type ImageEntryInfo } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 export interface CrossImportRoute {
   /** null = grids identical (plain copy) */
@@ -13,6 +14,8 @@ interface SourceGroup {
   /** how a mask would travel from this image, or a refusal message */
   route: CrossImportRoute | { refusal: string }
   masks: CacheObject[] | null // null = still loading
+  /** listing the source cache failed — distinct from "it has no masks" */
+  listFailed?: boolean
 }
 
 interface Props {
@@ -27,6 +30,7 @@ interface Props {
     warps the mask by nearest neighbour. Anything else is refused with both
     shapes shown. */
 export function CacheImportDialog({ sources, onConfirm, onClose }: Props) {
+  useEscClose(onClose)
   const [groups, setGroups] = useState<SourceGroup[]>(
     sources.map((s) => ({ ...s, masks: null })),
   )
@@ -46,9 +50,12 @@ export function CacheImportDialog({ sources, onConfirm, onClose }: Props) {
           )
         })
         .catch(() => {
+          // a failed listing must not masquerade as "no masks"
           if (!dead) {
             setGroups((gs) =>
-              gs.map((g) => (g.image.id === s.image.id ? { ...g, masks: [] } : g)),
+              gs.map((g) =>
+                g.image.id === s.image.id ? { ...g, masks: [], listFailed: true } : g,
+              ),
             )
           }
         })
@@ -100,6 +107,10 @@ export function CacheImportDialog({ sources, onConfirm, onClose }: Props) {
                 </p>
               ) : g.masks == null ? (
                 <p className="px-3 py-2 text-[11px] text-slate-600">loading…</p>
+              ) : g.listFailed ? (
+                <p className="px-3 py-2 text-[11px] text-amber-300/80">
+                  could not list its cache — close and retry
+                </p>
               ) : g.masks.length === 0 ? (
                 <p className="px-3 py-2 text-[11px] text-slate-600">no mask objects in its cache</p>
               ) : (

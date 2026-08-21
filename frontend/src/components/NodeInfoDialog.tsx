@@ -1,4 +1,5 @@
 import { fmtAxisValue, type DataNodeItem, type SpectralAxis } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 interface Props {
   node: DataNodeItem
@@ -20,6 +21,7 @@ function Row({ label, value }: { label: string; value: string }) {
 
 /** Read-only metadata sheet for a data-object checkpoint. */
 export function NodeInfoDialog({ node, datasetName, live, nValid, axis, onClose }: Props) {
+  useEscClose(onClose)
   const info = node.info
   return (
     <div

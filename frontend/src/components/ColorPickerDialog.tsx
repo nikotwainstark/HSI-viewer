@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useEscClose } from '../hooks/useEscClose'
 
 /** Shared colour picker: palette swatches + hex + R/G/B integer inputs.
     One component serves every colourable object (picked pixels, layers, …)
@@ -31,6 +32,7 @@ interface Props {
 }
 
 export function ColorPickerDialog({ title, initial, onSave, onClose }: Props) {
+  useEscClose(onClose)
   const [color, setColor] = useState(() => (parseHex(initial) ? initial.toLowerCase() : '#38bdf8'))
   const [hexText, setHexText] = useState(color)
   const rgb = parseHex(color)!

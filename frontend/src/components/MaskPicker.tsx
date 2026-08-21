@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { CacheObject } from '../lib/api'
+import { useEscClose } from '../hooks/useEscClose'
 
 interface Props {
   masks: CacheObject[]
@@ -10,6 +11,7 @@ interface Props {
 /** Modal for choosing mask objects from the cache as a pipeline mask source.
     Multiple selections are intersected. */
 export function MaskPicker({ masks, onConfirm, onClose }: Props) {
+  useEscClose(onClose)
   const [checked, setChecked] = useState<number[]>([])
 
   const toggle = (id: number) =>

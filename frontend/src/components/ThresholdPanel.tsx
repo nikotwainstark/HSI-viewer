@@ -1,3 +1,5 @@
+import { useEscClose } from '../hooks/useEscClose'
+
 export interface ThresholdState {
   min: number
   max: number
@@ -22,6 +24,7 @@ function fmt(v: number): string {
 /** Floating threshold editor: the canvas live-renders the binary mask while
     the slider moves; clicking anywhere outside cancels. */
 export function ThresholdPanel({ state, onChange, onCreate, onCancel }: Props) {
+  useEscClose(onCancel)
   const { min, max, value, reverse } = state
   const step = (max - min) / 256 || 1e-6
 
